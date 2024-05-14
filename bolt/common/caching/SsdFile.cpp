@@ -153,7 +153,7 @@ SsdFile::SsdFile(
   BOLT_CHECK_GE(
       fd_,
       0,
-      "Cannot open or create {}. Error: {}",
+      "Could not open or create {}. Error: {}",
       filename,
       folly::errnoStr(errno));
 
@@ -175,10 +175,10 @@ SsdFile::SsdFile(
   writableRegions_.resize(numRegions_);
   std::iota(writableRegions_.begin(), writableRegions_.end(), 0);
   tracker_.resize(maxRegions_);
-  regionSizes_.resize(maxRegions_);
-  erasedRegionSizes_.resize(maxRegions_);
-  regionPins_.resize(maxRegions_);
-  if (checkpointIntervalBytes_) {
+  regionSizes_.resize(maxRegions_, 0);
+  erasedRegionSizes_.resize(maxRegions_, 0);
+  regionPins_.resize(maxRegions_, 0);
+  if (checkpointEnabled()) {
     initializeCheckpoint();
   }
 }
@@ -353,7 +353,8 @@ bool SsdFile::growOrEvictLocked() {
 
 void SsdFile::clearRegionEntriesLocked(const std::vector<int32_t>& regions) {
   std::unordered_set<int32_t> regionSet{regions.begin(), regions.end()};
-  // Remove all 'entries_' where the dependent points one of 'regionIndices'.
+  // Remove all 'entries_' that reference data in regions described by
+  // 'regionIndices'.
   auto it = entries_.begin();
   while (it != entries_.end()) {
     const auto region = regionIndex(it->second.offset());
@@ -439,8 +440,7 @@ void SsdFile::write(std::vector<CachePin>& pins) {
     storeIndex += numWritten;
   }
 
-  if ((checkpointIntervalBytes_ > 0) &&
-      (bytesAfterCheckpoint_ >= checkpointIntervalBytes_)) {
+  if (checkpointEnabled()) {
     checkpoint();
   }
 }
@@ -460,9 +460,9 @@ void SsdFile::verifyWrite(AsyncDataCacheEntry& entry, SsdRun ssdRun) {
   auto testData = std::make_unique<char[]>(entry.size());
   const auto rc = ::pread(fd_, testData.get(), entry.size(), ssdRun.offset());
   BOLT_CHECK_EQ(rc, entry.size());
-  if (entry.tinyData() != 0) {
+  if (entry.tinyData() != nullptr) {
     if (::memcmp(testData.get(), entry.tinyData(), entry.size()) != 0) {
-      BOLT_FAIL("bad read back");
+      BOLT_FAIL("Bad read back");
     }
   } else {
     const auto& data = entry.data();
@@ -476,8 +476,8 @@ void SsdFile::verifyWrite(AsyncDataCacheEntry& entry, SsdRun ssdRun) {
       if (badIndex != -1) {
         BOLT_FAIL("Bad read back");
       }
-      bytesLeft -= run.numBytes();
-      offset += run.numBytes();
+      bytesLeft -= compareSize;
+      offset += compareSize;
       if (bytesLeft <= 0) {
         break;
       };
@@ -515,7 +515,7 @@ void SsdFile::updateStats(SsdCacheStats& stats) const {
   stats.readCheckpointErrors += stats_.readCheckpointErrors;
 }
 
-void SsdFile::clear() {
+void SsdFile::testingClear() {
   std::lock_guard<std::shared_mutex> l(mutex_);
   entries_.clear();
   std::fill(regionSizes_.begin(), regionSizes_.end(), 0);
@@ -524,7 +524,8 @@ void SsdFile::clear() {
   std::iota(writableRegions_.begin(), writableRegions_.end(), 0);
 }
 
-void SsdFile::deleteFile() {
+void SsdFile::testingDeleteFile() {
+  process::TraceContext trace("SsdFile::testingDeleteFile");
   if (fd_) {
     close(fd_);
     fd_ = 0;
@@ -554,7 +555,7 @@ bool SsdFile::removeFileEntries(
     const FileCacheKey& cacheKey = it->first;
     const SsdRun& ssdRun = it->second;
 
-    if (!cacheKey.fileNum.hasValue()) {
+    if (!cacheKey.fileNum.has_value()) {
       ++it;
       continue;
     }
@@ -603,7 +604,7 @@ bool SsdFile::removeFileEntries(
 }
 
 void SsdFile::logEviction(const std::vector<int32_t>& regions) {
-  if (checkpointIntervalBytes_ > 0) {
+  if (checkpointEnabled()) {
     const int32_t rc = ::write(
         evictLogFd_, regions.data(), regions.size() * sizeof(regions[0]));
     if (rc != regions.size() * sizeof(regions[0])) {
@@ -628,12 +629,12 @@ void SsdFile::deleteCheckpoint(bool keepLog) {
   }
 
   checkpointDeleted_ = true;
-  const auto logPath = fileName_ + kLogExtension;
+  const auto logPath = getEvictLogFilePath();
   int32_t logRc = 0;
   if (!keepLog) {
     logRc = ::unlink(logPath.c_str());
   }
-  const auto checkpointPath = fileName_ + kCheckpointExtension;
+  const auto checkpointPath = getCheckpointFilePath();
   const auto checkpointRc = ::unlink(checkpointPath.c_str());
   if ((logRc != 0) || (checkpointRc != 0)) {
     ++stats_.deleteCheckpointErrors;
@@ -665,7 +666,7 @@ inline const char* asChar(const T* ptr) {
 
 void SsdFile::checkpoint(bool force) {
   std::lock_guard<std::shared_mutex> l(mutex_);
-  if (!force && (bytesAfterCheckpoint_ < checkpointIntervalBytes_)) {
+  if (!needCheckpoint(force)) {
     return;
   }
 
@@ -695,75 +696,83 @@ void SsdFile::checkpoint(bool force) {
     };
 
     std::ofstream state;
-    auto checkpointPath = fileName_ + kCheckpointExtension;
-    state.exceptions(std::ofstream::failbit);
-    state.open(checkpointPath, std::ios_base::out | std::ios_base::trunc);
-    // The checkpoint state file contains:
-    // int32_t The 4 bytes of kCheckpointMagic,
-    // int32_t maxRegions,
-    // int32_t numRegions,
-    // regionScores from the 'tracker_',
-    // {fileId, fileName} pairs,
-    // kMapMarker,
-    // {fileId, offset, SSdRun} triples,
-    // kEndMarker.
-    state.write(kCheckpointMagic, sizeof(int32_t));
-    state.write(asChar(&maxRegions_), sizeof(maxRegions_));
-    state.write(asChar(&numRegions_), sizeof(numRegions_));
+    const auto checkpointPath = getCheckpointFilePath();
+    try {
+      state.exceptions(std::ofstream::failbit);
+      state.open(checkpointPath, std::ios_base::out | std::ios_base::trunc);
+      // The checkpoint state file contains:
+      // int32_t The 4 bytes of kCheckpointMagic,
+      // int32_t maxRegions,
+      // int32_t numRegions,
+      // regionScores from the 'tracker_',
+      // {fileId, fileName} pairs,
+      // kMapMarker,
+      // {fileId, offset, SSdRun} triples,
+      // kEndMarker.
+      state.write(kCheckpointMagic, sizeof(int32_t));
+      state.write(asChar(&maxRegions_), sizeof(maxRegions_));
+      state.write(asChar(&numRegions_), sizeof(numRegions_));
 
-    // Copy the region scores before writing out for tsan.
-    const auto scoresCopy = tracker_.copyScores();
-    state.write(asChar(scoresCopy.data()), maxRegions_ * sizeof(uint64_t));
-    std::unordered_set<uint64_t> fileNums;
-    for (const auto& entry : entries_) {
-      const auto fileNum = entry.first.fileNum.id();
-      if (fileNums.insert(fileNum).second) {
-        state.write(asChar(&fileNum), sizeof(fileNum));
-        const auto name = fileIds().string(fileNum);
-        const int32_t length = name.size();
-        state.write(asChar(&length), sizeof(length));
-        state.write(name.data(), length);
+      // Copy the region scores before writing out for tsan.
+      const auto scoresCopy = tracker_.copyScores();
+      state.write(asChar(scoresCopy.data()), maxRegions_ * sizeof(uint64_t));
+      std::unordered_set<uint64_t> fileNums;
+      for (const auto& entry : entries_) {
+        const auto fileNum = entry.first.fileNum.id();
+        if (fileNums.insert(fileNum).second) {
+          state.write(asChar(&fileNum), sizeof(fileNum));
+          const auto name = fileIds().string(fileNum);
+          const int32_t length = name.size();
+          state.write(asChar(&length), sizeof(length));
+          state.write(name.data(), length);
+        }
       }
+
+      const auto mapMarker = kCheckpointMapMarker;
+      state.write(asChar(&mapMarker), sizeof(mapMarker));
+      for (auto& pair : entries_) {
+        auto id = pair.first.fileNum.id();
+        state.write(asChar(&id), sizeof(id));
+        state.write(asChar(&pair.first.offset), sizeof(pair.first.offset));
+        auto offsetAndSize = pair.second.bits();
+        state.write(asChar(&offsetAndSize), sizeof(offsetAndSize));
+      }
+
+      // NOTE: we need to ensure cache file data sync update completes before
+      // updating checkpoint file.
+      const auto fileSyncRc = fileSync->move();
+      checkRc(*fileSyncRc, "Sync of cache data file");
+
+      const auto endMarker = kCheckpointEndMarker;
+      state.write(asChar(&endMarker), sizeof(endMarker));
+
+      if (state.bad()) {
+        ++stats_.writeCheckpointErrors;
+        checkRc(-1, "Write of checkpoint file");
+      }
+      state.close();
+
+      // Sync checkpoint data file. ofstream does not have a sync method, so open
+      // as fd and sync that.
+      const auto checkpointFd = checkRc(
+          ::open(checkpointPath.c_str(), O_WRONLY),
+          "Open of checkpoint file for sync");
+      BOLT_CHECK_GE(checkpointFd, 0);
+      checkRc(::fsync(checkpointFd), "Sync of checkpoint file");
+      ::close(checkpointFd);
+
+      // NOTE: we shall truncate eviction log after checkpoint file sync
+      // completes so that we never recover from an old checkpoint file without
+      // log evictions. The latter may lead to data consistent issue.
+      checkRc(::ftruncate(evictLogFd_, 0), "Truncate of event log");
+      checkRc(::fsync(evictLogFd_), "Sync of evict log");
+    } catch (const std::exception& e) {
+      try {
+        checkpointError(-1, e.what());
+      } catch (const std::exception&) {
+      }
+      // Ignore nested exception.
     }
-
-    const auto mapMarker = kCheckpointMapMarker;
-    state.write(asChar(&mapMarker), sizeof(mapMarker));
-    for (auto& pair : entries_) {
-      auto id = pair.first.fileNum.id();
-      state.write(asChar(&id), sizeof(id));
-      state.write(asChar(&pair.first.offset), sizeof(pair.first.offset));
-      auto offsetAndSize = pair.second.bits();
-      state.write(asChar(&offsetAndSize), sizeof(offsetAndSize));
-    }
-
-    // NOTE: we need to ensure cache file data sync update completes before
-    // updating checkpoint file.
-    const auto fileSyncRc = fileSync->move();
-    checkRc(*fileSyncRc, "Sync of cache data file");
-
-    const auto endMarker = kCheckpointEndMarker;
-    state.write(asChar(&endMarker), sizeof(endMarker));
-
-    if (state.bad()) {
-      ++stats_.writeCheckpointErrors;
-      checkRc(-1, "Write of checkpoint file");
-    }
-    state.close();
-
-    // Sync checkpoint data file. ofstream does not have a sync method, so open
-    // as fd and sync that.
-    const auto checkpointFd = checkRc(
-        ::open(checkpointPath.c_str(), O_WRONLY),
-        "Open of checkpoint file for sync");
-    BOLT_CHECK_GE(checkpointFd, 0);
-    checkRc(::fsync(checkpointFd), "Sync of checkpoint file");
-    ::close(checkpointFd);
-
-    // NOTE: we shall truncate eviction log after checkpoint file sync
-    // completes so that we never recover from an old checkpoint file without
-    // log evictions. The latter might lead to data consistent issue.
-    checkRc(::ftruncate(evictLogFd_, 0), "Truncate of event log");
-    checkRc(::fsync(evictLogFd_), "Sync of evict log");
   } catch (const std::exception& e) {
     try {
       checkpointError(-1, e.what());
@@ -774,24 +783,24 @@ void SsdFile::checkpoint(bool force) {
 }
 
 void SsdFile::initializeCheckpoint() {
-  if (checkpointIntervalBytes_ == 0) {
+  if (!checkpointEnabled()) {
     return;
   }
   bool hasCheckpoint = true;
-  std::ifstream state(fileName_ + kCheckpointExtension);
+  std::ifstream state(getCheckpointFilePath());
   if (!state.is_open()) {
     hasCheckpoint = false;
     ++stats_.openCheckpointErrors;
     BOLT_SSD_CACHE_LOG(INFO)
         << "Starting shard " << shardId_ << " without checkpoint";
   }
-  const auto logPath = fileName_ + kLogExtension;
+  const auto logPath = getEvictLogFilePath();
   evictLogFd_ = ::open(logPath.c_str(), O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
   if (evictLogFd_ < 0) {
     ++stats_.openLogErrors;
     // Failure to open the log at startup is a process terminating error.
     BOLT_FAIL(
-        "Could not open evict log {}, rc {}: {}",
+        "Could not open evict log {}, rc {} :{}",
         logPath,
         evictLogFd_,
         folly::errnoStr(errno));
@@ -806,7 +815,7 @@ void SsdFile::initializeCheckpoint() {
     ++stats_.readCheckpointErrors;
     try {
       BOLT_SSD_CACHE_LOG(ERROR) << "Error recovering from checkpoint "
-                                << e.what() << ": Starting without checkpoint";
+                               << e.what() << ": Starting without checkpoint";
       entries_.clear();
       deleteCheckpoint(true);
     } catch (const std::exception&) {

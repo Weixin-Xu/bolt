@@ -202,11 +202,11 @@ class SsdFile {
       const std::string& filename,
       int32_t shardId,
       int32_t maxRegions,
-      int64_t checkpointInternalBytes = 0,
+      int64_t checkpointIntervalBytes = 0,
       bool disableFileCow = false,
       folly::Executor* executor = nullptr);
 
-  // Adds entries of  'pins'  to this file. 'pins' must be in read mode and
+  // Adds entries of  'pins' to this file. 'pins' must be in read mode and
   // those pins that are successfully added to SSD are marked as being on SSD.
   // The file of the entries must be a file that is backed by 'this'.
   void write(std::vector<CachePin>& pins);
@@ -258,12 +258,6 @@ class SsdFile {
   // Adds 'stats_' to 'stats'.
   void updateStats(SsdCacheStats& stats) const;
 
-  // Resets this' to a post-construction empty state. See SsdCache::clear().
-  void clear();
-
-  // Deletes the backing file. Used in testing.
-  void deleteFile();
-
   /// Remove cached entries of files in the fileNum set 'filesToRemove'. If
   /// successful, return true, and 'filesRetained' contains entries that should
   /// not be removed, ex., from pinned regions. Otherwise, return false and
@@ -278,8 +272,32 @@ class SsdFile {
   // written since last checkpoint and silently returns if not.
   void checkpoint(bool force = false);
 
+  /// Returns the SSD file path.
+  const std::string& fileName() const {
+    return fileName_;
+  }
+
+  /// Returns the eviction log file path.
+  std::string getEvictLogFilePath() const {
+    return fileName_ + kLogExtension;
+  }
+
+  /// Deletes the backing file. Used in testing.
+  void testingDeleteFile();
+
+  /// Resets this' to a post-construction empty state. See SsdCache::clear().
+  void testingClear();
+
   /// Returns true if copy on write is disabled for this file. Used in testing.
   bool testingIsCowDisabled() const;
+
+  std::vector<double> testingCopyScores() {
+    return tracker_.copyScores();
+  }
+
+  int32_t testingNumWritableRegions() const {
+    return writableRegions_.size();
+  }
 
  private:
   // 4 first bytes of a checkpoint file. Allows distinguishing between format
@@ -341,9 +359,27 @@ class SsdFile {
   // the files for making new checkpoints.
   void initializeCheckpoint();
 
-  // Synchronously logs that 'regions' are no longer valid in a possibly xisting
+  // Synchronously logs that 'regions' are no longer valid in a possibly existing
   // checkpoint.
   void logEviction(const std::vector<int32_t>& regions);
+
+  // Returns true if checkpoint has been enabled.
+  bool checkpointEnabled() const {
+    return checkpointIntervalBytes_ > 0;
+  }
+
+  // Returns true if checkpoint is needed.
+  bool needCheckpoint(bool force) const {
+    if (!checkpointEnabled()) {
+      return false;
+    }
+    return force || (bytesAfterCheckpoint_ >= checkpointIntervalBytes_);
+  }
+
+  // Returns the checkpoint file path.
+  std::string getCheckpointFilePath() const {
+    return fileName_ + kCheckpointExtension;
+  }
 
   static constexpr const char* kLogExtension = ".log";
   static constexpr const char* kCheckpointExtension = ".cpt";
