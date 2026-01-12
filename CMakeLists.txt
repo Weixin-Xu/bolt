@@ -386,6 +386,7 @@ if(BOLT_ENABLE_ABFS)
 endif()
 
 if(BOLT_ENABLE_HDFS)
+  add_definitions(-DBOLT_ENABLE_HDFS)
   if (BOLT_ENABLE_ARROW_HDFS)
     find_package(Arrow REQUIRED)
     add_definitions(-DBOLT_ENABLE_ARROW_HDFS)

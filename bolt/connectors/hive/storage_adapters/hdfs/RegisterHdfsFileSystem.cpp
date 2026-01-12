@@ -28,7 +28,7 @@
  * --------------------------------------------------------------------------
  */
 
-#ifdef BOLT_ENABLE_HDFS3
+#ifdef BOLT_ENABLE_HDFS
 #include "folly/concurrency/ConcurrentHashMap.h"
 
 #include "bolt/common/config/Config.h"
@@ -38,7 +38,7 @@
 #endif
 namespace bytedance::bolt::filesystems {
 
-#ifdef BOLT_ENABLE_HDFS3
+#ifdef BOLT_ENABLE_HDFS
 
 namespace {
 std::function<std::shared_ptr<
@@ -94,7 +94,7 @@ hdfsWriteFileSinkGenerator() {
 #endif
 
 void registerHdfsFileSystem() {
-#ifdef BOLT_ENABLE_HDFS3
+#ifdef BOLT_ENABLE_HDFS
   registerFileSystem(HdfsFileSystem::isHdfsFile, hdfsFileSystemGenerator());
   dwio::common::FileSink::registerFactory(hdfsWriteFileSinkGenerator());
 #endif

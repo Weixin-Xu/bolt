@@ -395,9 +395,7 @@ class BoltConan(ConanFile):
             self.selected_file_systems = set(file_system for file_system in file_system_list if file_system in supported_file_systems)
         self.output.info(f"selected file systems: {self.selected_file_systems}")
 
-        if "hdfs" in self.selected_file_systems and self.options.enable_arrow_hdfs:
-            self.options.enable_arrow_hdfs = True
-        else:
+        if "hdfs" not in self.selected_file_systems:
             self.options.enable_arrow_hdfs = False
 
     # Set default options of third parties here

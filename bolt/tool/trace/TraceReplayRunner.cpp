@@ -268,7 +268,7 @@ void TraceReplayRunner::init() {
 #ifdef BOLT_ENABLE_S3
   filesystems::registerS3FileSystem();
 #endif
-#ifdef BOLT_ENABLE_HDFS3
+#ifdef BOLT_ENABLE_HDFS
   filesystems::registerHdfsFileSystem();
 #endif
 #ifdef BOLT_ENABLE_GCS

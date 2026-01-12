@@ -39,7 +39,7 @@
 #ifdef BOLT_ENABLE_GCS
 #include "bolt/connectors/hive/storage_adapters/gcs/RegisterGCSFileSystem.h" // @manual
 #endif
-#ifdef BOLT_ENABLE_HDFS3
+#ifdef BOLT_ENABLE_HDFS
 #include "bolt/connectors/hive/storage_adapters/hdfs/RegisterHdfsFileSystem.h" // @manual
 #endif
 #ifdef BOLT_ENABLE_S3
@@ -176,7 +176,7 @@ void HiveConnectorFactory::initialize() {
 #ifdef BOLT_ENABLE_S3
     filesystems::registerS3FileSystem();
 #endif
-#ifdef BOLT_ENABLE_HDFS3
+#ifdef BOLT_ENABLE_HDFS
     filesystems::registerHdfsFileSystem();
 #endif
 #ifdef BOLT_ENABLE_GCS
