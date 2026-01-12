@@ -28,7 +28,7 @@
 # --------------------------------------------------------------------------
 
 
-if(${BOLT_ENABLE_ARROW_HDFS})
+if(${BOLT_USE_ARROW_HDFS})
   find_package(Arrow CONFIG REQUIRED)
 
   add_library(bolt_external_hdfs ArrowHdfsInternal.cpp)

@@ -33,7 +33,7 @@ add_library(bolt_hdfs RegisterHdfsFileSystem.cpp)
     xsimd::xsimd
     date::date)
 
-if(BOLT_ENABLE_ARROW_HDFS)
+if(BOLT_USE_ARROW_HDFS)
   target_sources(bolt_hdfs PRIVATE HdfsFileSystem.cpp HdfsReadFile.cpp
                                     HdfsWriteFile.cpp StorageException.cpp)
 
