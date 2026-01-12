@@ -28,7 +28,7 @@
 
 add_library(bolt_hdfs RegisterHdfsFileSystem.cpp)
 
-if(BOLT_ENABLE_HDFS)
+if(BOLT_ENABLE_ARROW_HDFS)
   target_sources(bolt_hdfs PRIVATE HdfsFileSystem.cpp HdfsReadFile.cpp
                                     HdfsWriteFile.cpp StorageException.cpp)
 
