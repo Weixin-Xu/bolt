@@ -213,7 +213,7 @@ class BoltConan(ConanFile):
         "enable_txt": True,
         # file system options
         "enable_hdfs": True,
-        "enable_s3": True,
+        "enable_s3": False,
         "use_arrow_hdfs": True,
         "targets": None,
         "enable_arrow_connector": False,
