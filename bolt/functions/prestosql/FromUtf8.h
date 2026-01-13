@@ -35,11 +35,8 @@
 
 namespace bytedance::bolt::functions {
 
-std::shared_ptr<exec::VectorFunction> makeFromUtf8(
-    const std::string& name,
-    const std::vector<exec::VectorFunctionArg>& inputArgs,
-    const core::QueryConfig& config);
+std::shared_ptr<exec::VectorFunction> makeFromUtf8();
 
-void registerArrayConstructor(const std::string& name);
+void registerFromUtf8(const std::string& name);
 
 } // namespace bytedance::bolt::functions

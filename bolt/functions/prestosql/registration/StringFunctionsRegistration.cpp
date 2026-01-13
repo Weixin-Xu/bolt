@@ -31,6 +31,7 @@
 #include "bolt/functions/Registerer.h"
 #include "bolt/functions/lib/Re2Functions.h"
 #include "bolt/functions/lib/StringUtil.h"
+#include "bolt/functions/prestosql/FromUtf8.h"
 #include "bolt/functions/prestosql/RegexFunctions.h"
 #include "bolt/functions/prestosql/SplitPart.h"
 #include "bolt/functions/prestosql/SplitToMap.h"
@@ -126,7 +127,7 @@ void registerStringFunctions(const std::string& prefix) {
 #endif
   BOLT_REGISTER_VECTOR_FUNCTION(udf_reverse, prefix + "reverse");
   BOLT_REGISTER_VECTOR_FUNCTION(udf_to_utf8, prefix + "to_utf8");
-  BOLT_REGISTER_VECTOR_FUNCTION(udf_from_utf8, prefix + "from_utf8");
+  registerFromUtf8(prefix + "from_utf8");
   BOLT_REGISTER_VECTOR_FUNCTION(udf_str_to_map, prefix + "str_to_map");
 
   // Regex functions

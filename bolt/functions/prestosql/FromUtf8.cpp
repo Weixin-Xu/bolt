@@ -305,10 +305,7 @@ const std::string FromUtf8Function::kReplacementChar =
     codePointToString(0xFFFD);
 } // namespace
 
-std::shared_ptr<exec::VectorFunction> makeFromUtf8(
-    const std::string& /*name*/,
-    const std::vector<exec::VectorFunctionArg>& /*inputArgs*/,
-    const core::QueryConfig& /*config*/) {
+std::shared_ptr<exec::VectorFunction> makeFromUtf8() {
   return std::make_shared<FromUtf8Function>();
 }
 
@@ -316,5 +313,9 @@ BOLT_DECLARE_VECTOR_FUNCTION(
     udf_from_utf8,
     FromUtf8Function::signatures(),
     std::make_unique<FromUtf8Function>());
+
+void registerFromUtf8(const std::string& name) {
+  BOLT_REGISTER_VECTOR_FUNCTION(udf_from_utf8, name);
+}
 
 } // namespace bytedance::bolt::functions
