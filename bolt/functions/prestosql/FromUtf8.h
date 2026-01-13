@@ -27,6 +27,7 @@
  * This modified file is released under the same license.
  * --------------------------------------------------------------------------
  */
+#pragma once
 
 #include "bolt/expression/DecodedArgs.h"
 #include "bolt/expression/StringWriter.h"
