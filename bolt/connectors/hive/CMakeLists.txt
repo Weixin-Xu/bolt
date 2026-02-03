@@ -69,18 +69,10 @@ endif()
 
 set(ENABLED_FILESYSTEMS "")
 
-if(BOLT_ENABLE_S3)
-  list(APPEND ENABLED_FILESYSTEMS "bolt_s3fs")
-endif()
-if(BOLT_ENABLE_GCS)
-  list(APPEND ENABLED_FILESYSTEMS "bolt_gcs")
-endif()
-if(BOLT_ENABLE_HDFS)
-  list(APPEND ENABLED_FILESYSTEMS "bolt_hdfs")
-endif()
-if(BOLT_ENABLE_ABFS)
-  list(APPEND ENABLED_FILESYSTEMS "bolt_abfs")
-endif()
+list(APPEND ENABLED_FILESYSTEMS "bolt_s3fs")
+list(APPEND ENABLED_FILESYSTEMS "bolt_gcs")
+list(APPEND ENABLED_FILESYSTEMS "bolt_hdfs")
+list(APPEND ENABLED_FILESYSTEMS "bolt_abfs")
 
 target_link_libraries(
   bolt_hive_connector
