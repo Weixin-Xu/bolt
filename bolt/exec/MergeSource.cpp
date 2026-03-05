@@ -174,8 +174,9 @@ class MergeExchangeSource : public MergeSource {
     }
 
     if (!inputStream_->atEnd()) {
-      static const serializer::presto::PrestoVectorSerde::PrestoOptions options(
-          false, common::CompressionKind::CompressionKind_ZSTD);
+      const auto& qc = mergeExchange_->operatorCtx()->driverCtx()->queryConfig();
+      const auto kind = common::stringToCompressionKind(qc.shuffleCompressionKind());
+      const serializer::presto::PrestoVectorSerde::PrestoOptions options(false, kind);
       VectorStreamGroup::read(
           inputStream_.get(),
           mergeExchange_->pool(),

@@ -34,6 +34,21 @@
 namespace bytedance::bolt::exec {
 
 namespace detail {
+Destination::Destination(
+    const std::string& taskId,
+    int destination,
+    memory::MemoryPool* pool,
+    bool eagerFlush,
+    std::function<void(uint64_t bytes, uint64_t rows)> recordEnqueued,
+    common::CompressionKind compressionKind)
+    : taskId_(taskId),
+      destination_(destination),
+      pool_(pool),
+      eagerFlush_(eagerFlush),
+      recordEnqueued_(std::move(recordEnqueued)),
+      options_(false, compressionKind) {
+  setTargetSizePct();
+}
 BlockingReason Destination::advance(
     uint64_t maxBytes,
     const std::vector<vector_size_t>& sizes,
@@ -154,10 +169,10 @@ PartitionedOutput::PartitionedOutput(
                             ->queryConfig()
                             .maxPartitionedOutputBufferSize()),
       eagerFlush_(eagerFlush),
-      compressionKind_(
-          ctx->task->queryCtx()->queryConfig().isExchangeCompressionEnabled()
-              ? common::CompressionKind_ZSTD
-              : common::CompressionKind_NONE) {
+      compressionKind_([&]() {
+        const auto& qc = ctx->task->queryCtx()->queryConfig();
+        return common::stringToCompressionKind(qc.shuffleCompressionKind());
+      }()) {
   if (!planNode->isPartitioned()) {
     BOLT_USER_CHECK_EQ(numDestinations_, 1);
   }
@@ -401,6 +416,21 @@ RowVectorPtr PartitionedOutput::getOutput() {
 
 bool PartitionedOutput::isFinished() {
   return finished_;
+}
+
+void PartitionedOutput::close() {
+  Operator::close();
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        Operator::kShuffleCompressionKind,
+        RuntimeCounter(static_cast<int64_t>(compressionKind_)));
+    // Record serde kind used by PartitionedOutput based on the active serde.
+    lockedStats->addRuntimeStat(
+        Operator::kShuffleSerdeKind,
+        RuntimeCounter(static_cast<int64_t>(getVectorSerde()->kind())));
+  }
+  destinations_.clear();
 }
 
 } // namespace bytedance::bolt::exec

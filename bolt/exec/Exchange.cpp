@@ -168,6 +168,16 @@ void Exchange::close() {
     exchangeClient_->close();
   }
   exchangeClient_ = nullptr;
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        Operator::kShuffleCompressionKind,
+        RuntimeCounter(static_cast<int64_t>(options_.compressionKind)));
+    // Record serde kind used by Exchange based on the active serde.
+    lockedStats->addRuntimeStat(
+        Operator::kShuffleSerdeKind,
+        RuntimeCounter(static_cast<int64_t>(getSerde()->kind())));
+  }
 }
 
 void Exchange::recordExchangeClientStats() {

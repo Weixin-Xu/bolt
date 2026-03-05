@@ -314,6 +314,13 @@ PlanBuilder& PlanBuilder::exchange(const RowTypePtr& outputType) {
   return *this;
 }
 
+PlanBuilder& PlanBuilder::exchange(
+    const RowTypePtr& outputType,
+    VectorSerde::Kind /*serdeKind*/) {
+  // Serde kind is ignored in test plan builder.
+  return exchange(outputType);
+}
+
 namespace {
 std::pair<
     std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>>,
@@ -354,6 +361,14 @@ PlanBuilder& PlanBuilder::mergeExchange(
       nextPlanNodeId(), outputType, sortingKeys, sortingOrders);
 
   return *this;
+}
+
+PlanBuilder& PlanBuilder::mergeExchange(
+    const RowTypePtr& outputType,
+    const std::vector<std::string>& keys,
+    VectorSerde::Kind /*serdeKind*/) {
+  // Serde kind is ignored in test plan builder.
+  return mergeExchange(outputType, keys);
 }
 
 PlanBuilder& PlanBuilder::optionalProject(
@@ -1263,6 +1278,15 @@ PlanBuilder& PlanBuilder::partitionedOutput(
 PlanBuilder& PlanBuilder::partitionedOutput(
     const std::vector<std::string>& keys,
     int numPartitions,
+    const std::vector<std::string>& outputLayout,
+    VectorSerde::Kind /*serdeKind*/) {
+  // Serde kind is ignored in test plan builder.
+  return partitionedOutput(keys, numPartitions, outputLayout);
+}
+
+PlanBuilder& PlanBuilder::partitionedOutput(
+    const std::vector<std::string>& keys,
+    int numPartitions,
     bool replicateNullsAndAny,
     const std::vector<std::string>& outputLayout) {
   BOLT_CHECK_NOT_NULL(planNode_, "PartitionedOutput cannot be the source node");
@@ -1274,6 +1298,16 @@ PlanBuilder& PlanBuilder::partitionedOutput(
       replicateNullsAndAny,
       createPartitionFunctionSpec(planNode_->outputType(), keyExprs, pool_),
       outputLayout);
+}
+
+PlanBuilder& PlanBuilder::partitionedOutput(
+    const std::vector<std::string>& keys,
+    int numPartitions,
+    bool replicateNullsAndAny,
+    const std::vector<std::string>& outputLayout,
+    VectorSerde::Kind /*serdeKind*/) {
+  // Serde kind is ignored in test plan builder.
+  return partitionedOutput(keys, numPartitions, replicateNullsAndAny, outputLayout);
 }
 
 PlanBuilder& PlanBuilder::partitionedOutput(
@@ -1298,6 +1332,22 @@ PlanBuilder& PlanBuilder::partitionedOutput(
   return *this;
 }
 
+PlanBuilder& PlanBuilder::partitionedOutput(
+    const std::vector<std::string>& keys,
+    int numPartitions,
+    bool replicateNullsAndAny,
+    core::PartitionFunctionSpecPtr partitionFunctionSpec,
+    const std::vector<std::string>& outputLayout,
+    VectorSerde::Kind /*serdeKind*/) {
+  // Serde kind is ignored in test plan builder.
+  return partitionedOutput(
+      keys,
+      numPartitions,
+      replicateNullsAndAny,
+      std::move(partitionFunctionSpec),
+      outputLayout);
+}
+
 PlanBuilder& PlanBuilder::partitionedOutputBroadcast(
     const std::vector<std::string>& outputLayout) {
   BOLT_CHECK_NOT_NULL(planNode_, "PartitionedOutput cannot be the source node");
@@ -1307,6 +1357,13 @@ PlanBuilder& PlanBuilder::partitionedOutputBroadcast(
   planNode_ = core::PartitionedOutputNode::broadcast(
       nextPlanNodeId(), 1, outputType, planNode_);
   return *this;
+}
+
+PlanBuilder& PlanBuilder::partitionedOutputBroadcast(
+    const std::vector<std::string>& outputLayout,
+    VectorSerde::Kind /*serdeKind*/) {
+  // Serde kind is ignored in test plan builder.
+  return partitionedOutputBroadcast(outputLayout);
 }
 
 PlanBuilder& PlanBuilder::partitionedOutputArbitrary(

@@ -47,15 +47,7 @@ class Destination {
       memory::MemoryPool* pool,
       bool eagerFlush,
       std::function<void(uint64_t bytes, uint64_t rows)> recordEnqueued,
-      common::CompressionKind compressionKind)
-      : taskId_(taskId),
-        destination_(destination),
-        pool_(pool),
-        eagerFlush_(eagerFlush),
-        recordEnqueued_(std::move(recordEnqueued)),
-        options_(false, compressionKind) {
-    setTargetSizePct();
-  }
+      common::CompressionKind compressionKind);
 
   // Resets the destination before starting a new batch.
   void beginBatch() {
@@ -196,10 +188,10 @@ class PartitionedOutput : public Operator {
 
   bool isFinished() override;
 
-  void close() override {
-    Operator::close();
-    destinations_.clear();
-  }
+  void close() override;
+
+  // Testing-only hook to adjust compression behavior; no-op in Bolt.
+  static void testingSetMinCompressionRatio(float /*ratio*/) {}
 
  private:
   void initializeInput(RowVectorPtr input);

@@ -430,7 +430,9 @@ class QueryConfig {
   static constexpr const char* kMinTableRowsForParallelJoinBuild =
       "min_table_rows_for_parallel_join_build";
 
-  static constexpr const char* kExchangeCompression = "exchange_compression";
+  // Shuffle compression codec. Supported values: none, zstd, lz4, gzip,
+  // snappy, zlib, lzo.
+  static constexpr const char* kShuffleCompressionKind = "shuffle_compression_codec";
 
   static constexpr const char* kNativeCacheEnabled = "native_cache_enabled";
 
@@ -1327,8 +1329,9 @@ class QueryConfig {
     return get<uint32_t>(kMinTableRowsForParallelJoinBuild, 1'000);
   }
 
-  bool isExchangeCompressionEnabled() const {
-    return get<bool>(kExchangeCompression, false);
+  // Returns shuffle compression codec string, default "none".
+  std::string shuffleCompressionKind() const {
+    return get<std::string>(kShuffleCompressionKind, "none");
   }
 
   bool isNativeCacheEnabled() const {

@@ -204,7 +204,6 @@ class MergeExchange : public Merge {
       int32_t operatorId,
       DriverCtx* driverCtx,
       const std::shared_ptr<const core::MergeExchangeNode>& orderByNode);
-
  protected:
   BlockingReason addMergeSources(ContinueFuture* future) override;
 

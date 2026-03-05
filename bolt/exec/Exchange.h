@@ -69,11 +69,10 @@ class Exchange : public SourceOperator {
         exchangeClient_{std::move(exchangeClient)},
         options_(
             false,
-            driverCtx->task->queryCtx()
-                    ->queryConfig()
-                    .isExchangeCompressionEnabled()
-                ? common::CompressionKind::CompressionKind_ZSTD
-                : common::CompressionKind::CompressionKind_NONE) {}
+            [&]() {
+              const auto& qc = driverCtx->task->queryCtx()->queryConfig();
+              return common::stringToCompressionKind(qc.shuffleCompressionKind());
+            }()) {}
 
   ~Exchange() override {
     close();

@@ -350,7 +350,7 @@ class VectorStreamGroup : public StreamArena {
       bolt::memory::MemoryPool* pool,
       RowTypePtr type,
       RowVectorPtr* result,
-      const VectorSerde::Options* options = nullptr);
+      const VectorSerde::Options* options);
 
   void clear() override {
     StreamArena::clear();

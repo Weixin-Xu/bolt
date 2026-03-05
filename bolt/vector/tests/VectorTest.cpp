@@ -892,7 +892,10 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
     auto evenInput = prepareInput(evenString);
 
     RowVectorPtr resultRow;
-    VectorStreamGroup::read(evenInput.get(), pool(), sourceRowType, &resultRow);
+    VectorStreamGroup::read(
+        evenInput.get(), pool(), sourceRowType, &resultRow, nullptr);
+    VectorStreamGroup::read(
+        evenInput.get(), pool(), sourceRowType, &resultRow, nullptr);
     VectorPtr result = resultRow->childAt(0);
     switch (source->encoding()) {
       case VectorEncoding::Simple::FLAT:
@@ -921,7 +924,8 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
     auto oddString = oddStream.str();
     auto oddInput = prepareInput(oddString);
 
-    VectorStreamGroup::read(oddInput.get(), pool(), sourceRowType, &resultRow);
+    VectorStreamGroup::read(
+        oddInput.get(), pool(), sourceRowType, &resultRow, nullptr);
     result = resultRow->childAt(0);
     for (int32_t i = 0; i < oddIndices.size(); ++i) {
       EXPECT_TRUE(result->equalValueAt(source.get(), i, oddIndices[i].begin))
