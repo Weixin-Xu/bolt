@@ -350,30 +350,30 @@ macro names are always upper-snake-case. Also:
 
 ## Namespaces
 
-* All Bolt code should be placed inside the `facebook::bolt` namespace
+* All Bolt code should be placed inside the `bytedance::bolt` namespace
 * Always use nested namespace definition:
-  * `namespace facebook::bolt::core {` and not
-  * `namespace facebook { namespace bolt { namespace core {`
+  * `namespace bytedance::bolt::core {` and not
+  * `namespace bytedance { namespace bolt { namespace core {`
 * Always add an inline comment at the end of the namespace definition, and surround
   it by empty lines:
 
 ```
-namespace facebook::bolt::exec {
+namespace bytedance::bolt::exec {
 
 myFunc();
 
-} // namespace facebook::bolt::exec
+} // namespace bytedance::bolt::exec
 ```
 
   * not:
 
 ```
-namespace facebook::bolt::exec {
+namespace bytedance::bolt::exec {
 myFunc();
 }
 ```
 
-* Use sub namespaces (e.g: facebook::bolt::core) to logically group large
+* Use sub namespaces (e.g: bytedance::bolt::core) to logically group large
   chunks of related code and prevent identifier clashes.
   * Namespaces should make it easier to code, not harder. Refrain from creating
     hierarchies that are way too long.
