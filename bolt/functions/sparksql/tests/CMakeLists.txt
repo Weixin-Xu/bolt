@@ -65,6 +65,7 @@ add_executable(
   JsonToMapTest.cpp
   JsonTupleTest.cpp
   LeastGreatestTest.cpp
+  LuhnCheckTest.cpp
   MakeDecimalTest.cpp
   MakeTimestampTest.cpp
   MapConcatTest.cpp
