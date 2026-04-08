@@ -606,7 +606,7 @@ void* MemoryPoolImpl::allocate(
         toString(),
         allocator_->getAndClearFailureMessage()));
   }
-  RECORD_ALLOC(buffer, size);
+  RECORD_ALLOC_SPEC(this, buffer, size);
   return buffer;
 }
 
@@ -630,7 +630,7 @@ void* MemoryPoolImpl::allocateZeroFilled(
         toString(),
         allocator_->getAndClearFailureMessage()));
   }
-  RECORD_ALLOC(buffer, size);
+  RECORD_ALLOC_SPEC(this, buffer, size);
   return buffer;
 }
 
@@ -664,7 +664,7 @@ void* MemoryPoolImpl::reallocate(
     if (p) {
       RECORD_FREE(p, size);
     }
-    RECORD_ALLOC(newP, newSize);
+    RECORD_ALLOC_SPEC(this, newP, newSize);
   } else {
     RECORD_GROW(p, newP, size, newSize);
   }

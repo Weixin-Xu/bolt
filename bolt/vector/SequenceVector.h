@@ -213,6 +213,10 @@ class SequenceVector : public SimpleVector<T> {
     return false;
   }
 
+  void transferOrCopyTo(bolt::memory::MemoryPool* /*pool*/) override {
+    BOLT_UNSUPPORTED("transferTo not defined for SequenceVector");
+  }
+
  private:
   // Prepares for use after construction.
   void setInternalState();

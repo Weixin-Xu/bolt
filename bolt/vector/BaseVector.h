@@ -501,9 +501,11 @@ class BaseVector {
       bool canCopyAll);
 
   // Utility for making a deep copy of a whole vector.
-  static VectorPtr copy(const BaseVector& vector) {
-    auto result =
-        BaseVector::create(vector.type(), vector.size(), vector.pool());
+  static VectorPtr copy(
+      const BaseVector& vector,
+      bolt::memory::MemoryPool* pool = nullptr) {
+    auto result = BaseVector::create(
+        vector.type(), vector.size(), pool ? pool : vector.pool());
     result->copy(&vector, 0, 0, vector.size());
     return result;
   }
@@ -532,6 +534,8 @@ class BaseVector {
       const folly::Range<const CopyRange*>& /*ranges*/) {
     BOLT_UNSUPPORTED("Can only copy into flat or complex vectors");
   }
+
+  virtual void transferOrCopyTo(bolt::memory::MemoryPool* pool);
 
   // Construct a zero-copy slice of the vector with the indicated offset and
   // length.

@@ -322,6 +322,24 @@ class FlatVector final : public SimpleVector<T> {
       const BaseVector* source,
       const folly::Range<const BaseVector::CopyRange*>& ranges) override;
 
+  void transferOrCopyTo(bolt::memory::MemoryPool* pool) override {
+    BaseVector::transferOrCopyTo(pool);
+    if (values_ && !values_->transferTo(pool)) {
+      values_ = AlignedBuffer::copy<T>(values_, pool);
+      rawValues_ = const_cast<T*>(values_->as<T>());
+    }
+    for (auto& buffer : stringBuffers_) {
+      if (!buffer->transferTo(pool)) {
+        BOLT_CHECK_NE(
+            stringBufferSet_.erase(buffer.get()),
+            0,
+            "Easure of existing string buffer should always succeed.");
+        buffer = AlignedBuffer::copy<char>(buffer, pool);
+        BOLT_CHECK(stringBufferSet_.insert(buffer.get()).second);
+      }
+    }
+  }
+
   void resize(vector_size_t newSize, bool setNotNull = true) override;
 
   VectorPtr slice(vector_size_t offset, vector_size_t length) const override;

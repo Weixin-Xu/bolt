@@ -397,6 +397,16 @@ class ConstantVector final : public SimpleVector<T> {
     }
   }
 
+  void transferOrCopyTo(bolt::memory::MemoryPool* pool) override {
+    BaseVector::transferOrCopyTo(pool);
+    if (valueVector_) {
+      valueVector_->transferOrCopyTo(pool);
+    }
+    if (stringBuffer_ && !stringBuffer_->transferTo(pool)) {
+      stringBuffer_ = AlignedBuffer::copy<char>(stringBuffer_, pool);
+    }
+  }
+
  protected:
   std::string toSummaryString() const override {
     std::stringstream out;
