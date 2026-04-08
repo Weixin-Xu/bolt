@@ -212,6 +212,10 @@ class Buffer {
         sizeof(T), is_pod_like_v<T>, buffer, offset, length);
   }
 
+  /// Transfers this buffer to 'pool'. Returns true if the transfer succeeds, or
+  /// false if the transfer fails. A buffer can be transferred to 'pool' if its
+  /// original pool and 'pool' are from the same MemoryAllocator and the buffer
+  /// is not a BufferView.
   virtual bool transferTo(bolt::memory::MemoryPool* /*pool*/) {
     BOLT_NYI("{} unsupported", __FUNCTION__);
   }

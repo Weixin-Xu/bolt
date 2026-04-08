@@ -535,10 +535,15 @@ class BaseVector {
     BOLT_UNSUPPORTED("Can only copy into flat or complex vectors");
   }
 
+  /// Transfer or copy this vector and all its buffers recursively to 'pool'.
+  /// The transfer of a buffer is allowed if its original pool and 'pool' are
+  /// from the same MemoryAllocator and the buffer is not a BufferView. If a
+  /// buffer is not allowed to be transferred, it is copied to pool. After this
+  /// call, this vector and all its buffers are owned by 'pool'.
   virtual void transferOrCopyTo(bolt::memory::MemoryPool* pool);
 
-  // Construct a zero-copy slice of the vector with the indicated offset and
-  // length.
+  /// Construct a zero-copy slice of the vector with the indicated offset and
+  /// length.
   virtual VectorPtr slice(vector_size_t offset, vector_size_t length) const = 0;
 
   // Returns a vector of the type of 'source' where 'indices' contains

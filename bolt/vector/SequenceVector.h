@@ -214,7 +214,7 @@ class SequenceVector : public SimpleVector<T> {
   }
 
   void transferOrCopyTo(bolt::memory::MemoryPool* /*pool*/) override {
-    BOLT_UNSUPPORTED("transferTo not defined for SequenceVector");
+    BOLT_NYI("{} unsupported", __FUNCTION__);
   }
 
  private:
