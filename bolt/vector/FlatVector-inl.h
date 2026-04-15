@@ -717,7 +717,6 @@ inline void FlatVector<bool>::resizeValues(
   rawValues_ = values_->asMutable<bool>();
 }
 
-
 template <typename T>
 void FlatVector<T>::transferAndUpdateStringBuffers(
     bolt::memory::MemoryPool* /*pool*/) {
