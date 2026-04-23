@@ -247,7 +247,7 @@ add_library(bolt_engine
 target_link_libraries(bolt_engine PUBLIC
                                   $<$<CONFIG:Debug>:bolt_debug_util>
                                   arrow::arrow
-                                  llvm-core::llvm-core
+                                  $<$<BOOL:${ENABLE_BOLT_JIT}>:llvm-core::llvm-core>
                                   Folly::folly
                                   gfx::timsort
                                   date::date
