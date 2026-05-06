@@ -51,9 +51,8 @@ DEFINE_bool(ssd_verify_write, false, "Read back data after writing to SSD");
 namespace bytedance::bolt::cache {
 
 namespace {
-// Disable 'copy on write' on the given file. Will throw if failed for any
-// reason, including file system not supporting cow feature.
-void disableCow(int32_t fd) {
+// TODO: Remove this function once we migrate all files to velox fs.
+void disableFileCow(int32_t fd) {
 #ifdef linux
   int attr{0};
   auto res = ioctl(fd, FS_IOC_GETFLAGS, &attr);
@@ -139,37 +138,21 @@ SsdFile::SsdFile(
     : fileName_(filename),
       maxRegions_(maxRegions),
       shardId_(shardId),
+      fs_(filesystems::getFileSystem(fileName_, nullptr)),
       checkpointIntervalBytes_(checkpointIntervalBytes),
       executor_(executor) {
-  int32_t oDirect = 0;
-#ifdef linux
-  oDirect = FLAGS_ssd_odirect ? O_DIRECT : 0;
-#endif // linux
-  fd_ = open(fileName_.c_str(), O_CREAT | O_RDWR | oDirect, S_IRUSR | S_IWUSR);
-  if (FOLLY_UNLIKELY(fd_ < 0)) {
-    ++stats_.openFileErrors;
-  }
-  // TODO: add fault tolerant handling for open file errors.
-  BOLT_CHECK_GE(
-      fd_,
-      0,
-      "Could not open or create {}. Error: {}",
-      filename,
-      folly::errnoStr(errno));
+  process::TraceContext trace("SsdFile::SsdFile");
+  filesystems::FileOptions fileOptions;
+  fileOptions.shouldThrowOnFileAlreadyExists = false;
+  fileOptions.bufferWrite = !FLAGS_ssd_odirect;
+  writeFile_ = fs_->openFileForWrite(fileName_, fileOptions);
+  readFile_ = fs_->openFileForRead(fileName_);
 
-  if (disableFileCow) {
-    disableCow(fd_);
-  }
-
-  readFile_ = std::make_unique<LocalReadFile>(fd_);
-  uint64_t size = lseek(fd_, 0, SEEK_END);
-  numRegions_ = size / kRegionSize;
-  if (numRegions_ > maxRegions_) {
-    numRegions_ = maxRegions_;
-  }
+  const uint64_t size = writeFile_->size();
+  numRegions_ = std::min<int32_t>(size / kRegionSize, maxRegions_);
   fileSize_ = numRegions_ * kRegionSize;
-  if (size % kRegionSize > 0 || size > numRegions_ * kRegionSize) {
-    ftruncate(fd_, fileSize_);
+  if ((size % kRegionSize > 0) || (size > numRegions_ * kRegionSize)) {
+    writeFile_->truncate(fileSize_);
   }
   // The existing regions in the file are writable.
   writableRegions_.resize(numRegions_);
@@ -180,6 +163,10 @@ SsdFile::SsdFile(
   regionPins_.resize(maxRegions_, 0);
   if (checkpointEnabled()) {
     initializeCheckpoint();
+  }
+
+  if (disableFileCow) {
+    disableFileCow();
   }
 }
 
@@ -322,19 +309,22 @@ std::optional<std::pair<uint64_t, int32_t>> SsdFile::getSpace(
 bool SsdFile::growOrEvictLocked() {
   if (numRegions_ < maxRegions_) {
     const auto newSize = (numRegions_ + 1) * kRegionSize;
-    const auto rc = ::ftruncate(fd_, newSize);
-    if (rc >= 0) {
+    try {
+      writeFile_->truncate(newSize);
       fileSize_ = newSize;
       writableRegions_.push_back(numRegions_);
       regionSizes_[numRegions_] = 0;
       erasedRegionSizes_[numRegions_] = 0;
       ++numRegions_;
+      BOLT_SSD_CACHE_LOG(INFO)
+          << "Grow cache file " << fileName_ << " to " << numRegions_
+          << " regions (max: " << maxRegions_ << ")";
       return true;
+    } catch (const std::exception& e) {
+      ++stats_.growFileErrors;
+      BOLT_SSD_CACHE_LOG(ERROR)
+          << "Failed to grow cache file " << fileName_ << " to " << newSize;
     }
-
-    ++stats_.growFileErrors;
-    LOG(ERROR) << "Failed to grow cache file " << fileName_ << " to "
-               << newSize;
   }
 
   auto candidates =
@@ -346,7 +336,8 @@ bool SsdFile::growOrEvictLocked() {
 
   logEviction(candidates);
   clearRegionEntriesLocked(candidates);
-  writableRegions_ = std::move(candidates);
+  stats_.regionsEvicted += candidates.size();
+  writableRegions_ = candidates;
   suspended_ = false;
   return true;
 }
@@ -406,14 +397,7 @@ void SsdFile::write(std::vector<CachePin>& pins) {
     }
     BOLT_CHECK_GE(fileSize_, offset + bytes);
 
-    const auto rc = folly::pwritev(fd_, iovecs.data(), iovecs.size(), offset);
-    if (rc != bytes) {
-      BOLT_SSD_CACHE_LOG(ERROR)
-          << "Failed to write to SSD, file name: " << fileName_
-          << ", fd: " << fd_ << ", size: " << iovecs.size()
-          << ", offset: " << offset << ", error code: " << errno
-          << ", error string: " << folly::errnoStr(errno);
-      ++stats_.writeSsdErrors;
+    if (!write(offset, bytes, iovecs)) {
       // If write fails, we return without adding the pins to the cache. The
       // entries are unchanged.
       return;
@@ -445,6 +429,24 @@ void SsdFile::write(std::vector<CachePin>& pins) {
   }
 }
 
+bool SsdFile::write(
+    int64_t offset,
+    int64_t length,
+    const std::vector<iovec>& iovecs) {
+  try {
+    writeFile_->write(iovecs, offset, length);
+    return true;
+  } catch (const std::exception& e) {
+    BOLT_SSD_CACHE_LOG(ERROR)
+        << "Failed to write to SSD, file name: " << fileName_
+        << ", size: " << iovecs.size() << ", offset: " << offset
+        << ", error code: " << errno
+        << ", error string: " << folly::errnoStr(errno);
+    ++stats_.writeSsdErrors;
+    return false;
+  }
+}
+
 namespace {
 int32_t indexOfFirstMismatch(char* x, char* y, int n) {
   for (auto i = 0; i < n; ++i) {
@@ -457,9 +459,11 @@ int32_t indexOfFirstMismatch(char* x, char* y, int n) {
 } // namespace
 
 void SsdFile::verifyWrite(AsyncDataCacheEntry& entry, SsdRun ssdRun) {
+  process::TraceContext trace("SsdFile::verifyWrite");
   auto testData = std::make_unique<char[]>(entry.size());
-  const auto rc = ::pread(fd_, testData.get(), entry.size(), ssdRun.offset());
-  BOLT_CHECK_EQ(rc, entry.size());
+  const auto rc =
+      readFile_->pread(ssdRun.offset(), entry.size(), testData.get());
+  BOLT_CHECK_EQ(rc.size(), entry.size());
   if (entry.tinyData() != nullptr) {
     if (::memcmp(testData.get(), entry.tinyData(), entry.size()) != 0) {
       BOLT_FAIL("Bad read back");
@@ -526,14 +530,16 @@ void SsdFile::testingClear() {
 
 void SsdFile::testingDeleteFile() {
   process::TraceContext trace("SsdFile::testingDeleteFile");
-  if (fd_) {
-    close(fd_);
-    fd_ = 0;
+  if (writeFile_) {
+    writeFile_->close();
+    writeFile_.reset();
   }
-  auto rc = unlink(fileName_.c_str());
-  if (rc < 0) {
-    BOLT_SSD_CACHE_LOG(ERROR)
-        << "Error deleting cache file " << fileName_ << " rc: " << rc;
+  try {
+    fs_->remove(fileName_);
+  } catch (const std::exception& e) {
+    BOLT_SSD_CACHE_LOG(ERROR) << "Failed to delete cache file " << fileName_
+                             << ", error code: " << errno
+                             << ", error string: " << folly::errnoStr(errno);
   }
 }
 
@@ -682,8 +688,10 @@ void SsdFile::checkpoint(bool force) {
     // We schedule the potentially long fsync of the cache file on another
     // thread of the cache write executor, if available. If there is none, we do
     // the sync on this thread at the end.
-    auto fileSync = std::make_shared<AsyncSource<int>>(
-        [fd = fd_]() { return std::make_unique<int>(::fsync(fd)); });
+    auto fileSync = std::make_shared<AsyncSource<int>>([this]() {
+      writeFile_->flush();
+      return std::make_unique<int>(0);
+    });
     if (executor_ != nullptr) {
       executor_->add([fileSync]() { fileSync->prepare(); });
     }
@@ -740,8 +748,7 @@ void SsdFile::checkpoint(bool force) {
 
       // NOTE: we need to ensure cache file data sync update completes before
       // updating checkpoint file.
-      const auto fileSyncRc = fileSync->move();
-      checkRc(*fileSyncRc, "Sync of cache data file");
+      fileSync->move();
 
       const auto endMarker = kCheckpointEndMarker;
       state.write(asChar(&endMarker), sizeof(endMarker));
@@ -823,10 +830,36 @@ void SsdFile::initializeCheckpoint() {
   }
 }
 
+void SsdFile::disableFileCow() {
+#ifdef linux
+  auto* localWriteFile = dynamic_cast<LocalWriteFile*>(writeFile_.get());
+  BOLT_CHECK(localWriteFile != nullptr, "Expected LocalWriteFile");
+  int attr{0};
+  const auto fd = localWriteFile->fd();
+  const auto res = ioctl(fd, FS_IOC_GETFLAGS, &attr);
+  BOLT_CHECK_EQ(
+      0,
+      res,
+      "ioctl(FS_IOC_GETFLAGS) failed: {}, {}",
+      res,
+      folly::errnoStr(errno));
+  attr |= FS_NOCOW_FL;
+  const auto setRes = ioctl(fd, FS_IOC_SETFLAGS, &attr);
+  BOLT_CHECK_EQ(
+      0,
+      setRes,
+      "ioctl(FS_IOC_SETFLAGS, FS_NOCOW_FL) failed: {}, {}",
+      setRes,
+      folly::errnoStr(errno));
+#endif // linux
+}
+
 bool SsdFile::testingIsCowDisabled() const {
 #ifdef linux
+  auto* localWriteFile = dynamic_cast<LocalWriteFile*>(writeFile_.get());
+  BOLT_CHECK(localWriteFile != nullptr, "Expected LocalWriteFile");
   int attr{0};
-  const auto res = ioctl(fd_, FS_IOC_GETFLAGS, &attr);
+  const auto res = ioctl(localWriteFile->fd(), FS_IOC_GETFLAGS, &attr);
   BOLT_CHECK_EQ(
       0,
       res,

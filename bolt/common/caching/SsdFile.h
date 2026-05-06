@@ -33,6 +33,7 @@
 #include "bolt/common/caching/AsyncDataCache.h"
 #include "bolt/common/caching/SsdFileTracker.h"
 #include "bolt/common/file/File.h"
+#include "bolt/common/file/FileSystems.h"
 
 #include <gflags/gflags.h>
 
@@ -336,8 +337,16 @@ class SsdFile {
   // Reads the backing file with ReadFile::preadv().
   void read(uint64_t offset, const std::vector<folly::Range<char*>>& buffers);
 
+  // Writes 'iovecs' to the SSD file at the 'offset'. Returns true if the write
+  // succeeds; otherwise, log the error and return false.
+  bool write(int64_t offset, int64_t length, const std::vector<iovec>& iovecs);
+
   // Verifies that 'entry' has the data at 'run'.
   void verifyWrite(AsyncDataCacheEntry& entry, SsdRun run);
+
+  // Disable 'copy on write'. Will throw if failed for any reason, including
+  // file system not supporting cow feature.
+  void disableFileCow();
 
   // Deletes checkpoint files. If 'keepLog' is true, truncates and syncs the
   // eviction log and leaves this open.
@@ -423,14 +432,17 @@ class SsdFile {
   // Map of file number and offset to location in file.
   folly::F14FastMap<FileCacheKey, SsdRun> entries_;
 
-  // File descriptor. 0 (stdin) means file not open.
-  int32_t fd_{0};
+  // File system.
+  std::shared_ptr<filesystems::FileSystem> fs_;
 
   // Size of the backing file in bytes. Must be multiple of kRegionSize.
   uint64_t fileSize_{0};
 
-  // ReadFile made from 'fd_'.
+  // ReadFile for cache data file.
   std::unique_ptr<ReadFile> readFile_;
+
+  // WriteFile for cache data file.
+  std::unique_ptr<WriteFile> writeFile_;
 
   // Counters.
   SsdCacheStats stats_;
