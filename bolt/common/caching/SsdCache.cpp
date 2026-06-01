@@ -163,7 +163,7 @@ bool SsdCache::removeFileEntries(
       success &= files_[i]->removeFileEntries(filesToRemove, filesRetained);
     } catch (const std::exception& e) {
       BOLT_SSD_CACHE_LOG(ERROR) << "Error removing file entries from SSD shard "
-                               << files_[i]->shardId() << ": " << e.what();
+                                << files_[i]->shardId() << ": " << e.what();
       success = false;
     }
     --writesInProgress_;

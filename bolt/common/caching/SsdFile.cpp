@@ -35,6 +35,7 @@
 #include "bolt/common/base/SuccinctPrinter.h"
 #include "bolt/common/caching/FileIds.h"
 #include "bolt/common/caching/SsdCache.h"
+#include "bolt/common/process/TraceContext.h"
 
 #include <fcntl.h>
 #ifdef linux
@@ -51,28 +52,6 @@ DEFINE_bool(ssd_verify_write, false, "Read back data after writing to SSD");
 namespace bytedance::bolt::cache {
 
 namespace {
-// TODO: Remove this function once we migrate all files to velox fs.
-void disableFileCow(int32_t fd) {
-#ifdef linux
-  int attr{0};
-  auto res = ioctl(fd, FS_IOC_GETFLAGS, &attr);
-  BOLT_CHECK_EQ(
-      0,
-      res,
-      "ioctl(FS_IOC_GETFLAGS) failed: {}, {}",
-      res,
-      folly::errnoStr(errno));
-  attr |= FS_NOCOW_FL;
-  res = ioctl(fd, FS_IOC_SETFLAGS, &attr);
-  BOLT_CHECK_EQ(
-      0,
-      res,
-      "ioctl(FS_IOC_SETFLAGS, FS_NOCOW_FL) failed: {}, {}",
-      res,
-      folly::errnoStr(errno));
-#endif // linux
-}
-
 void addEntryToIovecs(AsyncDataCacheEntry& entry, std::vector<iovec>& iovecs) {
   if (entry.tinyData() != nullptr) {
     iovecs.push_back({entry.tinyData(), static_cast<size_t>(entry.size())});
@@ -144,7 +123,6 @@ SsdFile::SsdFile(
   process::TraceContext trace("SsdFile::SsdFile");
   filesystems::FileOptions fileOptions;
   fileOptions.shouldThrowOnFileAlreadyExists = false;
-  fileOptions.bufferWrite = !FLAGS_ssd_odirect;
   writeFile_ = fs_->openFileForWrite(fileName_, fileOptions);
   readFile_ = fs_->openFileForRead(fileName_);
 
@@ -166,7 +144,7 @@ SsdFile::SsdFile(
   }
 
   if (disableFileCow) {
-    disableFileCow();
+    this->disableFileCow();
   }
 }
 
@@ -499,6 +477,7 @@ void SsdFile::updateStats(SsdCacheStats& stats) const {
   stats.bytesRead += stats_.bytesRead;
   stats.entriesCached += entries_.size();
   stats.regionsCached += numRegions_;
+  stats.regionsEvicted += stats_.regionsEvicted;
   for (auto i = 0; i < numRegions_; i++) {
     stats.bytesCached += (regionSizes_[i] - erasedRegionSizes_[i]);
   }
@@ -538,8 +517,8 @@ void SsdFile::testingDeleteFile() {
     fs_->remove(fileName_);
   } catch (const std::exception& e) {
     BOLT_SSD_CACHE_LOG(ERROR) << "Failed to delete cache file " << fileName_
-                             << ", error code: " << errno
-                             << ", error string: " << folly::errnoStr(errno);
+                              << ", error code: " << errno
+                              << ", error string: " << folly::errnoStr(errno);
   }
 }
 
@@ -561,7 +540,7 @@ bool SsdFile::removeFileEntries(
     const FileCacheKey& cacheKey = it->first;
     const SsdRun& ssdRun = it->second;
 
-    if (!cacheKey.fileNum.has_value()) {
+    if (!cacheKey.fileNum.hasValue()) {
       ++it;
       continue;
     }
@@ -759,8 +738,8 @@ void SsdFile::checkpoint(bool force) {
       }
       state.close();
 
-      // Sync checkpoint data file. ofstream does not have a sync method, so open
-      // as fd and sync that.
+      // Sync checkpoint data file. ofstream does not have a sync method, so
+      // open as fd and sync that.
       const auto checkpointFd = checkRc(
           ::open(checkpointPath.c_str(), O_WRONLY),
           "Open of checkpoint file for sync");
@@ -776,14 +755,18 @@ void SsdFile::checkpoint(bool force) {
     } catch (const std::exception& e) {
       try {
         checkpointError(-1, e.what());
-      } catch (const std::exception&) {
+      } catch (const std::exception& nested) {
+        BOLT_SSD_CACHE_LOG(WARNING)
+            << "Ignoring nested checkpoint error: " << nested.what();
       }
       // Ignore nested exception.
     }
   } catch (const std::exception& e) {
     try {
       checkpointError(-1, e.what());
-    } catch (const std::exception&) {
+    } catch (const std::exception& nested) {
+      BOLT_SSD_CACHE_LOG(WARNING)
+          << "Ignoring nested checkpoint error: " << nested.what();
     }
     // Ignore nested exception.
   }
@@ -822,10 +805,12 @@ void SsdFile::initializeCheckpoint() {
     ++stats_.readCheckpointErrors;
     try {
       BOLT_SSD_CACHE_LOG(ERROR) << "Error recovering from checkpoint "
-                               << e.what() << ": Starting without checkpoint";
+                                << e.what() << ": Starting without checkpoint";
       entries_.clear();
       deleteCheckpoint(true);
-    } catch (const std::exception&) {
+    } catch (const std::exception& nested) {
+      BOLT_SSD_CACHE_LOG(WARNING)
+          << "Ignoring nested checkpoint recovery error: " << nested.what();
     }
   }
 }

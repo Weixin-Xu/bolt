@@ -363,10 +363,8 @@ class LocalWriteFile final : public WriteFile {
   void append(std::string_view data) final;
   void append(std::unique_ptr<folly::IOBuf> data) final;
   void truncate(int64_t newSize) final;
-  void write(
-      const std::vector<iovec>& iovecs,
-      int64_t offset,
-      int64_t length) final;
+  void write(const std::vector<iovec>& iovecs, int64_t offset, int64_t length)
+      final;
 
   void flush() final;
   void close() final;
@@ -466,10 +464,8 @@ class AsyncLocalWriteFile final : public WriteFile {
 
   void append(std::string_view data) override;
 
-  void write(
-      const std::vector<iovec>& iovecs,
-      int64_t offset,
-      int64_t length) final;
+  void write(const std::vector<iovec>& iovecs, int64_t offset, int64_t length)
+      final;
 
   void flush() final {
     BOLT_UNREACHABLE();

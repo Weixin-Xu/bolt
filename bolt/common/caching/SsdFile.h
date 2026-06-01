@@ -147,6 +147,7 @@ struct SsdCacheStats {
     bytesRead = tsanAtomicValue(other.bytesRead);
     entriesCached = tsanAtomicValue(other.entriesCached);
     regionsCached = tsanAtomicValue(other.regionsCached);
+    regionsEvicted = tsanAtomicValue(other.regionsEvicted);
     bytesCached = tsanAtomicValue(other.bytesCached);
     entriesAgedOut = tsanAtomicValue(other.entriesAgedOut);
     regionsAgedOut = tsanAtomicValue(other.regionsAgedOut);
@@ -169,6 +170,7 @@ struct SsdCacheStats {
   tsan_atomic<uint64_t> bytesRead{0};
   tsan_atomic<uint64_t> entriesCached{0};
   tsan_atomic<uint64_t> regionsCached{0};
+  tsan_atomic<uint64_t> regionsEvicted{0};
   tsan_atomic<uint64_t> bytesCached{0};
   tsan_atomic<uint64_t> entriesAgedOut{0};
   tsan_atomic<uint64_t> regionsAgedOut{0};
@@ -292,7 +294,7 @@ class SsdFile {
   /// Returns true if copy on write is disabled for this file. Used in testing.
   bool testingIsCowDisabled() const;
 
-  std::vector<double> testingCopyScores() {
+  std::vector<uint64_t> testingCopyScores() {
     return tracker_.copyScores();
   }
 
@@ -368,8 +370,8 @@ class SsdFile {
   // the files for making new checkpoints.
   void initializeCheckpoint();
 
-  // Synchronously logs that 'regions' are no longer valid in a possibly existing
-  // checkpoint.
+  // Synchronously logs that 'regions' are no longer valid in a possibly
+  // existing checkpoint.
   void logEviction(const std::vector<int32_t>& regions);
 
   // Returns true if checkpoint has been enabled.
