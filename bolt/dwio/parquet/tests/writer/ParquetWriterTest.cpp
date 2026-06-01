@@ -675,6 +675,123 @@ TEST_F(ParquetWriterTest, columnPageSize) {
   ASSERT_EQ(4, chunk2PageEncodingStats[0].count); // data page num
 }
 
+TEST_F(ParquetWriterTest, byteArrayPageSizeSplitsLargeVarcharPages) {
+  std::string c0{"c0"};
+  auto schema = ROW({c0}, {VARCHAR()});
+  const vector_size_t kRows = 20;
+  std::string parquetPath = tempPath_->path + "/varcharPageSize.parquet";
+
+  auto data = makeRowVector({makeFlatVector<std::string>(
+      kRows,
+      [](auto row) {
+        return std::string(40, static_cast<char>('a' + row % 26));
+      },
+      [](auto row) { return row % 5 == 0; })});
+
+  vp::WriterOptions writerOptions{};
+  writerOptions.enableDictionary = false;
+  writerOptions.columnDataPageSizeMap[c0] = 100;
+  auto writer = createLocalWriter(parquetPath, schema, writerOptions);
+  writer->write(data);
+  writer->close();
+
+  assertRead(parquetPath, kRows, schema, data);
+
+  auto reader = createLocalParquetReader(parquetPath);
+  auto chunkPageEncodingStats =
+      reader->fileMetaData().rowGroup(0).columnChunk(0).pageEncodingStats();
+  ASSERT_EQ(1, chunkPageEncodingStats.size());
+  ASSERT_GT(chunkPageEncodingStats[0].count, 1);
+}
+
+TEST_F(ParquetWriterTest, byteArrayPageSizeSplitsLargeVarbinaryPages) {
+  std::string c0{"c0"};
+  auto schema = ROW({c0}, {VARBINARY()});
+  const vector_size_t kRows = 20;
+  std::string parquetPath = tempPath_->path + "/varbinaryPageSize.parquet";
+
+  auto data = makeRowVector({makeFlatVector<std::string>(
+      kRows,
+      [](auto row) {
+        return std::string(40, static_cast<char>('a' + row % 26));
+      },
+      [](auto row) { return row % 7 == 0; },
+      VARBINARY())});
+
+  vp::WriterOptions writerOptions{};
+  writerOptions.enableDictionary = false;
+  writerOptions.columnDataPageSizeMap[c0] = 100;
+  auto writer = createLocalWriter(parquetPath, schema, writerOptions);
+  writer->write(data);
+  writer->close();
+
+  assertRead(parquetPath, kRows, schema, data);
+
+  auto reader = createLocalParquetReader(parquetPath);
+  auto chunkPageEncodingStats =
+      reader->fileMetaData().rowGroup(0).columnChunk(0).pageEncodingStats();
+  ASSERT_EQ(1, chunkPageEncodingStats.size());
+  ASSERT_GT(chunkPageEncodingStats[0].count, 1);
+}
+
+TEST_F(ParquetWriterTest, byteArrayPageSizeSplitsAfterDictionaryFallback) {
+  std::string c0{"c0"};
+  auto schema = ROW({c0}, {VARCHAR()});
+  const vector_size_t kDictionaryRows = 4;
+  const vector_size_t kPlainRows = 20;
+  std::string parquetPath =
+      tempPath_->path + "/dictionaryFallbackPageSize.parquet";
+
+  auto dictionaryData =
+      makeRowVector({makeFlatVector<std::string>(kDictionaryRows, [](auto row) {
+        return std::string("dict-") + std::to_string(row) + "-" +
+            std::string(40, static_cast<char>('a' + row % 26));
+      })});
+  auto plainData = makeRowVector({makeFlatVector<std::string>(
+      kPlainRows,
+      [](auto row) {
+        return std::string("value-") + std::to_string(row) + "-" +
+            std::string(40, static_cast<char>('a' + row % 26));
+      },
+      [](auto row) { return row % 6 == 0; })});
+  auto mergedData =
+      BaseVector::create(schema, kDictionaryRows + kPlainRows, pool_.get());
+  mergedData->copy(dictionaryData.get(), 0, 0, dictionaryData->size());
+  mergedData->copy(
+      plainData.get(), dictionaryData->size(), 0, plainData->size());
+
+  vp::WriterOptions writerOptions{};
+  writerOptions.enableDictionary = true;
+  writerOptions.columnDictionaryPageSizeLimitMap[c0] = 64;
+  writerOptions.columnDataPageSizeMap[c0] = 100;
+  auto writer = createLocalWriter(parquetPath, schema, writerOptions);
+  writer->write(dictionaryData);
+  writer->write(plainData);
+  writer->close();
+
+  assertRead(parquetPath, kDictionaryRows + kPlainRows, schema, mergedData);
+
+  auto reader = createLocalParquetReader(parquetPath);
+  auto chunkPageEncodingStats =
+      reader->fileMetaData().rowGroup(0).columnChunk(0).pageEncodingStats();
+  int32_t dictionaryPageCount = 0;
+  int32_t dataPageCount = 0;
+  int32_t plainDataPageCount = 0;
+  for (const auto& stats : chunkPageEncodingStats) {
+    if (stats.page_type == thrift::PageType::DICTIONARY_PAGE) {
+      dictionaryPageCount += stats.count;
+    } else if (stats.page_type == thrift::PageType::DATA_PAGE) {
+      dataPageCount += stats.count;
+      if (stats.encoding == thrift::Encoding::PLAIN) {
+        plainDataPageCount += stats.count;
+      }
+    }
+  }
+  ASSERT_EQ(1, dictionaryPageCount);
+  ASSERT_GT(dataPageCount, 1);
+  ASSERT_GT(plainDataPageCount, 1);
+}
+
 TEST_F(ParquetWriterTest, arrowPool) {
   const size_t kRows = 4 * 1024;
   auto type = getType();

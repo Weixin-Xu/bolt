@@ -36,8 +36,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -92,6 +95,17 @@ namespace bytedance::bolt::parquet::arrow {
 using util::CodecOptions;
 
 namespace {
+
+int32_t CheckPageHeaderSize(std::string_view sizeName, int64_t size) {
+  if (size < 0 || size > std::numeric_limits<int32_t>::max()) {
+    throw ParquetException(
+        std::string(sizeName),
+        " page size cannot be represented in a Parquet PageHeader int32 "
+        "field: ",
+        size);
+  }
+  return static_cast<int32_t>(size);
+}
 
 // Visitor that extracts the value buffer from a FlatArray at a given offset.
 struct ValueBufferSlicer {
@@ -350,25 +364,30 @@ class SerializedPageWriter : public PageWriter {
     dict_page_header.__set_is_sorted(page.is_sorted());
 
     const uint8_t* output_data_buffer = compressed_data->data();
-    int32_t output_data_len = static_cast<int32_t>(compressed_data->size());
+    int64_t output_data_len = compressed_data->size();
+    const int32_t uncompressed_page_size =
+        CheckPageHeaderSize("Uncompressed dictionary", uncompressed_size);
+    int32_t compressed_page_size =
+        CheckPageHeaderSize("Compressed dictionary", output_data_len);
 
     if (data_encryptor_.get()) {
       UpdateEncryption(encryption::kDictionaryPage);
       PARQUET_THROW_NOT_OK(encryption_buffer_->Resize(
-          data_encryptor_->CiphertextSizeDelta() + output_data_len, false));
+          data_encryptor_->CiphertextSizeDelta() + compressed_page_size,
+          false));
       output_data_len = data_encryptor_->Encrypt(
           compressed_data->data(),
-          output_data_len,
+          compressed_page_size,
           encryption_buffer_->mutable_data());
       output_data_buffer = encryption_buffer_->data();
+      compressed_page_size =
+          CheckPageHeaderSize("Compressed dictionary", output_data_len);
     }
 
     format::PageHeader page_header;
     page_header.__set_type(format::PageType::DICTIONARY_PAGE);
-    page_header.__set_uncompressed_page_size(
-        static_cast<int32_t>(uncompressed_size));
-    page_header.__set_compressed_page_size(
-        static_cast<int32_t>(output_data_len));
+    page_header.__set_uncompressed_page_size(uncompressed_page_size);
+    page_header.__set_compressed_page_size(compressed_page_size);
     page_header.__set_dictionary_page_header(dict_page_header);
     if (page_checksum_verification_) {
       uint32_t crc32 =
@@ -452,24 +471,29 @@ class SerializedPageWriter : public PageWriter {
     const int64_t uncompressed_size = page.uncompressed_size();
     std::shared_ptr<Buffer> compressed_data = page.buffer();
     const uint8_t* output_data_buffer = compressed_data->data();
-    int32_t output_data_len = static_cast<int32_t>(compressed_data->size());
+    int64_t output_data_len = compressed_data->size();
+    const int32_t uncompressed_page_size =
+        CheckPageHeaderSize("Uncompressed data", uncompressed_size);
+    int32_t compressed_page_size =
+        CheckPageHeaderSize("Compressed data", output_data_len);
 
     if (data_encryptor_.get()) {
       PARQUET_THROW_NOT_OK(encryption_buffer_->Resize(
-          data_encryptor_->CiphertextSizeDelta() + output_data_len, false));
+          data_encryptor_->CiphertextSizeDelta() + compressed_page_size,
+          false));
       UpdateEncryption(encryption::kDataPage);
       output_data_len = data_encryptor_->Encrypt(
           compressed_data->data(),
-          output_data_len,
+          compressed_page_size,
           encryption_buffer_->mutable_data());
       output_data_buffer = encryption_buffer_->data();
+      compressed_page_size =
+          CheckPageHeaderSize("Compressed data", output_data_len);
     }
 
     format::PageHeader page_header;
-    page_header.__set_uncompressed_page_size(
-        static_cast<int32_t>(uncompressed_size));
-    page_header.__set_compressed_page_size(
-        static_cast<int32_t>(output_data_len));
+    page_header.__set_uncompressed_page_size(uncompressed_page_size);
+    page_header.__set_compressed_page_size(compressed_page_size);
 
     if (page_checksum_verification_) {
       uint32_t crc32 =
@@ -2754,8 +2778,56 @@ Status TypedColumnWriterImpl<ByteArrayType>::WriteArrowDense(
     ARROW_UNSUPPORTED();
   }
 
+  constexpr int64_t kDataPageSizeSlack = 64L * 1024 * 1024;
+  const int64_t dataPageByteLimit = std::min<int64_t>(
+      data_pagesize_, std::numeric_limits<int32_t>::max() - kDataPageSizeSlack);
+
+  auto valueLength = [&](int64_t index) {
+    if (::arrow::is_binary_like(array.type_id())) {
+      return static_cast<int64_t>(
+          checked_cast<const ::arrow::BinaryArray&>(array).value_length(index));
+    }
+    DCHECK(::arrow::is_large_binary_like(array.type_id()));
+    return static_cast<int64_t>(
+        checked_cast<const ::arrow::LargeBinaryArray&>(array).value_length(
+            index));
+  };
+
+  auto valueRangeByteLength = [&](int64_t start, int64_t count) {
+    if (::arrow::is_binary_like(array.type_id())) {
+      const auto& binaryArray =
+          checked_cast<const ::arrow::BinaryArray&>(array);
+      return static_cast<int64_t>(
+          binaryArray.value_offset(start + count) -
+          binaryArray.value_offset(start));
+    }
+    DCHECK(::arrow::is_large_binary_like(array.type_id()));
+    const auto& largeBinaryArray =
+        checked_cast<const ::arrow::LargeBinaryArray&>(array);
+    return static_cast<int64_t>(
+        largeBinaryArray.value_offset(start + count) -
+        largeBinaryArray.value_offset(start));
+  };
+
+  auto hasSpacedValue = [&](int64_t levelIndex) {
+    if (def_levels == nullptr || level_info_.def_level == 0) {
+      return true;
+    }
+    return def_levels[levelIndex] >= level_info_.repeated_ancestor_def_level;
+  };
+
+  auto hasNonNullValue = [&](int64_t levelIndex, int64_t valueIndex) {
+    if (def_levels != nullptr &&
+        def_levels[levelIndex] != level_info_.def_level) {
+      return false;
+    }
+    return array.IsValid(valueIndex);
+  };
+
   int64_t value_offset = 0;
-  auto WriteChunk = [&](int64_t offset, int64_t batch_size, bool check_page) {
+  auto WriteSubChunk = [&](int64_t offset,
+                           int64_t batch_size,
+                           bool check_page) {
     int64_t batch_num_values = 0;
     int64_t batch_num_spaced_values = 0;
     int64_t null_count = 0;
@@ -2788,6 +2860,76 @@ Status TypedColumnWriterImpl<ByteArrayType>::WriteArrowDense(
         batch_size, batch_num_values, batch_size - non_null, check_page);
     CheckDictionarySizeLimit();
     value_offset += batch_num_spaced_values;
+  };
+
+  auto WriteChunk = [&](int64_t offset, int64_t batch_size, bool check_page) {
+    const bool split_by_byte_size =
+        check_page && !IsDictionaryEncoding(current_encoder_->encoding());
+    if (!split_by_byte_size) {
+      WriteSubChunk(offset, batch_size, check_page);
+      return;
+    }
+
+    if (def_levels == nullptr || level_info_.def_level == 0) {
+      const int64_t batch_encoded_bytes =
+          valueRangeByteLength(value_offset, batch_size) +
+          batch_size * static_cast<int64_t>(sizeof(uint32_t));
+      if (current_encoder_->EstimatedDataEncodedSize() + batch_encoded_bytes <=
+          dataPageByteLimit) {
+        WriteSubChunk(offset, batch_size, check_page);
+        return;
+      }
+    }
+
+    int64_t local_offset = offset;
+    int64_t remaining = batch_size;
+    while (remaining > 0) {
+      int64_t subchunk_levels = 0;
+      int64_t subchunk_spaced_values = 0;
+      int64_t subchunk_encoded_bytes = 0;
+
+      while (subchunk_levels < remaining) {
+        const int64_t level_index = local_offset + subchunk_levels;
+        const bool can_break_before_level =
+            !pages_change_on_record_boundaries() || rep_levels == nullptr ||
+            rep_levels[level_index] == 0;
+
+        int64_t value_bytes = 0;
+        if (hasSpacedValue(level_index)) {
+          const int64_t value_index = value_offset + subchunk_spaced_values;
+          if (hasNonNullValue(level_index, value_index)) {
+            value_bytes = static_cast<int64_t>(sizeof(uint32_t)) +
+                valueLength(value_index);
+          }
+        }
+
+        if (check_page && split_by_byte_size && can_break_before_level &&
+            current_encoder_->EstimatedDataEncodedSize() +
+                    subchunk_encoded_bytes + value_bytes >
+                dataPageByteLimit) {
+          if (subchunk_levels == 0) {
+            if (num_buffered_values_ > 0) {
+              AddDataPage();
+            }
+          } else {
+            break;
+          }
+        }
+
+        if (hasSpacedValue(level_index)) {
+          ++subchunk_spaced_values;
+        }
+        subchunk_encoded_bytes += value_bytes;
+        ++subchunk_levels;
+      }
+
+      if (subchunk_levels == 0) {
+        throw ParquetException("Unable to split BYTE_ARRAY write chunk");
+      }
+      WriteSubChunk(local_offset, subchunk_levels, check_page);
+      local_offset += subchunk_levels;
+      remaining -= subchunk_levels;
+    }
   };
 
   PARQUET_CATCH_NOT_OK(DoInBatches(
