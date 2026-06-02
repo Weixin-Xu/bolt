@@ -96,13 +96,20 @@ using util::CodecOptions;
 
 namespace {
 
-int32_t CheckPageHeaderSize(std::string_view sizeName, int64_t size) {
-  if (size < 0 || size > std::numeric_limits<int32_t>::max()) {
-    throw ParquetException(
-        std::string(sizeName),
-        " page size cannot be represented in a Parquet PageHeader int32 "
-        "field: ",
-        size);
+[[noreturn]] void ThrowPageHeaderSizeError(
+    std::string_view sizeName,
+    int64_t size) {
+  throw ParquetException(
+      std::string(sizeName),
+      " page size cannot be represented in a Parquet PageHeader int32 "
+      "field: ",
+      size);
+}
+
+inline int32_t CheckPageHeaderSize(std::string_view sizeName, int64_t size) {
+  if (ARROW_PREDICT_FALSE(
+          size < 0 || size > std::numeric_limits<int32_t>::max())) {
+    ThrowPageHeaderSizeError(sizeName, size);
   }
   return static_cast<int32_t>(size);
 }
@@ -667,12 +674,13 @@ class SerializedPageWriter : public PageWriter {
   void UpdateEncryption(int8_t module_type) {
     switch (module_type) {
       case encryption::kColumnMetaData: {
-        meta_encryptor_->UpdateAad(encryption::CreateModuleAad(
-            meta_encryptor_->file_aad(),
-            module_type,
-            row_group_ordinal_,
-            column_ordinal_,
-            kNonPageOrdinal));
+        meta_encryptor_->UpdateAad(
+            encryption::CreateModuleAad(
+                meta_encryptor_->file_aad(),
+                module_type,
+                row_group_ordinal_,
+                column_ordinal_,
+                kNonPageOrdinal));
         break;
       }
       case encryption::kDataPage: {
@@ -686,21 +694,23 @@ class SerializedPageWriter : public PageWriter {
         break;
       }
       case encryption::kDictionaryPageHeader: {
-        meta_encryptor_->UpdateAad(encryption::CreateModuleAad(
-            meta_encryptor_->file_aad(),
-            module_type,
-            row_group_ordinal_,
-            column_ordinal_,
-            kNonPageOrdinal));
+        meta_encryptor_->UpdateAad(
+            encryption::CreateModuleAad(
+                meta_encryptor_->file_aad(),
+                module_type,
+                row_group_ordinal_,
+                column_ordinal_,
+                kNonPageOrdinal));
         break;
       }
       case encryption::kDictionaryPage: {
-        data_encryptor_->UpdateAad(encryption::CreateModuleAad(
-            data_encryptor_->file_aad(),
-            module_type,
-            row_group_ordinal_,
-            column_ordinal_,
-            kNonPageOrdinal));
+        data_encryptor_->UpdateAad(
+            encryption::CreateModuleAad(
+                data_encryptor_->file_aad(),
+                module_type,
+                row_group_ordinal_,
+                column_ordinal_,
+                kNonPageOrdinal));
         break;
       }
       default:
@@ -1940,8 +1950,12 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
     if (array->data()->offset > 0) {
       RETURN_NOT_OK(util::VisitArrayInline(*array, &slicer, &buffers[1]));
     }
-    return ::arrow::MakeArray(std::make_shared<ArrayData>(
-        array->type(), array->length(), std::move(buffers), new_null_count));
+    return ::arrow::MakeArray(
+        std::make_shared<ArrayData>(
+            array->type(),
+            array->length(),
+            std::move(buffers),
+            new_null_count));
   }
 
   void WriteLevelsSpaced(

@@ -24,6 +24,8 @@
 #include "bolt/dwio/parquet/writer/Writer.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
 
+#include <filesystem>
+
 #include <folly/Benchmark.h>
 #include <folly/init/Init.h>
 using namespace bytedance::bolt;
@@ -65,7 +67,7 @@ class ParquetWriterBenchmark {
 
   ~ParquetWriterBenchmark() {}
 
-  void writeToFile(
+  uint64_t writeToFile(
       const std::vector<RowVectorPtr>& batches,
       bool /*forRowGroupSkip*/) {
     for (auto& batch : batches) {
@@ -73,9 +75,10 @@ class ParquetWriterBenchmark {
     }
     writer_->flush();
     writer_->close();
+    return std::filesystem::file_size(fileFolder_->path + "/" + fileName_);
   }
 
-  void writeSingleColumn(
+  uint64_t writeSingleColumn(
       const std::string& columnName,
       const TypePtr& type,
       uint8_t nullsRateX100,
@@ -89,7 +92,7 @@ class ParquetWriterBenchmark {
                        .withNullsForField(Subfield(columnName), nullsRateX100)
                        .build();
     suspender.dismiss();
-    writeToFile(*batches, true);
+    return writeToFile(*batches, true);
   }
 
  private:
@@ -105,16 +108,18 @@ class ParquetWriterBenchmark {
 };
 
 void run(
-    uint32_t,
+    uint32_t iterations,
     const std::string& columnName,
     const TypePtr& type,
     uint8_t nullsRateX100,
     uint32_t batchSize,
     bool disableDictionary) {
   RowTypePtr rowType = ROW({columnName}, {type});
-  ParquetWriterBenchmark benchmark(disableDictionary, rowType);
-  BIGINT()->toString();
-  benchmark.writeSingleColumn(columnName, type, nullsRateX100, batchSize);
+  for (uint32_t i = 0; i < iterations; ++i) {
+    ParquetWriterBenchmark benchmark(disableDictionary, rowType);
+    folly::doNotOptimizeAway(benchmark.writeSingleColumn(
+        columnName, type, nullsRateX100, batchSize));
+  }
 }
 
 #define PARQUET_BENCHMARKS_NULLS(_type_, _name_, _null_)                      \
@@ -131,6 +136,41 @@ void run(
 #define PARQUET_BENCHMARKS(_type_, _name_) \
   PARQUET_BENCHMARKS_NULLS(_type_, _name_, 20)
 
+// Benchmarks targeting the BYTE_ARRAY non-dictionary write path that is
+// affected by the oversized parquet data page fix. The data sizes here are
+// well below the int32 page-size limit, so these benchmarks measure the
+// overhead introduced for the common (non-oversized) case.
+#define PARQUET_BENCHMARKS_NULLS_NO_DICT(_type_, _name_, _null_) \
+  BENCHMARK_NAMED_PARAM(                                         \
+      run,                                                       \
+      _name_##_batch_4k_no_dict_null##_null_,                    \
+      #_name_,                                                   \
+      _type_,                                                    \
+      _null_,                                                    \
+      4096,                                                      \
+      true);                                                     \
+  BENCHMARK_NAMED_PARAM(                                         \
+      run,                                                       \
+      _name_##_batch_32k_no_dict_null##_null_,                   \
+      #_name_,                                                   \
+      _type_,                                                    \
+      _null_,                                                    \
+      32768,                                                     \
+      true);                                                     \
+  BENCHMARK_NAMED_PARAM(                                         \
+      run,                                                       \
+      _name_##_batch_256k_no_dict_null##_null_,                  \
+      #_name_,                                                   \
+      _type_,                                                    \
+      _null_,                                                    \
+      262144,                                                    \
+      true);                                                     \
+  BENCHMARK_DRAW_LINE();
+
+#define PARQUET_BENCHMARKS_NO_DICT(_type_, _name_)    \
+  PARQUET_BENCHMARKS_NULLS_NO_DICT(_type_, _name_, 0) \
+  PARQUET_BENCHMARKS_NULLS_NO_DICT(_type_, _name_, 20)
+
 PARQUET_BENCHMARKS(VARCHAR(), Varchar);
 PARQUET_BENCHMARKS(BIGINT(), BigInt);
 PARQUET_BENCHMARKS(DOUBLE(), Double);
@@ -138,6 +178,12 @@ PARQUET_BENCHMARKS(DECIMAL(18, 3), ShortDecimalType);
 PARQUET_BENCHMARKS(DECIMAL(38, 3), LongDecimalType);
 PARQUET_BENCHMARKS(MAP(BIGINT(), BIGINT()), Map);
 PARQUET_BENCHMARKS(ARRAY(BIGINT()), List);
+
+// Plain-encoded VARCHAR exercises the new BYTE_ARRAY page-splitting code path
+// added by the oversized-page fix. The nested ARRAY<VARCHAR> case additionally
+// drives the per-level loop branch (def_levels != nullptr && def_level > 0).
+PARQUET_BENCHMARKS_NO_DICT(VARCHAR(), VarcharPlain);
+PARQUET_BENCHMARKS_NO_DICT(ARRAY(VARCHAR()), VarcharListPlain);
 
 // TODO: Add all data types
 
