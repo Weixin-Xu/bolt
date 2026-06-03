@@ -649,10 +649,12 @@ class BoltConan(ConanFile):
             ]
         )
         if self.options.get_safe("enable_testutil"):
-            self.cpp_info.components["bolt_engine"].requires.append(
-                "gtest::gtest",
-                "cpr::cpr",
-                "duckdb::duckdb",
+            self.cpp_info.components["bolt_engine"].requires.extend(
+                [
+                    "gtest::gtest",
+                    "cpr::cpr",
+                    "duckdb::duckdb",
+                ]
             )
         if self.options.get_safe("enable_jit"):
             self.cpp_info.components["bolt_engine"].requires.append(
