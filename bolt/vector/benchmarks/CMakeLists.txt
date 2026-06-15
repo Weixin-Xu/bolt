@@ -52,3 +52,9 @@ target_link_libraries(
   copy_vectors_opt_bench
   PRIVATE ${BOLT_BENCHMARK_DEPS}
 )
+
+add_executable(row_vector_concat_benchmark RowVectorConcatBenchmark.cpp)
+target_link_libraries(
+  row_vector_concat_benchmark
+  PRIVATE ${BOLT_BENCHMARK_DEPS}
+)
