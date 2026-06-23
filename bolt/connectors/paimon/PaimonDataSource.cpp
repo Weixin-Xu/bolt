@@ -207,12 +207,12 @@ std::optional<RowVectorPtr> PaimonDataSource::next(
     ContinueFuture& /* future */) {
   // If we've already encountered EOF (inputSplits_ are cleared and no reader),
   // don't try to do anything else
-  if (inputSplits_.empty() && !reader_) {
+  if (inputSplits_.empty() && !currentReader_) {
     return nullptr;
   }
 
   // Lazily create the BatchReader using accumulated splits.
-  if (!reader_ && !inputSplits_.empty()) {
+  if (!currentReader_ && !inputSplits_.empty()) {
     VLOG(1) << "PaimonDataSource::next(): Creating reader with "
             << inputSplits_.size() << " split(s)";
     auto&& readerCreateStatus = tableRead_->CreateReader(inputSplits_);
@@ -222,23 +222,23 @@ std::optional<RowVectorPtr> PaimonDataSource::next(
       BOLT_FAIL(
           "create reader error: {}", readerCreateStatus.status().ToString());
     }
-    reader_ = std::move(readerCreateStatus).value();
+    currentReader_ = std::move(readerCreateStatus).value();
   }
 
-  if (!reader_) {
+  if (!currentReader_) {
     VLOG(1)
         << "PaimonDataSource::next(): No reader available, returning nullopt";
     return nullptr;
   }
 
   VLOG(1) << "PaimonDataSource::next(): Calling reader->NextBatch() at "
-          << reader_.get();
-  auto batchRes = reader_->NextBatch();
+          << currentReader_.get();
+  auto batchRes = currentReader_->NextBatch();
   if (!batchRes.ok()) {
     VLOG(1) << "PaimonDataSource::next(): NextBatch NOT ok: "
             << batchRes.status().ToString();
-    reader_->Close();
-    reader_.reset();
+    currentReader_->Close();
+    holdReader_.push_back(std::move(currentReader_));
     inputSplits_.clear();
     BOLT_FAIL("failed to get next batch: {}", batchRes.status().ToString());
   }
@@ -254,8 +254,8 @@ std::optional<RowVectorPtr> PaimonDataSource::next(
     if (pair.second && pair.second->release) {
       pair.second->release(pair.second.get());
     }
-    reader_->Close();
-    reader_.reset();
+    currentReader_->Close();
+    holdReader_.push_back(std::move(currentReader_));
     inputSplits_.clear();
     return nullptr;
   }

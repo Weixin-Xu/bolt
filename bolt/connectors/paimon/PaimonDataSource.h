@@ -68,11 +68,11 @@ class PaimonDataSource : public DataSource {
   std::shared_ptr<PaimonTableHandle> tableHandle_;
   memory::MemoryPool* pool_;
 
-  std::unique_ptr<::paimon::BatchReader> reader_;
+  std::vector<std::unique_ptr<::paimon::BatchReader>> holdReader_;
+  std::unique_ptr<::paimon::BatchReader> currentReader_;
   std::unique_ptr<::paimon::TableRead> tableRead_;
   std::vector<std::shared_ptr<::paimon::Split>> inputSplits_;
   std::shared_ptr<::paimon::MemoryPool> paimonPool_;
-  std::shared_ptr<PaimonConnectorSplit> currentSplit_;
 
   uint64_t completedRows_{0};
   uint64_t completedBytes_{0};
