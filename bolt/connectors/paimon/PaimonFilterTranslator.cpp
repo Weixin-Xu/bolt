@@ -28,6 +28,7 @@
 #include <limits>
 #include <optional>
 #include "bolt/core/Expressions.h"
+#include "bolt/expression/Expr.h"
 #include "bolt/type/Subfield.h"
 #include "bolt/type/Timestamp.h"
 #include "bolt/type/filter/FilterBase.h"
@@ -188,6 +189,131 @@ core::TypedExprPtr makeArrayConstant(
   return std::make_shared<core::ConstantTypedExpr>(wrapped);
 }
 
+VectorPtr evaluateConstantExpression(
+    const core::TypedExprPtr& expr,
+    core::ExpressionEvaluator* evaluator) {
+  if (!evaluator) {
+    return nullptr;
+  }
+  auto exprSet = evaluator->compile(expr);
+  if (exprSet->size() != 1 || !exprSet->exprs()[0]->isConstant()) {
+    return nullptr;
+  }
+
+  RowVector input(
+      evaluator->pool(), ROW({}, {}), nullptr, 1, std::vector<VectorPtr>{});
+  SelectivityVector rows(1);
+  VectorPtr result;
+  try {
+    evaluator->evaluate(exprSet.get(), rows, input, result);
+  } catch (const BoltUserError&) {
+    return nullptr;
+  }
+  return result;
+}
+
+std::optional<int64_t> integerValueAt(const VectorPtr& vector) {
+  switch (vector->typeKind()) {
+    case TypeKind::TINYINT:
+      return vector->as<SimpleVector<int8_t>>()->valueAt(0);
+    case TypeKind::SMALLINT:
+      return vector->as<SimpleVector<int16_t>>()->valueAt(0);
+    case TypeKind::INTEGER:
+      return vector->as<SimpleVector<int32_t>>()->valueAt(0);
+    case TypeKind::BIGINT:
+      return vector->as<SimpleVector<int64_t>>()->valueAt(0);
+    default:
+      return std::nullopt;
+  }
+}
+
+std::optional<::paimon::Literal> literalFromVector(
+    const VectorPtr& vector,
+    ::paimon::FieldType fieldType) {
+  if (!vector || vector->size() == 0) {
+    return std::nullopt;
+  }
+  if (vector->isNullAt(0)) {
+    return ::paimon::Literal(fieldType);
+  }
+
+  switch (fieldType) {
+    case ::paimon::FieldType::BOOLEAN:
+      if (vector->typeKind() != TypeKind::BOOLEAN) {
+        return std::nullopt;
+      }
+      return ::paimon::Literal(vector->as<SimpleVector<bool>>()->valueAt(0));
+    case ::paimon::FieldType::TINYINT:
+    case ::paimon::FieldType::SMALLINT:
+    case ::paimon::FieldType::INT:
+    case ::paimon::FieldType::BIGINT: {
+      auto v = integerValueAt(vector);
+      if (!v) {
+        return std::nullopt;
+      }
+      if (fieldType == ::paimon::FieldType::TINYINT) {
+        return ::paimon::Literal(static_cast<int8_t>(*v));
+      }
+      if (fieldType == ::paimon::FieldType::SMALLINT) {
+        return ::paimon::Literal(static_cast<int16_t>(*v));
+      }
+      if (fieldType == ::paimon::FieldType::INT) {
+        return ::paimon::Literal(static_cast<int32_t>(*v));
+      }
+      return ::paimon::Literal(*v);
+    }
+    case ::paimon::FieldType::FLOAT: {
+      if (vector->typeKind() == TypeKind::REAL) {
+        return ::paimon::Literal(vector->as<SimpleVector<float>>()->valueAt(0));
+      }
+      if (vector->typeKind() == TypeKind::DOUBLE) {
+        return ::paimon::Literal(
+            static_cast<float>(vector->as<SimpleVector<double>>()->valueAt(0)));
+      }
+      if (auto v = integerValueAt(vector)) {
+        return ::paimon::Literal(static_cast<float>(*v));
+      }
+      return std::nullopt;
+    }
+    case ::paimon::FieldType::DOUBLE: {
+      if (vector->typeKind() == TypeKind::REAL) {
+        return ::paimon::Literal(
+            static_cast<double>(vector->as<SimpleVector<float>>()->valueAt(0)));
+      }
+      if (vector->typeKind() == TypeKind::DOUBLE) {
+        return ::paimon::Literal(
+            vector->as<SimpleVector<double>>()->valueAt(0));
+      }
+      if (auto v = integerValueAt(vector)) {
+        return ::paimon::Literal(static_cast<double>(*v));
+      }
+      return std::nullopt;
+    }
+    case ::paimon::FieldType::STRING:
+    case ::paimon::FieldType::BINARY: {
+      if (vector->typeKind() != TypeKind::VARCHAR &&
+          vector->typeKind() != TypeKind::VARBINARY) {
+        return std::nullopt;
+      }
+      auto sv = vector->as<SimpleVector<StringView>>()->valueAt(0);
+      return ::paimon::Literal(
+          ::paimon::FieldType::STRING, sv.data(), sv.size());
+    }
+    case ::paimon::FieldType::TIMESTAMP: {
+      if (vector->typeKind() != TypeKind::TIMESTAMP) {
+        return std::nullopt;
+      }
+      auto ts = vector->as<SimpleVector<Timestamp>>()->valueAt(0);
+      int64_t totalNanos = (ts.getSeconds() * 1'000'000'000LL) + ts.getNanos();
+      int64_t millis = totalNanos / 1'000'000;
+      int32_t nanoOfMillis = static_cast<int32_t>(totalNanos % 1'000'000);
+      return ::paimon::Literal(::paimon::Timestamp(millis, nanoOfMillis));
+    }
+    default:
+      return std::nullopt;
+  }
+}
+
 } // namespace
 
 // ===========================================================================
@@ -224,7 +350,8 @@ std::string PaimonFilterTranslator::normalizeOpName(const std::string& opName) {
 
 ToPaimonPredicateResult PaimonFilterTranslator::translate(
     const core::TypedExprPtr& expr,
-    const RowTypePtr& rowType) {
+    const RowTypePtr& rowType,
+    core::ExpressionEvaluator* evaluator) {
   auto fail = [](std::string reason) -> ToPaimonPredicateResult {
     LOG(WARNING) << "translate (with rowType): " << reason;
     return {nullptr, std::move(reason)};
@@ -239,12 +366,13 @@ ToPaimonPredicateResult PaimonFilterTranslator::translate(
     return fail("expr is not a CallTypedExpr");
   }
 
-  return translateCall(*call, rowType);
+  return translateCall(*call, rowType, evaluator);
 }
 
 ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     const core::CallTypedExpr& call,
-    const RowTypePtr& rowType) {
+    const RowTypePtr& rowType,
+    core::ExpressionEvaluator* evaluator) {
   auto fail = [](std::string reason) -> ToPaimonPredicateResult {
     LOG(WARNING) << "translateCall (with rowType): " << reason;
     return {nullptr, std::move(reason)};
@@ -262,7 +390,7 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     std::vector<std::shared_ptr<::paimon::Predicate>> children;
     children.reserve(inputs.size());
     for (const auto& input : inputs) {
-      auto child = translate(input, rowType);
+      auto child = translate(input, rowType, evaluator);
       if (!child.ok()) {
         return fail(fmt::format("AND child failed: {}", child.reason));
       }
@@ -280,7 +408,7 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     std::vector<std::shared_ptr<::paimon::Predicate>> children;
     children.reserve(inputs.size());
     for (const auto& input : inputs) {
-      auto child = translate(input, rowType);
+      auto child = translate(input, rowType, evaluator);
       if (!child.ok()) {
         return fail("OR child failed");
       }
@@ -307,7 +435,7 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     if (negatedOp.has_value()) {
       core::CallTypedExpr negatedCall(
           innerCall->type(), innerCall->inputs(), negatedOp.value());
-      return translateCall(negatedCall, rowType);
+      return translateCall(negatedCall, rowType, evaluator);
     }
     if (normalizeOpName(innerCall->name()) == "is_null") {
       auto fieldInfo = extractFieldInfo(innerCall->inputs()[0], rowType);
@@ -350,7 +478,7 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     if (inputs.size() < 2) {
       return fail("eq requires 2 inputs");
     }
-    auto lit = extractLiteral(inputs[1], fieldType);
+    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
     if (!lit) {
       return fail("eq: could not extract literal");
     }
@@ -363,7 +491,7 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     if (inputs.size() < 2) {
       return fail("neq requires 2 inputs");
     }
-    auto lit = extractLiteral(inputs[1], fieldType);
+    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
     if (!lit) {
       return fail("neq: could not extract literal");
     }
@@ -376,7 +504,7 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     if (inputs.size() < 2) {
       return fail("lt requires 2 inputs");
     }
-    auto lit = extractLiteral(inputs[1], fieldType);
+    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
     if (!lit) {
       return fail("lt: could not extract literal");
     }
@@ -389,7 +517,7 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     if (inputs.size() < 2) {
       return fail("lte requires 2 inputs");
     }
-    auto lit = extractLiteral(inputs[1], fieldType);
+    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
     if (!lit) {
       return fail("lte: could not extract literal");
     }
@@ -402,7 +530,7 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     if (inputs.size() < 2) {
       return fail("gt requires 2 inputs");
     }
-    auto lit = extractLiteral(inputs[1], fieldType);
+    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
     if (!lit) {
       return fail("gt: could not extract literal");
     }
@@ -415,7 +543,7 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     if (inputs.size() < 2) {
       return fail("gte requires 2 inputs");
     }
-    auto lit = extractLiteral(inputs[1], fieldType);
+    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
     if (!lit) {
       return fail("gte: could not extract literal");
     }
@@ -428,8 +556,8 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     if (inputs.size() < 3) {
       return fail("between requires 3 inputs");
     }
-    auto low = extractLiteral(inputs[1], fieldType);
-    auto high = extractLiteral(inputs[2], fieldType);
+    auto low = extractLiteral(inputs[1], fieldType, evaluator);
+    auto high = extractLiteral(inputs[2], fieldType, evaluator);
     if (!low || !high) {
       return fail("between: could not extract literals");
     }
@@ -451,6 +579,28 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     }
     return ok(::paimon::PredicateBuilder::In(
         fieldIndex, fieldName, fieldType, literals));
+  }
+
+  // Like: like(string_field, pattern). Three-arg LIKE with an explicit escape
+  // character is kept as a remaining filter to avoid changing escape semantics.
+  if (opName == "like") {
+    if (inputs.size() != 2) {
+      return fail("like requires 2 inputs");
+    }
+    if (fieldType != ::paimon::FieldType::STRING &&
+        fieldType != ::paimon::FieldType::BINARY) {
+      return fail("like only supports string/binary fields");
+    }
+    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
+    if (!lit) {
+      return fail("like: could not extract pattern literal");
+    }
+    auto result = ::paimon::PredicateBuilder::Like(
+        fieldIndex, fieldName, fieldType, *lit);
+    if (!result.ok()) {
+      return fail("like: " + result.status().ToString());
+    }
+    return ok(std::move(result).value());
   }
 
   // Is null: is_null(field)
@@ -684,7 +834,8 @@ PaimonFilterTranslator::extractFieldInfo(
 
 std::optional<::paimon::Literal> PaimonFilterTranslator::extractLiteral(
     const core::TypedExprPtr& expr,
-    ::paimon::FieldType fieldType) {
+    ::paimon::FieldType fieldType,
+    core::ExpressionEvaluator* evaluator) {
   // Unwrap CastTypedExpr — query planners often wrap constants in casts.
   auto unwrapped = expr;
   while (const auto* cast =
@@ -695,7 +846,8 @@ std::optional<::paimon::Literal> PaimonFilterTranslator::extractLiteral(
   const auto* constant =
       dynamic_cast<const core::ConstantTypedExpr*>(unwrapped.get());
   if (!constant || constant->hasValueVector()) {
-    return std::nullopt;
+    return literalFromVector(
+        evaluateConstantExpression(unwrapped, evaluator), fieldType);
   }
 
   const auto& value = constant->value();
@@ -945,6 +1097,8 @@ std::optional<std::string> PaimonFilterTranslator::functionToOpName(
       return std::string("in");
     case ::paimon::Function::Type::NOT_IN:
       return std::string("not_in");
+    case ::paimon::Function::Type::LIKE:
+      return std::string("like");
     default:
       return std::nullopt;
   }
