@@ -33,6 +33,7 @@
 #include "bolt/connectors/paimon/PaimonConfig.h"
 #include "bolt/connectors/paimon/PaimonFilterTranslator.h"
 #include "bolt/expression/Expr.h"
+#include "bolt/expression/ExprToSubfieldFilter.h"
 #include "bolt/type/StringView.h"
 #include "bolt/type/Type.h"
 #include "bolt/vector/BaseVector.h"
@@ -77,19 +78,6 @@ std::shared_ptr<PaimonColumnHandle> findPaimonColumnHandle(
 
 namespace {
 
-void collectTopLevelConjuncts(
-    const core::TypedExprPtr& expression,
-    std::vector<core::TypedExprPtr>& conjuncts) {
-  const auto* call = dynamic_cast<const core::CallTypedExpr*>(expression.get());
-  if (call && call->name() == "and") {
-    for (const auto& input : call->inputs()) {
-      collectTopLevelConjuncts(input, conjuncts);
-    }
-    return;
-  }
-  conjuncts.push_back(expression);
-}
-
 core::TypedExprPtr combineConjuncts(std::vector<core::TypedExprPtr> conjuncts) {
   if (conjuncts.empty()) {
     return nullptr;
@@ -130,7 +118,7 @@ std::pair<std::shared_ptr<::paimon::Predicate>, core::TypedExprPtr> planFilter(
     const RowTypePtr& rowType,
     core::ExpressionEvaluator* evaluator) {
   std::vector<core::TypedExprPtr> conjuncts;
-  collectTopLevelConjuncts(expression, conjuncts);
+  exec::flattenTopLevelConjuncts(expression, conjuncts);
 
   std::vector<std::shared_ptr<::paimon::Predicate>> predicates;
   std::vector<core::TypedExprPtr> remainingConjuncts;
@@ -176,7 +164,8 @@ PaimonDataSource::PaimonDataSource(
       expressionEvaluator_(queryCtx->expressionEvaluator()),
       pool_(queryCtx->memoryPool()) {
   // Wrap the query-context pool for Paimon's native memory management.
-  paimonPool_ = std::make_shared<BoltPaimonMemoryPool>(pool_);
+  paimonPool_ =
+      std::make_shared<BoltPaimonMemoryPool>(pool_, expressionEvaluator_);
 
   ::paimon::ReadContextBuilder ctxBuilder(tableHandle_->tablePath());
   std::vector<std::string> columns;
@@ -433,11 +422,7 @@ std::optional<RowVectorPtr> PaimonDataSource::next(
   BufferPtr remainingIndices;
   if (remainingFilterExprSet_) {
     auto filterInput = std::make_shared<RowVector>(
-        pool_,
-        filterRowType_,
-        row->nulls(),
-        row->size(),
-        row->children());
+        pool_, filterRowType_, row->nulls(), row->size(), row->children());
     rowsRemaining = evaluateRemainingFilter(filterInput);
     if (rowsRemaining == 0) {
       return RowVector::createEmpty(outputType_, pool_);

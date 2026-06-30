@@ -135,6 +135,31 @@ std::pair<common::Subfield, std::unique_ptr<common::Filter>> toSubfieldFilter(
       "Unsupported expression for range filter: {}", expr->toString());
 }
 
+void flattenTopLevelConjuncts(
+    const core::TypedExprPtr& expr,
+    std::vector<core::TypedExprPtr>& conjuncts) {
+  if (!expr) {
+    return;
+  }
+  auto call = std::dynamic_pointer_cast<const core::CallTypedExpr>(expr);
+  if (call && call->name() == "and") {
+    for (const auto& input : call->inputs()) {
+      flattenTopLevelConjuncts(input, conjuncts);
+    }
+    return;
+  }
+  conjuncts.push_back(expr);
+}
+
+std::vector<core::TypedExprPtr> flattenTopLevelConjuncts(
+    const core::TypedExprPtr& expr) {
+  std::vector<core::TypedExprPtr> conjuncts;
+  if (expr) {
+    flattenTopLevelConjuncts(expr, conjuncts);
+  }
+  return conjuncts;
+}
+
 std::shared_ptr<ExprToSubfieldFilterParser>
     ExprToSubfieldFilterParser::parser_ =
         std::make_shared<PrestoExprToSubfieldFilterParser>();

@@ -29,6 +29,7 @@
 #include <optional>
 #include "bolt/core/Expressions.h"
 #include "bolt/expression/Expr.h"
+#include "bolt/expression/ExprToSubfieldFilter.h"
 #include "bolt/type/Subfield.h"
 #include "bolt/type/Timestamp.h"
 #include "bolt/type/filter/FilterBase.h"
@@ -1711,157 +1712,186 @@ PaimonFilterTranslator::FilterBuildResult buildFilterFromCall(
   return fail(fmt::format("unsupported operator '{}'", op));
 }
 
+void addSubfieldFilter(
+    common::SubfieldFilters& filters,
+    common::Subfield subfield,
+    std::unique_ptr<common::Filter> filter) {
+  if (!filter) {
+    return;
+  }
+  const auto fieldName = subfield.toString();
+  auto [it, inserted] =
+      filters.try_emplace(std::move(subfield), std::move(filter));
+  if (!inserted && it->second && filter) {
+    try {
+      it->second = it->second->mergeWith(filter.get());
+    } catch (const BoltException& e) {
+      // Some filter types (e.g. HugeintRange) don't support mergeWith.
+      // Skip pushdown for this subfield rather than failing.
+      LOG(WARNING) << "toSubfieldFilters: cannot merge filters on '"
+                   << fieldName << "': " << e.message();
+      filters.erase(it);
+    }
+  }
+}
+
+bool extractSubfieldFilter(
+    const core::TypedExprPtr& expr,
+    common::SubfieldFilters& filters) {
+  const auto* call = dynamic_cast<const core::CallTypedExpr*>(expr.get());
+  if (!call) {
+    return false;
+  }
+
+  const auto& op = call->name();
+
+  // OR: only push down when ALL direct children are EQUAL predicates
+  // on the same column (produces a Values filter). Cross-column or mixed
+  // ORs cannot be pushed into ScanSpec.
+  if (op == "or") {
+    std::optional<std::string> columnName;
+    std::vector<int64_t> intValues;
+    std::vector<int128_t> hugeintValues;
+    std::vector<std::string> stringValues;
+    bool allEqual = true;
+
+    std::vector<const core::CallTypedExpr*> orStack;
+    for (const auto& child : call->inputs()) {
+      const auto* childCall =
+          dynamic_cast<const core::CallTypedExpr*>(child.get());
+      if (childCall) {
+        orStack.push_back(childCall);
+      } else {
+        allEqual = false;
+        break;
+      }
+    }
+    while (!orStack.empty() && allEqual) {
+      const auto* current = orStack.back();
+      orStack.pop_back();
+      if (!current || current->name() != "eq") {
+        allEqual = false;
+        break;
+      }
+      auto name = extractFieldName(current->inputs()[0]);
+      if (!name) {
+        allEqual = false;
+        break;
+      }
+      if (!columnName.has_value()) {
+        columnName = name;
+      } else if (*columnName != *name) {
+        allEqual = false;
+        break;
+      }
+      auto val = extractConstant(current->inputs()[1]);
+      if (!val) {
+        allEqual = false;
+        break;
+      }
+      auto kind = current->inputs()[1]->type()->kind();
+      if (kind == TypeKind::TINYINT || kind == TypeKind::SMALLINT ||
+          kind == TypeKind::INTEGER || kind == TypeKind::BIGINT) {
+        // literalToConstantExpr promotes all integral types < BIGINT to
+        // int64_t in the variant, so always read as int64_t.
+        intValues.push_back(val->value<int64_t>());
+      } else if (kind == TypeKind::HUGEINT) {
+        hugeintValues.push_back(val->value<int128_t>());
+      } else if (kind == TypeKind::VARCHAR || kind == TypeKind::VARBINARY) {
+        stringValues.push_back(val->value<std::string>());
+      } else {
+        allEqual = false;
+        break;
+      }
+    }
+
+    if (!allEqual) {
+      LOG(INFO)
+          << "[FilterPushdown] OR predicate cannot be pushed down: "
+             "not all children are equality predicates on the same column";
+      return false;
+    }
+    if (!columnName.has_value()) {
+      return false;
+    }
+
+    std::unique_ptr<common::Filter> filter;
+    if (!intValues.empty()) {
+      filter = common::createBigintValues(intValues, false);
+    } else if (!hugeintValues.empty()) {
+      auto [minIt, maxIt] =
+          std::minmax_element(hugeintValues.begin(), hugeintValues.end());
+      filter = std::make_unique<common::HugeintValuesUsingHashTable>(
+          *minIt, *maxIt, hugeintValues, false);
+    } else if (!stringValues.empty()) {
+      filter = common::createBytesValues(stringValues, false);
+    }
+    if (!filter) {
+      return false;
+    }
+    addSubfieldFilter(
+        filters, common::Subfield(columnName.value()), std::move(filter));
+    return true;
+  }
+
+  // Leaf predicate — try to build a filter directly.
+  auto result = buildFilterFromCall(*call);
+  if (!result) {
+    LOG(INFO) << "[FilterPushdown] skipping leaf predicate '" << call->name()
+              << "': " << result.reason;
+    return false;
+  }
+
+  auto fieldName = extractFieldName(call->inputs()[0]);
+  if (!fieldName) {
+    return false;
+  }
+
+  addSubfieldFilter(
+      filters, common::Subfield(*fieldName), std::move(result.value));
+  return true;
+}
+
+bool extractSubfieldFiltersWithEvaluator(
+    const core::TypedExprPtr& expr,
+    core::ExpressionEvaluator* evaluator,
+    common::SubfieldFilters& filters) {
+  const auto* call = dynamic_cast<const core::CallTypedExpr*>(expr.get());
+  if (!call) {
+    return false;
+  }
+
+  try {
+    auto subfieldFilter = exec::toSubfieldFilter(expr, evaluator);
+    addSubfieldFilter(
+        filters,
+        std::move(subfieldFilter.first),
+        std::move(subfieldFilter.second));
+    return true;
+  } catch (const BoltException& e) {
+    LOG(INFO) << "[FilterPushdown] ExprToSubfieldFilterParser skipped '"
+              << call->name() << "': " << e.message();
+  } catch (const std::exception& e) {
+    LOG(INFO) << "[FilterPushdown] ExprToSubfieldFilterParser skipped '"
+              << call->name() << "': " << e.what();
+  }
+
+  return false;
+}
+
 } // namespace
 
 common::SubfieldFilters PaimonFilterTranslator::toSubfieldFilters(
-    const core::TypedExprPtr& expr) {
+    const core::TypedExprPtr& expr,
+    core::ExpressionEvaluator* evaluator) {
   common::SubfieldFilters filters;
-
-  if (!expr) {
+  if (evaluator &&
+      extractSubfieldFiltersWithEvaluator(expr, evaluator, filters)) {
     return filters;
   }
 
-  // Iterative traversal to satisfy clang-tidy misc-no-recursion.
-  std::vector<core::TypedExprPtr> stack;
-  stack.push_back(expr);
-
-  while (!stack.empty()) {
-    auto current = std::move(stack.back());
-    stack.pop_back();
-    if (!current) {
-      continue;
-    }
-
-    const auto* call = dynamic_cast<const core::CallTypedExpr*>(current.get());
-    if (!call) {
-      continue;
-    }
-
-    const auto& op = call->name();
-
-    // Flatten AND by pushing children onto the stack.
-    if (op == "and") {
-      for (const auto& child : call->inputs()) {
-        stack.push_back(child);
-      }
-      continue;
-    }
-
-    // OR: only push down when ALL direct children are EQUAL predicates
-    // on the same column (produces a Values filter). Cross-column or mixed
-    // ORs cannot be pushed into ScanSpec.
-    if (op == "or") {
-      std::optional<std::string> columnName;
-      std::vector<int64_t> intValues;
-      std::vector<int128_t> hugeintValues;
-      std::vector<std::string> stringValues;
-      bool allEqual = true;
-
-      std::vector<const core::CallTypedExpr*> orStack;
-      for (const auto& child : call->inputs()) {
-        const auto* childCall =
-            dynamic_cast<const core::CallTypedExpr*>(child.get());
-        if (childCall) {
-          orStack.push_back(childCall);
-        } else {
-          allEqual = false;
-          break;
-        }
-      }
-      while (!orStack.empty() && allEqual) {
-        const auto* current = orStack.back();
-        orStack.pop_back();
-        if (!current || current->name() != "eq") {
-          allEqual = false;
-          break;
-        }
-        auto name = extractFieldName(current->inputs()[0]);
-        if (!name) {
-          allEqual = false;
-          break;
-        }
-        if (!columnName.has_value()) {
-          columnName = name;
-        } else if (*columnName != *name) {
-          allEqual = false;
-          break;
-        }
-        auto val = extractConstant(current->inputs()[1]);
-        if (!val) {
-          allEqual = false;
-          break;
-        }
-        auto kind = current->inputs()[1]->type()->kind();
-        if (kind == TypeKind::TINYINT || kind == TypeKind::SMALLINT ||
-            kind == TypeKind::INTEGER || kind == TypeKind::BIGINT) {
-          // literalToConstantExpr promotes all integral types < BIGINT to
-          // int64_t in the variant, so always read as int64_t.
-          intValues.push_back(val->value<int64_t>());
-        } else if (kind == TypeKind::HUGEINT) {
-          hugeintValues.push_back(val->value<int128_t>());
-        } else if (kind == TypeKind::VARCHAR || kind == TypeKind::VARBINARY) {
-          stringValues.push_back(val->value<std::string>());
-        } else {
-          allEqual = false;
-          break;
-        }
-      }
-
-      if (!allEqual) {
-        LOG(INFO)
-            << "[FilterPushdown] OR predicate cannot be pushed down: "
-               "not all children are equality predicates on the same column";
-      }
-      if (allEqual && columnName.has_value()) {
-        std::unique_ptr<common::Filter> filter;
-        if (!intValues.empty()) {
-          filter = common::createBigintValues(intValues, false);
-        } else if (!hugeintValues.empty()) {
-          auto [minIt, maxIt] =
-              std::minmax_element(hugeintValues.begin(), hugeintValues.end());
-          filter = std::make_unique<common::HugeintValuesUsingHashTable>(
-              *minIt, *maxIt, hugeintValues, false);
-        } else if (!stringValues.empty()) {
-          filter = common::createBytesValues(stringValues, false);
-        }
-        if (filter) {
-          common::Subfield subfield(columnName.value());
-          filters.insert_or_assign(std::move(subfield), std::move(filter));
-        }
-      }
-      continue;
-    }
-
-    // Leaf predicate — try to build a filter directly.
-    auto result = buildFilterFromCall(*call);
-    if (!result) {
-      LOG(INFO) << "[FilterPushdown] skipping leaf predicate '" << call->name()
-                << "': " << result.reason;
-      continue;
-    }
-    auto filter = std::move(result.value);
-
-    auto fieldName = extractFieldName(call->inputs()[0]);
-    if (!fieldName) {
-      continue;
-    }
-
-    common::Subfield subfield(*fieldName);
-    auto [it, inserted] =
-        filters.try_emplace(std::move(subfield), std::move(filter));
-    if (!inserted && it->second && filter) {
-      try {
-        it->second = it->second->mergeWith(filter.get());
-      } catch (const BoltException& e) {
-        // Some filter types (e.g. HugeintRange) don't support mergeWith.
-        // Skip pushdown for this subfield rather than failing.
-        LOG(WARNING) << "toSubfieldFilters: cannot merge filters on '"
-                     << *fieldName << "': " << e.message();
-        filters.erase(it);
-      }
-    }
-  }
-
+  // fallback to direct subfield filter extraction (no evaluator)
+  extractSubfieldFilter(expr, filters);
   return filters;
 }
 

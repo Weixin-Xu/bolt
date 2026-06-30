@@ -20,6 +20,7 @@
 #include "bolt/connectors/paimon/PaimonConfig.h"
 #include "bolt/connectors/paimon/PaimonConnectorSplit.h"
 #include "bolt/connectors/paimon/PaimonTableHandle.h"
+#include "bolt/core/ExpressionEvaluator.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/vector/SelectivityVector.h"
 

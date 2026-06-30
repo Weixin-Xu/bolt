@@ -121,7 +121,7 @@ class PaimonFilterTranslator {
       memory::MemoryPool* pool = nullptr);
 
   // -----------------------------------------------------------------------
-  // Direction 2b: TypedExpr → SubfieldFilters (constant-only, no evaluator)
+  // Direction 2b: TypedExpr → SubfieldFilters
   // -----------------------------------------------------------------------
 
   /// Result of building a DWIO Filter from a CallTypedExpr.
@@ -139,14 +139,18 @@ class PaimonFilterTranslator {
 
   /// Convert a TypedExpr into SubfieldFilters for DWIO scan spec pushdown.
   ///
-  /// Designed for TypedExpr trees produced by toTypedExpr(), where all
-  /// literals are ConstantTypedExpr nodes. Does not require an
-  /// ExpressionEvaluator — values are read directly from constants.
+  /// When an evaluator is provided, leaf predicates are converted by
+  /// exec::ExprToSubfieldFilterParser and literal-side constant expressions can
+  /// be evaluated before building filters. Without an evaluator, this falls
+  /// back to direct ConstantTypedExpr extraction for TypedExpr trees produced
+  /// by toTypedExpr().
   ///
-  /// Handles AND-flattening. OR is only converted when all children are
-  /// EQUAL predicates on the same column (produces a Values filter).
+  /// Handles AND-flattening. With an evaluator, OR is converted when the
+  /// common parser can merge both sides on the same subfield. Without an
+  /// evaluator, OR falls back to the existing same-column equality handling.
   static common::SubfieldFilters toSubfieldFilters(
-      const core::TypedExprPtr& expr);
+      const core::TypedExprPtr& expr,
+      core::ExpressionEvaluator* evaluator = nullptr);
 
  private:
   struct FieldInfo {

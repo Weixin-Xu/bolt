@@ -29,6 +29,7 @@
 #include "bolt/core/Expressions.h"
 #include "bolt/core/QueryCtx.h"
 #include "bolt/expression/Expr.h"
+#include "bolt/expression/ExprToSubfieldFilter.h"
 #include "bolt/functions/prestosql/registration/RegistrationFunctions.h"
 #include "bolt/type/Subfield.h"
 #include "bolt/type/Type.h"
@@ -106,6 +107,10 @@ class PaimonFilterTranslatorTest
 
   static TypedExprPtr strConst(const std::string& value) {
     return std::make_shared<ConstantTypedExpr>(VARCHAR(), variant(value));
+  }
+
+  static TypedExprPtr binaryConst(const std::string& value) {
+    return std::make_shared<ConstantTypedExpr>(VARBINARY(), variant(value));
   }
 
   static TypedExprPtr floatConst(float value) {
@@ -297,6 +302,20 @@ TEST_F(PaimonFilterTranslatorTest, BareConstantReturnsNull) {
   EXPECT_FALSE(result.ok()) << result.reason;
 }
 
+TEST_F(PaimonFilterTranslatorTest, FlattenTopLevelConjunctsKeepsLeafOrder) {
+  auto first = eq(field(BIGINT(), "id"), intConst(1));
+  auto second = gt(field(BIGINT(), "age"), intConst(10));
+  auto third = isNotNull(field(VARCHAR(), "name"));
+  auto expr = andExpr(andExpr(first, second), third);
+
+  auto conjuncts = exec::flattenTopLevelConjuncts(expr);
+
+  ASSERT_EQ(conjuncts.size(), 3);
+  EXPECT_EQ(conjuncts[0].get(), first.get());
+  EXPECT_EQ(conjuncts[1].get(), second.get());
+  EXPECT_EQ(conjuncts[2].get(), third.get());
+}
+
 // ---------------------------------------------------------------------------
 // Equality predicates
 // ---------------------------------------------------------------------------
@@ -452,6 +471,32 @@ TEST_F(
   ASSERT_NE(it, filters.end());
   EXPECT_TRUE(it->second->testInt64(2));
   EXPECT_FALSE(it->second->testInt64(1));
+}
+
+TEST_F(PaimonFilterTranslatorTest, SubfieldFiltersUseEvaluatorForConstantRhs) {
+  auto expr = eq(field(BIGINT(), "id"), plus(intConst(1), intConst(1)));
+
+  EXPECT_TRUE(PaimonFilterTranslator::toSubfieldFilters(expr).empty());
+
+  auto filters = PaimonFilterTranslator::toSubfieldFilters(expr, &evaluator_);
+  ASSERT_EQ(filters.size(), 1);
+  auto it = filters.find(common::Subfield("id"));
+  ASSERT_NE(it, filters.end());
+  EXPECT_TRUE(it->second->testInt64(2));
+  EXPECT_FALSE(it->second->testInt64(1));
+}
+
+TEST_F(
+    PaimonFilterTranslatorTest,
+    SubfieldFiltersFallbackWhenEvaluatorParserDoesNotSupportType) {
+  auto expr = eq(field(VARBINARY(), "payload"), binaryConst("abc"));
+
+  auto filters = PaimonFilterTranslator::toSubfieldFilters(expr, &evaluator_);
+  ASSERT_EQ(filters.size(), 1);
+  auto it = filters.find(common::Subfield("payload"));
+  ASSERT_NE(it, filters.end());
+  EXPECT_TRUE(it->second->testBytes("abc", 3));
+  EXPECT_FALSE(it->second->testBytes("abd", 3));
 }
 
 // ---------------------------------------------------------------------------
