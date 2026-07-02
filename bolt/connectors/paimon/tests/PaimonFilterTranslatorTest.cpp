@@ -496,7 +496,7 @@ TEST_F(
   auto it = filters.find(common::Subfield("payload"));
   ASSERT_NE(it, filters.end());
   EXPECT_TRUE(it->second->testBytes("abc", 3));
-  EXPECT_FALSE(it->second->testBytes("abd", 3));
+  EXPECT_FALSE(it->second->testBytes("bcd", 3));
 }
 
 // ---------------------------------------------------------------------------

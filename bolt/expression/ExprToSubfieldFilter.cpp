@@ -138,17 +138,27 @@ std::pair<common::Subfield, std::unique_ptr<common::Filter>> toSubfieldFilter(
 void flattenTopLevelConjuncts(
     const core::TypedExprPtr& expr,
     std::vector<core::TypedExprPtr>& conjuncts) {
-  if (!expr) {
-    return;
+  std::vector<core::TypedExprPtr> pending;
+  if (expr) {
+    pending.push_back(expr);
   }
-  auto call = std::dynamic_pointer_cast<const core::CallTypedExpr>(expr);
-  if (call && call->name() == "and") {
-    for (const auto& input : call->inputs()) {
-      flattenTopLevelConjuncts(input, conjuncts);
+
+  while (!pending.empty()) {
+    auto current = std::move(pending.back());
+    pending.pop_back();
+    if (!current) {
+      continue;
     }
-    return;
+    auto call = std::dynamic_pointer_cast<const core::CallTypedExpr>(current);
+    if (call && call->name() == "and") {
+      const auto& inputs = call->inputs();
+      for (size_t i = inputs.size(); i > 0; --i) {
+        pending.push_back(inputs[i - 1]);
+      }
+      continue;
+    }
+    conjuncts.push_back(std::move(current));
   }
-  conjuncts.push_back(expr);
 }
 
 std::vector<core::TypedExprPtr> flattenTopLevelConjuncts(

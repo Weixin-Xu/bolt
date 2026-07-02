@@ -307,7 +307,7 @@ std::optional<::paimon::Literal> literalFromVector(
       auto ts = vector->as<SimpleVector<Timestamp>>()->valueAt(0);
       int64_t totalNanos = (ts.getSeconds() * 1'000'000'000LL) + ts.getNanos();
       int64_t millis = totalNanos / 1'000'000;
-      int32_t nanoOfMillis = static_cast<int32_t>(totalNanos % 1'000'000);
+      auto nanoOfMillis = static_cast<int32_t>(totalNanos % 1'000'000);
       return ::paimon::Literal(::paimon::Timestamp(millis, nanoOfMillis));
     }
     default:
@@ -383,240 +383,292 @@ ToPaimonPredicateResult PaimonFilterTranslator::translateCall(
     return {std::move(pred), ""};
   };
 
-  const auto& opName = normalizeOpName(call.name());
-  const auto& inputs = call.inputs();
+  auto translateLeafCall =
+      [&](const core::CallTypedExpr& leafCall) -> ToPaimonPredicateResult {
+    const auto opName = normalizeOpName(leafCall.name());
+    const auto& inputs = leafCall.inputs();
 
-  // Handle AND: recursively translate all children.
-  if (opName == "and") {
-    std::vector<std::shared_ptr<::paimon::Predicate>> children;
-    children.reserve(inputs.size());
-    for (const auto& input : inputs) {
-      auto child = translate(input, rowType, evaluator);
-      if (!child.ok()) {
-        return fail(fmt::format("AND child failed: {}", child.reason));
-      }
-      children.push_back(std::move(child.value));
-    }
-    auto result = ::paimon::PredicateBuilder::And(children);
-    if (!result.ok()) {
-      return fail("PredicateBuilder::And failed");
-    }
-    return ok(std::move(result).value());
-  }
-
-  // Handle OR: recursively translate all children.
-  if (opName == "or") {
-    std::vector<std::shared_ptr<::paimon::Predicate>> children;
-    children.reserve(inputs.size());
-    for (const auto& input : inputs) {
-      auto child = translate(input, rowType, evaluator);
-      if (!child.ok()) {
-        return fail("OR child failed");
-      }
-      children.push_back(std::move(child.value));
-    }
-    auto result = ::paimon::PredicateBuilder::Or(children);
-    if (!result.ok()) {
-      return fail("PredicateBuilder::Or failed");
-    }
-    return ok(std::move(result).value());
-  }
-
-  // Handle NOT: translate inner with negation applied per-operator.
-  if (opName == "not") {
+    // Leaf predicates require at least one operand (the field).
     if (inputs.empty()) {
-      return fail("NOT has no inputs");
+      return fail("leaf op has no inputs");
     }
-    const auto* innerCall =
-        dynamic_cast<const core::CallTypedExpr*>(inputs[0].get());
-    if (!innerCall) {
-      return fail("NOT inner is not a CallTypedExpr");
+
+    auto fieldInfo = extractFieldInfo(inputs[0], rowType);
+    if (!fieldInfo) {
+      return fail(fmt::format(
+          "could not extract field info for op {}, input[0]={}",
+          opName,
+          inputs[0]->toString()));
     }
-    auto negatedOp = applyNegation(normalizeOpName(innerCall->name()));
-    if (negatedOp.has_value()) {
-      core::CallTypedExpr negatedCall(
-          innerCall->type(), innerCall->inputs(), negatedOp.value());
-      return translateCall(negatedCall, rowType, evaluator);
-    }
-    if (normalizeOpName(innerCall->name()) == "is_null") {
-      auto fieldInfo = extractFieldInfo(innerCall->inputs()[0], rowType);
-      if (!fieldInfo) {
-        return fail("NOT is_null: could not extract field info");
+
+    const auto& fieldName = fieldInfo->name;
+    const auto fieldIndex = fieldInfo->index;
+    const auto& fieldType = fieldInfo->fieldType;
+
+    // Equality: eq(field, constant)
+    if (opName == "eq") {
+      if (inputs.size() < 2) {
+        return fail("eq requires 2 inputs");
       }
-      return ok(::paimon::PredicateBuilder::IsNotNull(
-          fieldInfo->index, fieldInfo->name, fieldInfo->fieldType));
-    }
-    if (normalizeOpName(innerCall->name()) == "is_not_null") {
-      auto fieldInfo = extractFieldInfo(innerCall->inputs()[0], rowType);
-      if (!fieldInfo) {
-        return fail("NOT is_not_null: could not extract field info");
+      auto lit = extractLiteral(inputs[1], fieldType, evaluator);
+      if (!lit) {
+        return fail("eq: could not extract literal");
       }
-      return ok(::paimon::PredicateBuilder::IsNull(
-          fieldInfo->index, fieldInfo->name, fieldInfo->fieldType));
+      return ok(::paimon::PredicateBuilder::Equal(
+          fieldIndex, fieldName, fieldType, *lit));
     }
-    return fail("unsupported negation target");
-  }
 
-  // Leaf predicates require at least one operand (the field).
-  if (inputs.empty()) {
-    return fail("leaf op has no inputs");
-  }
+    // Not equal: neq(field, constant)
+    if (opName == "neq") {
+      if (inputs.size() < 2) {
+        return fail("neq requires 2 inputs");
+      }
+      auto lit = extractLiteral(inputs[1], fieldType, evaluator);
+      if (!lit) {
+        return fail("neq: could not extract literal");
+      }
+      return ok(::paimon::PredicateBuilder::NotEqual(
+          fieldIndex, fieldName, fieldType, *lit));
+    }
 
-  auto fieldInfo = extractFieldInfo(inputs[0], rowType);
-  if (!fieldInfo) {
-    return fail(fmt::format(
-        "could not extract field info for op {}, input[0]={}",
-        opName,
-        inputs[0]->toString()));
-  }
+    // Less than: lt(field, constant)
+    if (opName == "lt") {
+      if (inputs.size() < 2) {
+        return fail("lt requires 2 inputs");
+      }
+      auto lit = extractLiteral(inputs[1], fieldType, evaluator);
+      if (!lit) {
+        return fail("lt: could not extract literal");
+      }
+      return ok(::paimon::PredicateBuilder::LessThan(
+          fieldIndex, fieldName, fieldType, *lit));
+    }
 
-  const auto& fieldName = fieldInfo->name;
-  const auto fieldIndex = fieldInfo->index;
-  const auto& fieldType = fieldInfo->fieldType;
+    // Less or equal: lte(field, constant)
+    if (opName == "lte") {
+      if (inputs.size() < 2) {
+        return fail("lte requires 2 inputs");
+      }
+      auto lit = extractLiteral(inputs[1], fieldType, evaluator);
+      if (!lit) {
+        return fail("lte: could not extract literal");
+      }
+      return ok(::paimon::PredicateBuilder::LessOrEqual(
+          fieldIndex, fieldName, fieldType, *lit));
+    }
 
-  // Equality: eq(field, constant)
-  if (opName == "eq") {
-    if (inputs.size() < 2) {
-      return fail("eq requires 2 inputs");
+    // Greater than: gt(field, constant)
+    if (opName == "gt") {
+      if (inputs.size() < 2) {
+        return fail("gt requires 2 inputs");
+      }
+      auto lit = extractLiteral(inputs[1], fieldType, evaluator);
+      if (!lit) {
+        return fail("gt: could not extract literal");
+      }
+      return ok(::paimon::PredicateBuilder::GreaterThan(
+          fieldIndex, fieldName, fieldType, *lit));
     }
-    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
-    if (!lit) {
-      return fail("eq: could not extract literal");
-    }
-    return ok(::paimon::PredicateBuilder::Equal(
-        fieldIndex, fieldName, fieldType, *lit));
-  }
 
-  // Not equal: neq(field, constant)
-  if (opName == "neq") {
-    if (inputs.size() < 2) {
-      return fail("neq requires 2 inputs");
+    // Greater or equal: gte(field, constant)
+    if (opName == "gte") {
+      if (inputs.size() < 2) {
+        return fail("gte requires 2 inputs");
+      }
+      auto lit = extractLiteral(inputs[1], fieldType, evaluator);
+      if (!lit) {
+        return fail("gte: could not extract literal");
+      }
+      return ok(::paimon::PredicateBuilder::GreaterOrEqual(
+          fieldIndex, fieldName, fieldType, *lit));
     }
-    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
-    if (!lit) {
-      return fail("neq: could not extract literal");
-    }
-    return ok(::paimon::PredicateBuilder::NotEqual(
-        fieldIndex, fieldName, fieldType, *lit));
-  }
 
-  // Less than: lt(field, constant)
-  if (opName == "lt") {
-    if (inputs.size() < 2) {
-      return fail("lt requires 2 inputs");
+    // Between: between(field, lower, upper)
+    if (opName == "between") {
+      if (inputs.size() < 3) {
+        return fail("between requires 3 inputs");
+      }
+      auto low = extractLiteral(inputs[1], fieldType, evaluator);
+      auto high = extractLiteral(inputs[2], fieldType, evaluator);
+      if (!low || !high) {
+        return fail("between: could not extract literals");
+      }
+      return ok(::paimon::PredicateBuilder::Between(
+          fieldIndex, fieldName, fieldType, *low, *high));
     }
-    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
-    if (!lit) {
-      return fail("lt: could not extract literal");
-    }
-    return ok(::paimon::PredicateBuilder::LessThan(
-        fieldIndex, fieldName, fieldType, *lit));
-  }
 
-  // Less or equal: lte(field, constant)
-  if (opName == "lte") {
-    if (inputs.size() < 2) {
-      return fail("lte requires 2 inputs");
-    }
-    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
-    if (!lit) {
-      return fail("lte: could not extract literal");
-    }
-    return ok(::paimon::PredicateBuilder::LessOrEqual(
-        fieldIndex, fieldName, fieldType, *lit));
-  }
-
-  // Greater than: gt(field, constant)
-  if (opName == "gt") {
-    if (inputs.size() < 2) {
-      return fail("gt requires 2 inputs");
-    }
-    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
-    if (!lit) {
-      return fail("gt: could not extract literal");
-    }
-    return ok(::paimon::PredicateBuilder::GreaterThan(
-        fieldIndex, fieldName, fieldType, *lit));
-  }
-
-  // Greater or equal: gte(field, constant)
-  if (opName == "gte") {
-    if (inputs.size() < 2) {
-      return fail("gte requires 2 inputs");
-    }
-    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
-    if (!lit) {
-      return fail("gte: could not extract literal");
-    }
-    return ok(::paimon::PredicateBuilder::GreaterOrEqual(
-        fieldIndex, fieldName, fieldType, *lit));
-  }
-
-  // Between: between(field, lower, upper)
-  if (opName == "between") {
-    if (inputs.size() < 3) {
-      return fail("between requires 3 inputs");
-    }
-    auto low = extractLiteral(inputs[1], fieldType, evaluator);
-    auto high = extractLiteral(inputs[2], fieldType, evaluator);
-    if (!low || !high) {
-      return fail("between: could not extract literals");
-    }
-    return ok(::paimon::PredicateBuilder::Between(
-        fieldIndex, fieldName, fieldType, *low, *high));
-  }
-
-  // In: in(field, array_constant) / not_in(field, array_constant)
-  if (opName == "in" || opName == "not_in") {
-    bool negated = (opName == "not_in");
-    auto result = extractInListLiterals(inputs[1], fieldType);
-    if (!result.has_value()) {
-      return fail("in/not_in: could not extract IN-list literals");
-    }
-    auto literals = std::move(result.value());
-    if (negated) {
-      return ok(::paimon::PredicateBuilder::NotIn(
+    // In: in(field, array_constant) / not_in(field, array_constant)
+    if (opName == "in" || opName == "not_in") {
+      if (inputs.size() < 2) {
+        return fail("in/not_in requires 2 inputs");
+      }
+      bool negated = (opName == "not_in");
+      auto result = extractInListLiterals(inputs[1], fieldType);
+      if (!result.has_value()) {
+        return fail("in/not_in: could not extract IN-list literals");
+      }
+      auto literals = std::move(result.value());
+      if (negated) {
+        return ok(::paimon::PredicateBuilder::NotIn(
+            fieldIndex, fieldName, fieldType, literals));
+      }
+      return ok(::paimon::PredicateBuilder::In(
           fieldIndex, fieldName, fieldType, literals));
     }
-    return ok(::paimon::PredicateBuilder::In(
-        fieldIndex, fieldName, fieldType, literals));
-  }
 
-  // Like: like(string_field, pattern). Three-arg LIKE with an explicit escape
-  // character is kept as a remaining filter to avoid changing escape semantics.
-  if (opName == "like") {
-    if (inputs.size() != 2) {
-      return fail("like requires 2 inputs");
+    // Like: like(string_field, pattern). Three-arg LIKE with an explicit escape
+    // character is kept as a remaining filter to avoid changing escape
+    // semantics.
+    if (opName == "like") {
+      if (inputs.size() != 2) {
+        return fail("like requires 2 inputs");
+      }
+      if (fieldType != ::paimon::FieldType::STRING &&
+          fieldType != ::paimon::FieldType::BINARY) {
+        return fail("like only supports string/binary fields");
+      }
+      auto lit = extractLiteral(inputs[1], fieldType, evaluator);
+      if (!lit) {
+        return fail("like: could not extract pattern literal");
+      }
+      auto result = ::paimon::PredicateBuilder::Like(
+          fieldIndex, fieldName, fieldType, *lit);
+      if (!result.ok()) {
+        return fail("like: " + result.status().ToString());
+      }
+      return ok(std::move(result).value());
     }
-    if (fieldType != ::paimon::FieldType::STRING &&
-        fieldType != ::paimon::FieldType::BINARY) {
-      return fail("like only supports string/binary fields");
+
+    // Is null: is_null(field)
+    if (opName == "is_null") {
+      return ok(
+          ::paimon::PredicateBuilder::IsNull(fieldIndex, fieldName, fieldType));
     }
-    auto lit = extractLiteral(inputs[1], fieldType, evaluator);
-    if (!lit) {
-      return fail("like: could not extract pattern literal");
+
+    // Is not null: is_not_null(field)
+    if (opName == "is_not_null") {
+      return ok(::paimon::PredicateBuilder::IsNotNull(
+          fieldIndex, fieldName, fieldType));
     }
-    auto result = ::paimon::PredicateBuilder::Like(
-        fieldIndex, fieldName, fieldType, *lit);
+
+    return fail(fmt::format("unsupported opName={}", opName));
+  };
+
+  auto translateNonCompoundCall =
+      [&](const core::CallTypedExpr& node) -> ToPaimonPredicateResult {
+    const auto opName = normalizeOpName(node.name());
+    const auto& inputs = node.inputs();
+
+    // Handle NOT: translate inner with negation applied per-operator.
+    if (opName == "not") {
+      if (inputs.empty()) {
+        return fail("NOT has no inputs");
+      }
+      const auto* innerCall =
+          dynamic_cast<const core::CallTypedExpr*>(inputs[0].get());
+      if (!innerCall) {
+        return fail("NOT inner is not a CallTypedExpr");
+      }
+      auto negatedOp = applyNegation(normalizeOpName(innerCall->name()));
+      if (negatedOp.has_value()) {
+        core::CallTypedExpr negatedCall(
+            innerCall->type(), innerCall->inputs(), negatedOp.value());
+        return translateLeafCall(negatedCall);
+      }
+      if (normalizeOpName(innerCall->name()) == "is_null") {
+        if (innerCall->inputs().empty()) {
+          return fail("NOT is_null has no inputs");
+        }
+        auto fieldInfo = extractFieldInfo(innerCall->inputs()[0], rowType);
+        if (!fieldInfo) {
+          return fail("NOT is_null: could not extract field info");
+        }
+        return ok(::paimon::PredicateBuilder::IsNotNull(
+            fieldInfo->index, fieldInfo->name, fieldInfo->fieldType));
+      }
+      if (normalizeOpName(innerCall->name()) == "is_not_null") {
+        if (innerCall->inputs().empty()) {
+          return fail("NOT is_not_null has no inputs");
+        }
+        auto fieldInfo = extractFieldInfo(innerCall->inputs()[0], rowType);
+        if (!fieldInfo) {
+          return fail("NOT is_not_null: could not extract field info");
+        }
+        return ok(::paimon::PredicateBuilder::IsNull(
+            fieldInfo->index, fieldInfo->name, fieldInfo->fieldType));
+      }
+      return fail("unsupported negation target");
+    }
+
+    return translateLeafCall(node);
+  };
+
+  struct Frame {
+    const core::CallTypedExpr* node;
+    bool combine;
+  };
+
+  std::vector<Frame> pending{{&call, false}};
+  std::vector<std::shared_ptr<::paimon::Predicate>> results;
+
+  while (!pending.empty()) {
+    auto frame = pending.back();
+    pending.pop_back();
+
+    const auto opName = normalizeOpName(frame.node->name());
+    const auto& inputs = frame.node->inputs();
+    const bool isCompound = opName == "and" || opName == "or";
+
+    if (!isCompound) {
+      auto leaf = translateNonCompoundCall(*frame.node);
+      if (!leaf.ok()) {
+        return leaf;
+      }
+      results.push_back(std::move(leaf.value));
+      continue;
+    }
+
+    if (!frame.combine) {
+      pending.push_back({frame.node, true});
+      for (size_t i = inputs.size(); i > 0; --i) {
+        const auto& input = inputs[i - 1];
+        const auto* childCall =
+            dynamic_cast<const core::CallTypedExpr*>(input.get());
+        if (!childCall) {
+          return fail(fmt::format(
+              "{} child failed: expr is not a CallTypedExpr",
+              opName == "and" ? "AND" : "OR"));
+        }
+        pending.push_back({childCall, false});
+      }
+      continue;
+    }
+
+    if (results.size() < inputs.size()) {
+      return fail("compound predicate result stack underflow");
+    }
+    const auto firstChild = results.size() - inputs.size();
+    std::vector<std::shared_ptr<::paimon::Predicate>> children;
+    children.reserve(inputs.size());
+    for (size_t i = firstChild; i < results.size(); ++i) {
+      children.push_back(std::move(results[i]));
+    }
+    results.resize(firstChild);
+
+    auto result = opName == "and" ? ::paimon::PredicateBuilder::And(children)
+                                  : ::paimon::PredicateBuilder::Or(children);
     if (!result.ok()) {
-      return fail("like: " + result.status().ToString());
+      return fail(
+          opName == "and" ? "PredicateBuilder::And failed"
+                          : "PredicateBuilder::Or failed");
     }
-    return ok(std::move(result).value());
+    results.push_back(std::move(result).value());
   }
 
-  // Is null: is_null(field)
-  if (opName == "is_null") {
-    return ok(
-        ::paimon::PredicateBuilder::IsNull(fieldIndex, fieldName, fieldType));
+  if (results.size() != 1) {
+    return fail("predicate translation produced an invalid result stack");
   }
-
-  // Is not null: is_not_null(field)
-  if (opName == "is_not_null") {
-    return ok(::paimon::PredicateBuilder::IsNotNull(
-        fieldIndex, fieldName, fieldType));
-  }
-
-  return fail(fmt::format("unsupported opName={}", opName));
+  return ok(std::move(results.front()));
 }
 
 std::optional<std::vector<::paimon::Literal>>

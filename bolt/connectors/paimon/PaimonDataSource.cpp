@@ -93,18 +93,32 @@ void collectFieldNames(
     const core::TypedExprPtr& expression,
     std::vector<std::string>& fieldNames,
     std::unordered_set<std::string>& seen) {
-  const auto* field =
-      dynamic_cast<const core::FieldAccessTypedExpr*>(expression.get());
-  if (field &&
-      (field->inputs().empty() ||
-       dynamic_cast<const core::InputTypedExpr*>(
-           field->inputs().front().get()) != nullptr) &&
-      seen.insert(field->name()).second) {
-    fieldNames.push_back(field->name());
+  std::vector<core::TypedExprPtr> pending;
+  if (expression) {
+    pending.push_back(expression);
   }
 
-  for (const auto& input : expression->inputs()) {
-    collectFieldNames(input, fieldNames, seen);
+  while (!pending.empty()) {
+    auto current = std::move(pending.back());
+    pending.pop_back();
+    if (!current) {
+      continue;
+    }
+
+    const auto* field =
+        dynamic_cast<const core::FieldAccessTypedExpr*>(current.get());
+    if (field != nullptr &&
+        (field->inputs().empty() ||
+         dynamic_cast<const core::InputTypedExpr*>(
+             field->inputs().front().get()) != nullptr) &&
+        seen.insert(field->name()).second) {
+      fieldNames.push_back(field->name());
+    }
+
+    const auto& inputs = current->inputs();
+    for (size_t i = inputs.size(); i > 0; --i) {
+      pending.push_back(inputs[i - 1]);
+    }
   }
 }
 
