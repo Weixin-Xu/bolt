@@ -1885,13 +1885,15 @@ common::SubfieldFilters PaimonFilterTranslator::toSubfieldFilters(
     const core::TypedExprPtr& expr,
     core::ExpressionEvaluator* evaluator) {
   common::SubfieldFilters filters;
-  if (evaluator &&
-      extractSubfieldFiltersWithEvaluator(expr, evaluator, filters)) {
-    return filters;
-  }
+  for (const auto& conjunct : exec::flattenTopLevelConjuncts(expr)) {
+    if (evaluator &&
+        extractSubfieldFiltersWithEvaluator(conjunct, evaluator, filters)) {
+      continue;
+    }
 
-  // fallback to direct subfield filter extraction (no evaluator)
-  extractSubfieldFilter(expr, filters);
+    // Fallback to direct subfield filter extraction (no evaluator).
+    extractSubfieldFilter(conjunct, filters);
+  }
   return filters;
 }
 

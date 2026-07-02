@@ -93,11 +93,14 @@ void collectFieldNames(
     const core::TypedExprPtr& expression,
     std::vector<std::string>& fieldNames,
     std::unordered_set<std::string>& seen) {
-  if (const auto* field =
-          dynamic_cast<const core::FieldAccessTypedExpr*>(expression.get())) {
-    if (field->inputs().empty() && seen.insert(field->name()).second) {
-      fieldNames.push_back(field->name());
-    }
+  const auto* field =
+      dynamic_cast<const core::FieldAccessTypedExpr*>(expression.get());
+  if (field &&
+      (field->inputs().empty() ||
+       dynamic_cast<const core::InputTypedExpr*>(
+           field->inputs().front().get()) != nullptr) &&
+      seen.insert(field->name()).second) {
+    fieldNames.push_back(field->name());
   }
 
   for (const auto& input : expression->inputs()) {
