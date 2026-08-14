@@ -66,6 +66,28 @@ class SizeTest : public SparkFunctionBaseTest {
     }
   }
 
+  void testSizeWithQueryConfig(
+      VectorPtr vector,
+      vector_size_t numRows,
+      bool legacySizeOfNull) {
+    queryCtx_->testingOverrideConfigUnsafe({
+        {core::QueryConfig::kSparkLegacySizeOfNull,
+         std::to_string(legacySizeOfNull)},
+    });
+    auto result =
+        evaluate<SimpleVector<int32_t>>("size(c0)", makeRowVector({vector}));
+    for (vector_size_t i = 0; i < numRows; ++i) {
+      if (!vector->isNullAt(i)) {
+        EXPECT_EQ(result->valueAt(i), sizeAt(i)) << "at " << i;
+      } else if (legacySizeOfNull) {
+        EXPECT_FALSE(result->isNullAt(i)) << "at " << i;
+        EXPECT_EQ(result->valueAt(i), -1) << "at " << i;
+      } else {
+        EXPECT_TRUE(result->isNullAt(i)) << "at " << i;
+      }
+    }
+  }
+
   template <typename T>
   int32_t testArraySize(const std::vector<std::optional<T>>& input) {
     auto row = makeRowVector({makeNullableArrayVector(
@@ -104,6 +126,19 @@ TEST_F(SizeTest, size) {
   auto mapVector = makeMapVector<int64_t, int64_t>(
       numRows, sizeAt, valueAt, valueAt, nullEvery(1));
   testSize(mapVector, numRows);
+}
+
+TEST_F(SizeTest, oneArgumentUsesQueryConfig) {
+  constexpr vector_size_t kNumRows = 100;
+  auto arrayVector =
+      makeArrayVector<int64_t>(kNumRows, sizeAt, valueAt, nullEvery(5));
+  auto mapVector = makeMapVector<int64_t, int64_t>(
+      kNumRows, sizeAt, valueAt, valueAt, nullEvery(5));
+
+  for (const bool legacySizeOfNull : {true, false}) {
+    testSizeWithQueryConfig(arrayVector, kNumRows, legacySizeOfNull);
+    testSizeWithQueryConfig(mapVector, kNumRows, legacySizeOfNull);
+  }
 }
 
 TEST_F(SizeTest, boolean) {
