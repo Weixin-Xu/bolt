@@ -111,6 +111,12 @@ class QueryConfig {
   /// If set, cast from float/double/decimal/string to integer truncates the
   /// decimal part, otherwise rounds.
   static constexpr const char* kCastToIntByTruncate = "cast_to_int_by_truncate";
+
+  /// If set, cast from string to REAL or DOUBLE trims leading and trailing
+  /// ASCII bytes in the inclusive range 0x00 through 0x20 before conversion.
+  static constexpr const char* kCastStringToFloatingPointTrimControlChars =
+      "cast_string_to_floating_point_trim_control_chars";
+
   static constexpr const char* kSpecTimezone = "spec_timezone";
 
   /// If set, cast from string to date allows only ISO 8601 formatted strings:
@@ -1011,6 +1017,14 @@ class QueryConfig {
 
   bool isCastToIntByTruncate() const {
     return get<bool>(kCastToIntByTruncate, false);
+  }
+
+  bool castStringToFloatingPointTrimControlChars() const {
+#ifdef SPARK_COMPATIBLE
+    return get<bool>(kCastStringToFloatingPointTrimControlChars, true);
+#else
+    return get<bool>(kCastStringToFloatingPointTrimControlChars, false);
+#endif
   }
 
   std::string specTimeZone() const {

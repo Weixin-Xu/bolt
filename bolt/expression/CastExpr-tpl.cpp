@@ -299,6 +299,8 @@ class Converter {
       timeZone_ = tz::locateZone(sessionTzName);
     }
     isFlinkCompatible_ = queryConfig.enableFlinkCompatible();
+    trimStringToFloatingPointControlChars_ =
+        queryConfig.castStringToFloatingPointTrimControlChars();
   }
 
   TO_KIND(BooleanKind) convert(const FromType& from, ToType& to) {
@@ -420,7 +422,11 @@ class Converter {
       // might throw 'loss of precision' error.
       to = static_cast<ToType>(from);
     } else if constexpr (fromString) {
-      folly::StringPiece newV = folly::trimWhitespace(from);
+      folly::StringPiece newV = trimStringToFloatingPointControlChars_
+          ? folly::trim(
+                from,
+                [](char c) { return static_cast<unsigned char>(c) <= 0x20; })
+          : folly::trimWhitespace(from);
       if (newV.empty()) {
         return ConvertStatus::OTHER_FAILURE;
       }
@@ -789,6 +795,7 @@ class Converter {
   int toScale_ = 0;
   const tz::TimeZone* timeZone_ = nullptr;
   bool isFlinkCompatible_ = false;
+  bool trimStringToFloatingPointControlChars_ = false;
 
   bool canAsInlinedStr_ = false;
 };

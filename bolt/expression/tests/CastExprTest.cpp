@@ -89,6 +89,13 @@ class CastExprTest : public functions::test::CastBaseTest {
     queryCtx_->testingOverrideConfigUnsafe(std::move(config));
   }
 
+  void setCastStringToFloatingPointTrimControlChars(bool value) {
+    auto config = queryCtx_->queryConfig().rawConfigsCopy();
+    config[core::QueryConfig::kCastStringToFloatingPointTrimControlChars] =
+        std::to_string(value);
+    queryCtx_->testingOverrideConfigUnsafe(std::move(config));
+  }
+
   void setEnableOptimizedCast(bool value) {
     auto config = queryCtx_->queryConfig().rawConfigsCopy();
     config[core::QueryConfig::kEnableOptimizedCast] = std::to_string(value);
@@ -719,6 +726,60 @@ TEST_F(CastExprTest, stringToDouble) {
        std::numeric_limits<double>::infinity(),
        std::numeric_limits<double>::quiet_NaN(),
        std::numeric_limits<double>::quiet_NaN()});
+
+  // Without trimming control chars, control-char-prefixed strings fail.
+  setCastStringToFloatingPointTrimControlChars(false);
+  testInvalidCast<std::string>(
+      "double",
+      {std::string(
+          "\x03"
+          "4.5",
+          4)},
+      "Unable to convert string to floating point value");
+
+  // With trimming enabled, leading/trailing bytes 0x00-0x20 are stripped.
+  setCastStringToFloatingPointTrimControlChars(true);
+  testCast<std::string, float>(
+      "real",
+      {std::string(
+           "\x03"
+           "4.5",
+           4),
+       std::string("5.5\x05", 4),
+       "6.5"},
+      {4.5f, 5.5f, 6.5f});
+  testCast<std::string, double>(
+      "double",
+      {std::string(
+           "\x01"
+           "1.5",
+           4),
+       std::string("2.5\x1f", 4),
+       std::string("\x0f -3.5 \x1e", 8),
+       std::string(
+           "\x03\0"
+           "4",
+           3),
+       std::string(
+           "\x05\0"
+           "5",
+           3)},
+      {1.5, 2.5, -3.5, 4, 5});
+  // Control chars (including NUL) in the middle are still errors.
+  testInvalidCast<std::string>(
+      "double",
+      {std::string(
+          "1\x0f"
+          "2",
+          3)},
+      "Non-whitespace character found after end of conversion");
+  testInvalidCast<std::string>(
+      "double",
+      {std::string(
+          "1\0"
+          "2",
+          3)},
+      "Non-whitespace character found after end of conversion");
 
   testInvalidCast<std::string>("double", {"f"}, "Empty input string");
   testInvalidCast<std::string>(
