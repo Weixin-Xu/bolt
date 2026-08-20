@@ -33,6 +33,7 @@
 #include <bolt/core/QueryConfig.h>
 #include <gtest/gtest.h>
 #include <optional>
+#include "bolt/common/base/SparkCompatibility.h"
 #include "bolt/functions/sparksql/tests/SparkFunctionBaseTest.h"
 #include "bolt/type/Timestamp.h"
 
@@ -66,20 +67,22 @@ class SizeTest : public SparkFunctionBaseTest {
     }
   }
 
-  void testSizeWithQueryConfig(
+  void testSizeWithSparkQueryConfig(
       VectorPtr vector,
       vector_size_t numRows,
-      bool legacySizeOfNull) {
+      bool legacySizeOfNull,
+      bool ansiEnabled,
+      bool expectedLegacySizeOfNull) {
     queryCtx_->testingOverrideConfigUnsafe({
-        {core::QueryConfig::kSparkLegacySizeOfNull,
-         std::to_string(legacySizeOfNull)},
+        {"spark.sql.legacy.sizeOfNull", std::to_string(legacySizeOfNull)},
+        {"spark.sql.ansi.enabled", std::to_string(ansiEnabled)},
     });
     auto result =
         evaluate<SimpleVector<int32_t>>("size(c0)", makeRowVector({vector}));
     for (vector_size_t i = 0; i < numRows; ++i) {
       if (!vector->isNullAt(i)) {
         EXPECT_EQ(result->valueAt(i), sizeAt(i)) << "at " << i;
-      } else if (legacySizeOfNull) {
+      } else if (expectedLegacySizeOfNull) {
         EXPECT_FALSE(result->isNullAt(i)) << "at " << i;
         EXPECT_EQ(result->valueAt(i), -1) << "at " << i;
       } else {
@@ -128,7 +131,7 @@ TEST_F(SizeTest, size) {
   testSize(mapVector, numRows);
 }
 
-TEST_F(SizeTest, oneArgumentUsesQueryConfig) {
+TEST_F(SizeTest, oneArgumentUsesSparkLegacySizeOfNullConfig) {
   constexpr vector_size_t kNumRows = 100;
   auto arrayVector =
       makeArrayVector<int64_t>(kNumRows, sizeAt, valueAt, nullEvery(5));
@@ -136,9 +139,40 @@ TEST_F(SizeTest, oneArgumentUsesQueryConfig) {
       kNumRows, sizeAt, valueAt, valueAt, nullEvery(5));
 
   for (const bool legacySizeOfNull : {true, false}) {
-    testSizeWithQueryConfig(arrayVector, kNumRows, legacySizeOfNull);
-    testSizeWithQueryConfig(mapVector, kNumRows, legacySizeOfNull);
+    testSizeWithSparkQueryConfig(
+        arrayVector,
+        kNumRows,
+        legacySizeOfNull,
+        /*ansiEnabled=*/false,
+        /*expectedLegacySizeOfNull=*/legacySizeOfNull);
+    testSizeWithSparkQueryConfig(
+        mapVector,
+        kNumRows,
+        legacySizeOfNull,
+        /*ansiEnabled=*/false,
+        /*expectedLegacySizeOfNull=*/legacySizeOfNull);
   }
+}
+
+TEST_F(SizeTest, ansiAffectsLegacySizeOfNullOnlyInSparkCompatibleBuild) {
+  constexpr vector_size_t kNumRows = 100;
+  auto arrayVector =
+      makeArrayVector<int64_t>(kNumRows, sizeAt, valueAt, nullEvery(5));
+  auto mapVector = makeMapVector<int64_t, int64_t>(
+      kNumRows, sizeAt, valueAt, valueAt, nullEvery(5));
+
+  testSizeWithSparkQueryConfig(
+      arrayVector,
+      kNumRows,
+      /*legacySizeOfNull=*/true,
+      /*ansiEnabled=*/true,
+      /*expectedLegacySizeOfNull=*/!::bytedance::bolt::kSparkCompatible);
+  testSizeWithSparkQueryConfig(
+      mapVector,
+      kNumRows,
+      /*legacySizeOfNull=*/true,
+      /*ansiEnabled=*/true,
+      /*expectedLegacySizeOfNull=*/!::bytedance::bolt::kSparkCompatible);
 }
 
 TEST_F(SizeTest, boolean) {
