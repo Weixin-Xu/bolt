@@ -15,7 +15,6 @@
 
 import os
 import platform
-import re
 from conan import ConanFile
 from conan.errors import ConanInvalidConfiguration
 from conan.tools import files, scm
@@ -165,25 +164,12 @@ class BoltConan(ConanFile):
                 git.checkout(cmd)
 
     def io_uring_supported(self):
-        if not self.options.io_uring_supported:
-            return False
-        if self.settings.os == "Linux":
-            # Try to determine kernel version during package configuration
-            kernel_version = platform.release()
-            match = re.search(r"^(\d+)\.(\d+)", kernel_version)
-            if kernel_version:
-                major = int(match.group(1))
-                minor = int(match.group(2))
-                self.output.info(f"Detected Linux kernel version: {major}.{minor}")
-                has_minimum_kernel = (major > 5) or (major == 5 and minor >= 1)
-
-                # Define a variable to be used in the build
-                self.output.info(
-                    f"Has minimum kernel required for io_uring: {has_minimum_kernel}"
-                )
-                return has_minimum_kernel
-        self.output.info("OS is not Linux. io_uring is not supported.")
-        return False
+        # This controls public virtual methods in FileSystem, so it is part of
+        # the package ABI. Derive it only from settings/options that participate
+        # in the package ID; never re-detect the build or consumer kernel here.
+        # liburing already falls back to synchronous I/O at runtime when the
+        # running kernel cannot initialize a ring.
+        return self.settings.os == "Linux" and bool(self.options.io_uring_supported)
 
     def _test_linkage(self):
         linkage = os.getenv("BOLT_TEST_LINKAGE", "shared")
@@ -448,7 +434,7 @@ class BoltConan(ConanFile):
             self.options[gperftools].build_cpu_profiler = True
             self.options[gperftools].build_heap_profiler = True
 
-        if self.io_uring_supported:
+        if self.io_uring_supported():
             self.options[liburing].with_libc = False
 
         self.options["date/*"].use_system_tz_db = True
@@ -738,11 +724,18 @@ class BoltConan(ConanFile):
                 "thrift::thrift",
                 "roaring::roaring",
                 "boost::boost",
-                "liburing::liburing",
                 "zlib::zlib",
                 "libbacktrace::libbacktrace",
             ]
         )
+        # FileSystem has IO_URING_SUPPORTED-gated virtual methods. Consumers
+        # must compile its public headers with the same definition as Bolt or
+        # the FileSystem vtable layout is ABI-incompatible.
+        if self.io_uring_supported():
+            self.cpp_info.components["bolt_engine"].requires.append(
+                "liburing::liburing"
+            )
+            self.cpp_info.components["bolt_engine"].defines.append("IO_URING_SUPPORTED")
         if self.options.get_safe("enable_testutil"):
             self.cpp_info.components["bolt_engine"].requires.extend(
                 [
