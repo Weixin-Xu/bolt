@@ -725,6 +725,8 @@ class BoltConan(ConanFile):
         self.cpp_info.components["bolt_engine"].set_property(
             "cmake_target_name", "bolt::bolt_engine"
         )
+        if self.io_uring_supported():
+            self.cpp_info.components["bolt_engine"].defines.append("IO_URING_SUPPORTED")
         self.cpp_info.components["bolt_engine"].requires.extend(
             [
                 "arrow::arrow",
