@@ -142,7 +142,10 @@ class BoltConan(ConanFile):
 
     build_policy = "missing"
 
-    scm_url = "https://github.com/bytedance/bolt.git"
+    @property
+    def scm_url(self):
+        # The Conan user selects the GitHub owner, defaulting to upstream.
+        return f"https://github.com/{self.user or 'bytedance'}/bolt.git"
 
     def source(self):
         git = scm.Git(self)
