@@ -20,6 +20,8 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -64,6 +66,60 @@ std::string joinDirAndBasename(
     return dir + basename;
   }
   return dir + "/" + basename;
+}
+
+bool hasObjectStoreKeys(const filesystems::FileSystem& fs) {
+  return fs.name() == "S3" || fs.name() == "GCS";
+}
+
+std::optional<filesystems::FileInfo> findFileInfo(
+    filesystems::FileSystem& fs,
+    const std::string& path) {
+  // Object existence does not account for directories represented by prefixes.
+  if (!hasObjectStoreKeys(fs) && !fs.exists(path)) {
+    return std::nullopt;
+  }
+  try {
+    return fs.fileInfo(path);
+  } catch (const BoltException& e) {
+    if (e.errorCode() == error_code::kFileNotFound) {
+      return std::nullopt;
+    }
+    throw;
+  }
+}
+
+std::vector<std::string> listDirectChildren(
+    filesystems::FileSystem& fs,
+    const std::string& directory) {
+  if (!hasObjectStoreKeys(fs)) {
+    auto entries = fs.list(directory);
+    for (auto& entry : entries) {
+      entry = joinDirAndBasename(directory, entry);
+    }
+    return entries;
+  }
+
+  std::string prefix = directory;
+  if (prefix.back() != '/') {
+    prefix += '/';
+  }
+  const auto keyStart = prefix.find('/', prefix.find("://") + 3) + 1;
+  const auto keyPrefix = prefix.substr(keyStart);
+  std::set<std::string> children;
+  // S3 returns prefix-matching keys; GCS currently returns bucket-wide keys.
+  // Filter on a directory boundary and collapse descendants to direct children.
+  for (const auto& key : fs.list(prefix)) {
+    if (key.compare(0, keyPrefix.size(), keyPrefix) != 0) {
+      continue;
+    }
+    const auto relative = key.substr(keyPrefix.size());
+    const auto child = relative.substr(0, relative.find('/'));
+    if (!child.empty()) {
+      children.emplace(prefix + child);
+    }
+  }
+  return {children.begin(), children.end()};
 }
 
 class PaimonBoltInputStream final : public ::paimon::InputStream {
@@ -427,18 +483,18 @@ PaimonBoltFileSystem::GetFileStatus(const std::string& path) const {
   try {
     auto fs = bytedance::bolt::filesystems::getFileSystem(
         directory, connectorProperties_);
-    if (!fs->exists(directory)) {
+    const auto info = findFileInfo(*fs, directory);
+    if (!info) {
       return ::paimon::Status::OK();
     }
-    if (!fs->fileInfo(directory).isDirectory) {
+    if (!info->isDirectory) {
       return ::paimon::Status::IOError(
           "ListDir target is not a directory: " + directory);
     }
 
-    auto entries = fs->list(directory);
+    auto entries = listDirectChildren(*fs, directory);
     file_status_list->reserve(file_status_list->size() + entries.size());
-    for (const auto& entry : entries) {
-      const std::string full = joinDirAndBasename(directory, entry);
+    for (const auto& full : entries) {
       const bool isDir = fs->fileInfo(full).isDirectory;
       file_status_list->emplace_back(
           std::make_unique<PaimonBoltBasicFileStatus>(full, isDir));
@@ -457,20 +513,19 @@ PaimonBoltFileSystem::GetFileStatus(const std::string& path) const {
   try {
     auto fs =
         bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
-    if (!fs->exists(path)) {
+    const auto info = findFileInfo(*fs, path);
+    if (!info) {
       return ::paimon::Status::OK();
     }
-    const auto info = fs->fileInfo(path);
-    if (!info.isDirectory) {
+    if (!info->isDirectory) {
       file_status_list->emplace_back(std::make_unique<PaimonBoltFileStatus>(
-          path, info.isDirectory, info.size, info.modificationTimeMs));
+          path, info->isDirectory, info->size, info->modificationTimeMs));
       return ::paimon::Status::OK();
     }
 
-    auto entries = fs->list(path);
+    auto entries = listDirectChildren(*fs, path);
     file_status_list->reserve(file_status_list->size() + entries.size());
-    for (const auto& entry : entries) {
-      const std::string full = joinDirAndBasename(path, entry);
+    for (const auto& full : entries) {
       const auto entryInfo = fs->fileInfo(full);
       file_status_list->emplace_back(std::make_unique<PaimonBoltFileStatus>(
           full,
@@ -490,7 +545,8 @@ PaimonBoltFileSystem::GetFileStatus(const std::string& path) const {
   try {
     auto fs =
         bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
-    return fs->exists(path);
+    return hasObjectStoreKeys(*fs) ? findFileInfo(*fs, path).has_value()
+                                   : fs->exists(path);
   } catch (const std::exception& e) {
     return ::paimon::Status::IOError(
         "Exists failed for " + path + ": " + e.what());

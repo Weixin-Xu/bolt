@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <map>
 #include <memory>
 #include <string>
 
@@ -101,6 +102,35 @@ class FakeFileSystem : public filesystems::FileSystem {
   int* renameCalls_;
 };
 
+// Model the S3 backend's exact-object existence check and bucket-relative keys.
+class PrefixFileSystem final : public FakeFileSystem {
+ public:
+  using FakeFileSystem::FakeFileSystem;
+
+  bool exists(std::string_view path) override {
+    return path == "prefix-test://bucket/dir/file";
+  }
+
+  filesystems::FileInfo fileInfo(std::string_view path) override {
+    if (path == "prefix-test://bucket/denied") {
+      BOLT_FAIL("Access denied");
+    }
+    if (path == "prefix-test://bucket/dir" ||
+        path == "prefix-test://bucket/dir/" ||
+        path == "prefix-test://bucket/dir/sub") {
+      return {.isDirectory = true};
+    }
+    if (exists(path)) {
+      return {.size = 4};
+    }
+    BOLT_FILE_NOT_FOUND_ERROR("Missing path: {}", path);
+  }
+
+  std::vector<std::string> list(std::string_view) override {
+    return {"dir/", "dir/file", "dir/sub/a", "dir/sub/b", "dir-other/file"};
+  }
+};
+
 class NonListingFileSystem final : public FakeFileSystem {
  public:
   using FakeFileSystem::FakeFileSystem;
@@ -129,6 +159,15 @@ class PaimonFileSystemTest : public testing::Test {
   static void SetUpTestSuite() {
     filesystems::registerLocalFileSystem();
     EnsurePaimonBoltFileSystemRegistered();
+
+    filesystems::registerFileSystem(
+        [](std::string_view path) {
+          return path.rfind("prefix-test://", 0) == 0;
+        },
+        [](std::shared_ptr<const config::ConfigBase> config, std::string_view) {
+          return std::make_shared<PrefixFileSystem>(
+              std::move(config), "S3", &firstRenameCalls_);
+        });
 
     filesystems::registerFileSystem(
         [](std::string_view path) { return path.rfind("first://", 0) == 0; },
@@ -193,6 +232,39 @@ TEST_F(PaimonFileSystemTest, FileStatusUsesGenericFileInfo) {
   ASSERT_TRUE(result.value()->ListFileStatus("first://file", &statuses).ok());
   ASSERT_EQ(statuses.size(), 1);
   EXPECT_EQ(statuses.front()->GetModificationTime(), 1'234'000);
+}
+
+TEST_F(PaimonFileSystemTest, PrefixDirectoryListingAndExistence) {
+  PaimonBoltFileSystem fs({});
+  for (const auto* path :
+       {"prefix-test://bucket/dir", "prefix-test://bucket/dir/"}) {
+    EXPECT_TRUE(fs.Exists(path).value());
+    std::vector<std::unique_ptr<::paimon::BasicFileStatus>> basic;
+    ASSERT_TRUE(fs.ListDir(path, &basic).ok());
+    ASSERT_EQ(basic.size(), 2);
+    std::map<std::string, bool> actual;
+    for (const auto& entry : basic) {
+      actual.emplace(entry->GetPath(), entry->IsDir());
+    }
+    const std::map<std::string, bool> expected{
+        {"prefix-test://bucket/dir/file", false},
+        {"prefix-test://bucket/dir/sub", true}};
+    EXPECT_EQ(actual, expected);
+    std::vector<std::unique_ptr<::paimon::FileStatus>> full;
+    ASSERT_TRUE(fs.ListFileStatus(path, &full).ok());
+    ASSERT_EQ(full.size(), 2);
+    actual.clear();
+    for (const auto& entry : full) {
+      actual.emplace(entry->GetPath(), entry->IsDir());
+    }
+    EXPECT_EQ(actual, expected);
+  }
+  EXPECT_FALSE(fs.Exists("prefix-test://bucket/missing").value());
+  EXPECT_FALSE(fs.Exists("prefix-test://bucket/denied").ok());
+  std::vector<std::unique_ptr<::paimon::BasicFileStatus>> basic;
+  EXPECT_FALSE(fs.ListDir("prefix-test://bucket/denied", &basic).ok());
+  EXPECT_TRUE(fs.ListDir("prefix-test://bucket/missing", &basic).ok());
+  EXPECT_TRUE(basic.empty());
 }
 
 TEST_F(PaimonFileSystemTest, ConnectorOptionsReachRegisteredFileSystem) {
@@ -332,6 +404,80 @@ TEST_F(PaimonFileSystemTest, NonRecursiveDeleteDoesNotRequireListing) {
 }
 
 #ifdef BOLT_ENABLE_GCS
+TEST_F(PaimonFileSystemTest, GcsCreateAndOverwrite) {
+  filesystems::GcsEmulator emulator;
+  emulator.bootstrap();
+  filesystems::registerGcsFileSystem();
+  const auto config = emulator.hiveConfig()->rawConfigsCopy();
+  PaimonBoltFileSystem fs({config.begin(), config.end()});
+  const auto path = gcsURI(emulator.preexistingBucketName(), "new/data");
+  auto backend = filesystems::getFileSystem(path, emulator.hiveConfig());
+  EXPECT_TRUE(backend->exists(gcsURI(emulator.preexistingBucketName())));
+  EXPECT_TRUE(backend->exists(gcsURI(emulator.preexistingBucketName(), "")));
+  EXPECT_FALSE(backend->exists("gs://missing-bucket"));
+  EXPECT_FALSE(backend->exists("gs://missing-bucket/data"));
+  EXPECT_FALSE(backend->exists(path));
+  auto output = fs.Create(path, false);
+  ASSERT_TRUE(output.ok()) << output.status().ToString();
+  ASSERT_TRUE(output.value()->Write("original", 8).ok());
+  ASSERT_TRUE(output.value()->Close().ok());
+  EXPECT_TRUE(backend->exists(path));
+  EXPECT_TRUE(fs.Create(path, false).status().IsInvalid());
+  EXPECT_EQ(backend->openFileForRead(path)->pread(0, 8), "original");
+  output = fs.Create(path, true);
+  ASSERT_TRUE(output.ok()) << output.status().ToString();
+  ASSERT_TRUE(output.value()->Write("new", 3).ok());
+  ASSERT_TRUE(output.value()->Close().ok());
+  EXPECT_EQ(backend->openFileForRead(path)->pread(0, 3), "new");
+}
+
+TEST_F(PaimonFileSystemTest, GcsListingReturnsDirectChildren) {
+  filesystems::GcsEmulator emulator;
+  emulator.bootstrap();
+  filesystems::registerGcsFileSystem();
+  const auto config = emulator.hiveConfig()->rawConfigsCopy();
+  PaimonBoltFileSystem fs({config.begin(), config.end()});
+  const auto root = gcsURI(emulator.preexistingBucketName(), "");
+  auto backend = filesystems::getFileSystem(root, emulator.hiveConfig());
+  for (const auto* key :
+       {"dir/file", "dir/sub/a", "dir/sub/b", "dir-other/file"}) {
+    auto output = backend->openFileForWrite(root + key);
+    output->append("bolt");
+    output->close();
+  }
+  backend->mkdir(root + "dir/empty/");
+  const std::map<std::string, bool> expected{
+      {root + "dir/file", false},
+      {root + "dir/sub", true},
+      {root + "dir/empty", true}};
+  for (const auto* suffix : {"dir", "dir/"}) {
+    std::vector<std::unique_ptr<::paimon::BasicFileStatus>> basic;
+    auto status = fs.ListDir(root + suffix, &basic);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    std::map<std::string, bool> actual;
+    for (const auto& entry : basic) {
+      actual.emplace(entry->GetPath(), entry->IsDir());
+    }
+    EXPECT_EQ(basic.size(), expected.size());
+    EXPECT_EQ(actual, expected);
+    std::vector<std::unique_ptr<::paimon::FileStatus>> full;
+    status = fs.ListFileStatus(root + suffix, &full);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    actual.clear();
+    for (const auto& entry : full) {
+      actual.emplace(entry->GetPath(), entry->IsDir());
+      EXPECT_EQ(entry->GetLen(), entry->IsDir() ? 0 : 4);
+    }
+    EXPECT_EQ(full.size(), expected.size());
+    EXPECT_EQ(actual, expected);
+  }
+  std::vector<std::unique_ptr<::paimon::BasicFileStatus>> missing;
+  EXPECT_TRUE(fs.ListDir(root + "missing", &missing).ok());
+  EXPECT_TRUE(missing.empty());
+  EXPECT_FALSE(fs.Exists(root + "missing").value());
+  EXPECT_TRUE(fs.Exists(root + "dir").value());
+}
+
 void checkGcsDirectoryDeletionIsRejected(bool recursive) {
   filesystems::GcsEmulator emulator;
   emulator.bootstrap();

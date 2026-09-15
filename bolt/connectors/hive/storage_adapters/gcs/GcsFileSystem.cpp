@@ -223,20 +223,20 @@ void GcsFileSystem::remove(std::string_view path) {
 }
 
 bool GcsFileSystem::exists(std::string_view path) {
-  std::vector<std::string> result;
-  if (!isGcsFile(path))
-    BOLT_FAIL(kGcsInvalidPath, path);
-
-  // We assume 'path' is well-formed here.
+  BOLT_CHECK(isGcsFile(path), kGcsInvalidPath, path);
   const auto file = gcsPath(path);
-  std::string bucket;
-  std::string object;
-  setBucketAndKeyFromGcsPath(file, bucket, object);
-  using ::google::cloud::StatusOr;
-  StatusOr<gcs::BucketMetadata> metadata =
-      impl_->getClient()->GetBucketMetadata(bucket);
-
-  return metadata.ok();
+  const auto separator = file.find('/');
+  const auto bucket = file.substr(0, separator);
+  const auto object =
+      separator == std::string::npos ? "" : file.substr(separator + 1);
+  const auto status = object.empty()
+      ? impl_->getClient()->GetBucketMetadata(bucket).status()
+      : impl_->getClient()->GetObjectMetadata(bucket, object).status();
+  if (status.code() == gc::StatusCode::kNotFound) {
+    return false;
+  }
+  checkGcsStatus(status, "Failed to check GCS path existence", bucket, object);
+  return true;
 }
 
 FileInfo GcsFileSystem::fileInfo(std::string_view path) {
