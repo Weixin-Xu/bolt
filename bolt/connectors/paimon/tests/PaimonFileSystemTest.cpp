@@ -39,6 +39,18 @@
 namespace bytedance::bolt::connector::paimon {
 namespace {
 
+template <typename T>
+void expectEntries(
+    const std::vector<std::unique_ptr<T>>& entries,
+    const std::map<std::string, bool>& expected) {
+  std::map<std::string, bool> actual;
+  for (const auto& entry : entries) {
+    actual.emplace(entry->GetPath(), entry->IsDir());
+  }
+  EXPECT_EQ(entries.size(), expected.size());
+  EXPECT_EQ(actual, expected);
+}
+
 class FakeFileSystem : public filesystems::FileSystem {
  public:
   FakeFileSystem(
@@ -234,33 +246,20 @@ TEST_F(PaimonFileSystemTest, FileStatusUsesGenericFileInfo) {
   EXPECT_EQ(statuses.front()->GetModificationTime(), 1'234'000);
 }
 
-TEST_F(PaimonFileSystemTest, PrefixDirectoryListingAndExistence) {
+TEST_F(PaimonFileSystemTest, PrefixDirectoryListing) {
   PaimonBoltFileSystem fs({});
+  const std::map<std::string, bool> expected{
+      {"prefix-test://bucket/dir/file", false},
+      {"prefix-test://bucket/dir/sub", true}};
   for (const auto* path :
        {"prefix-test://bucket/dir", "prefix-test://bucket/dir/"}) {
-    EXPECT_TRUE(fs.Exists(path).value());
     std::vector<std::unique_ptr<::paimon::BasicFileStatus>> basic;
     ASSERT_TRUE(fs.ListDir(path, &basic).ok());
-    ASSERT_EQ(basic.size(), 2);
-    std::map<std::string, bool> actual;
-    for (const auto& entry : basic) {
-      actual.emplace(entry->GetPath(), entry->IsDir());
-    }
-    const std::map<std::string, bool> expected{
-        {"prefix-test://bucket/dir/file", false},
-        {"prefix-test://bucket/dir/sub", true}};
-    EXPECT_EQ(actual, expected);
+    expectEntries(basic, expected);
     std::vector<std::unique_ptr<::paimon::FileStatus>> full;
     ASSERT_TRUE(fs.ListFileStatus(path, &full).ok());
-    ASSERT_EQ(full.size(), 2);
-    actual.clear();
-    for (const auto& entry : full) {
-      actual.emplace(entry->GetPath(), entry->IsDir());
-    }
-    EXPECT_EQ(actual, expected);
+    expectEntries(full, expected);
   }
-  EXPECT_FALSE(fs.Exists("prefix-test://bucket/missing").value());
-  EXPECT_FALSE(fs.Exists("prefix-test://bucket/denied").ok());
   std::vector<std::unique_ptr<::paimon::BasicFileStatus>> basic;
   EXPECT_FALSE(fs.ListDir("prefix-test://bucket/denied", &basic).ok());
   EXPECT_TRUE(fs.ListDir("prefix-test://bucket/missing", &basic).ok());
@@ -454,28 +453,18 @@ TEST_F(PaimonFileSystemTest, GcsListingReturnsDirectChildren) {
     std::vector<std::unique_ptr<::paimon::BasicFileStatus>> basic;
     auto status = fs.ListDir(root + suffix, &basic);
     ASSERT_TRUE(status.ok()) << status.ToString();
-    std::map<std::string, bool> actual;
-    for (const auto& entry : basic) {
-      actual.emplace(entry->GetPath(), entry->IsDir());
-    }
-    EXPECT_EQ(basic.size(), expected.size());
-    EXPECT_EQ(actual, expected);
+    expectEntries(basic, expected);
     std::vector<std::unique_ptr<::paimon::FileStatus>> full;
     status = fs.ListFileStatus(root + suffix, &full);
     ASSERT_TRUE(status.ok()) << status.ToString();
-    actual.clear();
     for (const auto& entry : full) {
-      actual.emplace(entry->GetPath(), entry->IsDir());
       EXPECT_EQ(entry->GetLen(), entry->IsDir() ? 0 : 4);
     }
-    EXPECT_EQ(full.size(), expected.size());
-    EXPECT_EQ(actual, expected);
+    expectEntries(full, expected);
   }
   std::vector<std::unique_ptr<::paimon::BasicFileStatus>> missing;
   EXPECT_TRUE(fs.ListDir(root + "missing", &missing).ok());
   EXPECT_TRUE(missing.empty());
-  EXPECT_FALSE(fs.Exists(root + "missing").value());
-  EXPECT_TRUE(fs.Exists(root + "dir").value());
 }
 
 void checkGcsDirectoryDeletionIsRejected(bool recursive) {

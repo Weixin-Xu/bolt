@@ -545,8 +545,7 @@ PaimonBoltFileSystem::GetFileStatus(const std::string& path) const {
   try {
     auto fs =
         bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
-    return hasObjectStoreKeys(*fs) ? findFileInfo(*fs, path).has_value()
-                                   : fs->exists(path);
+    return fs->exists(path);
   } catch (const std::exception& e) {
     return ::paimon::Status::IOError(
         "Exists failed for " + path + ": " + e.what());

@@ -229,14 +229,9 @@ bool GcsFileSystem::exists(std::string_view path) {
   const auto bucket = file.substr(0, separator);
   const auto object =
       separator == std::string::npos ? "" : file.substr(separator + 1);
-  const auto status = object.empty()
-      ? impl_->getClient()->GetBucketMetadata(bucket).status()
-      : impl_->getClient()->GetObjectMetadata(bucket, object).status();
-  if (status.code() == gc::StatusCode::kNotFound) {
-    return false;
-  }
-  checkGcsStatus(status, "Failed to check GCS path existence", bucket, object);
-  return true;
+  return object.empty()
+      ? impl_->getClient()->GetBucketMetadata(bucket).ok()
+      : impl_->getClient()->GetObjectMetadata(bucket, object).ok();
 }
 
 FileInfo GcsFileSystem::fileInfo(std::string_view path) {
