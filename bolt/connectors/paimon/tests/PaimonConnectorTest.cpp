@@ -20,6 +20,7 @@
 #include <folly/json.h>
 #include <gtest/gtest.h>
 #include <paimon/defs.h>
+#include <paimon/format/file_format_factory.h>
 #include <paimon/scan_context.h>
 #include <paimon/table/source/data_split.h>
 #include <paimon/table/source/plan.h>
@@ -46,6 +47,10 @@
 #include "bolt/type/TimestampConversion.h"
 #include "bolt/type/Type.h"
 #include "bolt/vector/tests/utils/VectorMaker.h"
+
+#ifdef BOLT_ENABLE_ORC
+#include "bolt/connectors/paimon/PaimonOrcReader.h"
+#endif
 
 namespace bytedance::bolt::connector::paimon {
 
@@ -1079,6 +1084,212 @@ static size_t countFilesWithExtension(
   return count;
 }
 
+#ifdef BOLT_ENABLE_ORC
+static std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
+serializedEvolutionColumnHandles() {
+  return {
+      {"id", std::make_shared<PaimonColumnHandle>("id", BIGINT())},
+      {"score", std::make_shared<PaimonColumnHandle>("score", BIGINT())},
+      {"label", std::make_shared<PaimonColumnHandle>("label", VARCHAR())},
+      {"rank", std::make_shared<PaimonColumnHandle>("rank", INTEGER())},
+  };
+}
+
+TEST_F(PaimonConnectorTest, SerializedOrcAppendTableQueries) {
+  auto format = ::paimon::FileFormatFactory::Get("orc", {});
+  ASSERT_TRUE(format.ok()) << format.status().ToString();
+  EXPECT_NE(dynamic_cast<PaimonOrcReader*>(format.value().get()), nullptr);
+
+  auto rootPool = memory::memoryManager()->addRootPool("SerializedOrcScan");
+  auto leafPool = rootPool->addLeafChild("leaf");
+  auto paimonPool = std::make_shared<BoltPaimonMemoryPool>(leafPool.get());
+  bytedance::bolt::test::VectorMaker mk(leafPool.get());
+
+  const std::string tablePath =
+      "file:" + tempDir_->path + "/test_db.db/serialized_append_orc";
+  EXPECT_EQ(
+      countFilesWithExtension(
+          tempDir_->path + "/test_db.db/serialized_append_orc", ".orc"),
+      2);
+  const auto connectorSplits = makePaimonSplits(
+      tablePath,
+      paimonPool,
+      {{::paimon::Options::SOURCE_SPLIT_TARGET_SIZE, "1B"}});
+  ASSERT_GE(connectorSplits.size(), 2);
+
+  auto tableHandle = std::make_shared<PaimonTableHandle>(
+      "paimon_test",
+      "serialized_append_orc",
+      tablePath,
+      std::unordered_map<std::string, std::string>{});
+  const auto columnHandles = serializedAppendColumnHandles();
+  const auto fullType =
+      ROW({"id", "score", "label"}, {BIGINT(), BIGINT(), VARCHAR()});
+  auto fullPlan = exec::test::PlanBuilder()
+                      .tableScan(fullType, tableHandle, columnHandles)
+                      .planNode();
+  auto fullExpected = mk.rowVector(
+      {mk.flatVector<int64_t>({1, 2, 3, 4, 5, 6}),
+       mk.flatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+       mk.flatVector<std::string>(
+           {"alpha", "beta", "gamma", "delta", "epsilon", "zeta"})});
+  exec::test::AssertQueryBuilder(fullPlan)
+      .splits(connectorSplits)
+      .assertResults(fullExpected);
+
+  const auto labelType = ROW({"label"}, {VARCHAR()});
+  auto projectionPlan = exec::test::PlanBuilder()
+                            .tableScan(labelType, tableHandle, columnHandles)
+                            .planNode();
+  auto projectionExpected = mk.rowVector({mk.flatVector<std::string>(
+      {"alpha", "beta", "gamma", "delta", "epsilon", "zeta"})});
+  exec::test::AssertQueryBuilder(projectionPlan)
+      .splits(connectorSplits)
+      .assertResults(projectionExpected);
+
+  auto filteredHandle = std::make_shared<PaimonTableHandle>(
+      "paimon_test",
+      "serialized_append_orc",
+      tablePath,
+      std::unordered_map<std::string, std::string>{},
+      parseExpr("id >= 5", fullType));
+  const auto filteredType = ROW({"id", "label"}, {BIGINT(), VARCHAR()});
+  auto filteredPlan =
+      exec::test::PlanBuilder()
+          .tableScan(filteredType, filteredHandle, columnHandles)
+          .planNode();
+  auto filteredExpected = mk.rowVector(
+      {mk.flatVector<int64_t>({5, 6}),
+       mk.flatVector<std::string>({"epsilon", "zeta"})});
+  exec::test::AssertQueryBuilder(filteredPlan)
+      .splits(connectorSplits)
+      .assertResults(filteredExpected);
+
+  auto emptyHandle = std::make_shared<PaimonTableHandle>(
+      "paimon_test",
+      "serialized_append_orc",
+      tablePath,
+      std::unordered_map<std::string, std::string>{},
+      parseExpr("id > 100", fullType));
+  auto emptyPlan = exec::test::PlanBuilder()
+                       .tableScan(labelType, emptyHandle, columnHandles)
+                       .planNode();
+  exec::test::AssertQueryBuilder(emptyPlan)
+      .splits(connectorSplits)
+      .assertEmptyResults();
+
+  auto countPlan = exec::test::PlanBuilder()
+                       .tableScan(
+                           ROW({}, {}),
+                           tableHandle,
+                           std::unordered_map<
+                               std::string,
+                               std::shared_ptr<connector::ColumnHandle>>{})
+                       .singleAggregation({}, {"count(1)"})
+                       .planNode();
+  auto countExpected = mk.rowVector({mk.flatVector<int64_t>({6})});
+  exec::test::AssertQueryBuilder(countPlan)
+      .splits(connectorSplits)
+      .assertResults(countExpected);
+
+  auto filteredCountHandle = std::make_shared<PaimonTableHandle>(
+      "paimon_test",
+      "serialized_append_orc",
+      tablePath,
+      std::unordered_map<std::string, std::string>{},
+      parseExpr("id >= 5", fullType));
+  auto filteredCountPlan =
+      exec::test::PlanBuilder()
+          .tableScan(ROW({}, {}), filteredCountHandle, columnHandles)
+          .singleAggregation({}, {"count(1)"})
+          .planNode();
+  auto filteredCountExpected = mk.rowVector({mk.flatVector<int64_t>({2})});
+  exec::test::AssertQueryBuilder(filteredCountPlan)
+      .splits(connectorSplits)
+      .assertResults(filteredCountExpected);
+}
+
+TEST_F(PaimonConnectorTest, SerializedOrcPrimaryKeyUpdatesRemoveOldVersions) {
+  auto rootPool =
+      memory::memoryManager()->addRootPool("SerializedOrcPrimaryKeyScan");
+  auto leafPool = rootPool->addLeafChild("leaf");
+  auto paimonPool = std::make_shared<BoltPaimonMemoryPool>(leafPool.get());
+  bytedance::bolt::test::VectorMaker mk(leafPool.get());
+
+  const std::string tablePath =
+      "file:" + tempDir_->path + "/test_db.db/serialized_pk_orc";
+  EXPECT_EQ(
+      countFilesWithExtension(
+          tempDir_->path + "/test_db.db/serialized_pk_orc", ".orc"),
+      3);
+  const auto connectorSplits = makePaimonSplits(tablePath, paimonPool);
+  ASSERT_FALSE(connectorSplits.empty());
+
+  const auto rowType =
+      ROW({"id", "score", "label"}, {BIGINT(), BIGINT(), VARCHAR()});
+  auto tableHandle = std::make_shared<PaimonTableHandle>(
+      "paimon_test",
+      "serialized_pk_orc",
+      tablePath,
+      std::unordered_map<std::string, std::string>{});
+  auto plan =
+      exec::test::PlanBuilder()
+          .tableScan(rowType, tableHandle, serializedAppendColumnHandles())
+          .orderBy({"id"}, false)
+          .planNode();
+  auto expected = mk.rowVector(
+      {mk.flatVector<int64_t>({1, 2, 3, 4, 5, 6}),
+       mk.flatVector<int64_t>({10, 200, 30, 400, 50, 60}),
+       mk.flatVector<std::string>(
+           {"one", "two-updated", "three", "four-updated", "five", "six"})});
+  exec::test::AssertQueryBuilder(plan)
+      .splits(connectorSplits)
+      .assertResults(expected);
+}
+
+TEST_F(
+    PaimonConnectorTest,
+    SerializedOrcSchemaEvolutionMapsAddedAndReorderedFields) {
+  auto rootPool =
+      memory::memoryManager()->addRootPool("SerializedOrcSchemaEvolution");
+  auto leafPool = rootPool->addLeafChild("leaf");
+  auto paimonPool = std::make_shared<BoltPaimonMemoryPool>(leafPool.get());
+  bytedance::bolt::test::VectorMaker mk(leafPool.get());
+
+  const std::string tablePath =
+      "file:" + tempDir_->path + "/test_db.db/serialized_evolution_orc";
+  EXPECT_EQ(
+      countFilesWithExtension(
+          tempDir_->path + "/test_db.db/serialized_evolution_orc", ".orc"),
+      2);
+  const auto connectorSplits = makePaimonSplits(tablePath, paimonPool);
+  ASSERT_FALSE(connectorSplits.empty());
+
+  const auto rowType =
+      ROW({"score", "rank", "id", "label"},
+          {BIGINT(), INTEGER(), BIGINT(), VARCHAR()});
+  auto tableHandle = std::make_shared<PaimonTableHandle>(
+      "paimon_test",
+      "serialized_evolution_orc",
+      tablePath,
+      std::unordered_map<std::string, std::string>{});
+  auto plan =
+      exec::test::PlanBuilder()
+          .tableScan(rowType, tableHandle, serializedEvolutionColumnHandles())
+          .orderBy({"id"}, false)
+          .planNode();
+  auto expected = mk.rowVector(
+      {mk.flatVector<int64_t>({10, 20, 30, 40}),
+       makeNullableFlatVector<int32_t>({std::nullopt, std::nullopt, 1, 2}),
+       mk.flatVector<int64_t>({1, 2, 3, 4}),
+       mk.flatVector<std::string>({"alpha", "beta", "gamma", "delta"})});
+  exec::test::AssertQueryBuilder(plan)
+      .splits(connectorSplits)
+      .assertResults(expected);
+}
+
+#endif
+
 TEST_F(
     PaimonConnectorTest,
     SerializedDeletionVectorsPreservePhysicalPositionsWithPredicateAndRowTracking) {
@@ -1090,6 +1301,9 @@ TEST_F(
 
   const std::vector<std::string> formats{
       "parquet",
+#ifdef BOLT_ENABLE_ORC
+      "orc",
+#endif
   };
   for (const auto& format : formats) {
     SCOPED_TRACE(format);
@@ -1278,6 +1492,9 @@ TEST_F(
   const auto columnHandles = serializedAppendColumnHandles();
   const std::vector<std::string> formats{
       "parquet",
+#ifdef BOLT_ENABLE_ORC
+      "orc",
+#endif
   };
   for (const auto& format : formats) {
     SCOPED_TRACE(format);

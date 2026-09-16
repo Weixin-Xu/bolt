@@ -38,7 +38,7 @@ This is a package/linkage smoke test. A Bolt integration requires reader,
 read-context and signed 64-bit filesystem API adaptations. Compact Parquet
 predicate/bitmap results need a physical row ID for every returned row.
 Arrow exports must flatten constant and dictionary vectors when Paimon's row
-merge expects primitive buffers. Consumers providing their own ORC reader do not need to enable Paimon's
-`with_orc` option.
+merge expects primitive buffers. Bolt supplies its own ORC reader, so Paimon's
+`with_orc` option is not required for that read path.
 
 The recipe includes neither the internal chain-split nor range-partition patch.

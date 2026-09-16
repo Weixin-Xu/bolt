@@ -21,6 +21,8 @@ from pypaimon.deletionvectors.bitmap_deletion_vector import BitmapDeletionVector
 from typing import Any
 import pyarrow as pa
 from pypaimon import Schema
+from pypaimon.schema.data_types import AtomicType
+from pypaimon.schema.schema_change import Move, SchemaChange
 from pathlib import Path
 import pandas as pd
 from argparse import ArgumentParser
@@ -164,6 +166,118 @@ def serialized_append_table(catalog, table_name: str, file_format: str):
                 "id": [4, 5, 6],
                 "score": [40, 50, 60],
                 "label": ["delta", "epsilon", "zeta"],
+            }
+        ),
+    )
+
+
+def serialized_primary_key_orc_table(catalog):
+    pa_schema = pa.schema(
+        [
+            ("id", pa.int64()),
+            ("score", pa.int64()),
+            ("label", pa.string()),
+        ]
+    )
+    schema = Schema.from_pyarrow_schema(
+        pa_schema=pa_schema,
+        partition_keys=[],
+        primary_keys=["id"],
+        options={"bucket": "1", "file.format": "orc"},
+        comment="serialized ORC primary-key table",
+    )
+    (table_created, table) = create_table(
+        catalog=catalog,
+        database="test_db",
+        table_name="serialized_pk_orc",
+        schema=schema,
+    )
+    if not table_created:
+        return
+
+    write_to_table(
+        table,
+        pd.DataFrame(
+            {
+                "id": [1, 2, 3, 4, 5],
+                "score": [10, 20, 30, 40, 50],
+                "label": ["one", "two", "three", "four", "five"],
+            }
+        ),
+    )
+    write_to_table(
+        table,
+        pd.DataFrame(
+            {
+                "id": [2, 4],
+                "score": [200, 400],
+                "label": ["two-updated", "four-updated"],
+            }
+        ),
+    )
+    write_to_table(
+        table,
+        pd.DataFrame(
+            {
+                "id": [6],
+                "score": [60],
+                "label": ["six"],
+            }
+        ),
+    )
+
+
+def serialized_evolution_orc_table(catalog):
+    pa_schema = pa.schema(
+        [
+            ("id", pa.int64()),
+            ("score", pa.int64()),
+            ("label", pa.string()),
+        ]
+    )
+    schema = Schema.from_pyarrow_schema(
+        pa_schema=pa_schema,
+        partition_keys=[],
+        primary_keys=[],
+        options={"bucket": "-1", "file.format": "orc"},
+        comment="serialized ORC schema-evolution table",
+    )
+    (table_created, table) = create_table(
+        catalog=catalog,
+        database="test_db",
+        table_name="serialized_evolution_orc",
+        schema=schema,
+    )
+    if not table_created:
+        return
+
+    write_to_table(
+        table,
+        pd.DataFrame(
+            {
+                "id": [1, 2],
+                "score": [10, 20],
+                "label": ["alpha", "beta"],
+            }
+        ),
+    )
+    catalog.alter_table(
+        "test_db.serialized_evolution_orc",
+        [
+            SchemaChange.add_column("rank", AtomicType("INT")),
+            SchemaChange.update_column_position(Move.first("rank")),
+            SchemaChange.update_column_position(Move.after("label", "rank")),
+        ],
+    )
+    table = catalog.get_table("test_db.serialized_evolution_orc")
+    write_to_table(
+        table,
+        pd.DataFrame(
+            {
+                "rank": [1, 2],
+                "label": ["gamma", "delta"],
+                "id": [3, 4],
+                "score": [30, 40],
             }
         ),
     )
@@ -565,9 +679,17 @@ def main():
         lambda catalog: serialized_append_table(
             catalog, "serialized_append_parquet", "parquet"
         ),
+        lambda catalog: serialized_append_table(
+            catalog, "serialized_append_orc", "orc"
+        ),
+        lambda catalog: serialized_deletion_vector_table(
+            catalog, "serialized_dv_orc", "orc"
+        ),
         lambda catalog: serialized_deletion_vector_table(
             catalog, "serialized_dv_parquet", "parquet"
         ),
+        serialized_primary_key_orc_table,
+        serialized_evolution_orc_table,
         pk_no_overwrite,
         pk_with_overwrite,
         data_evolution_table,
