@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
-#include "bolt/connectors/paimon/PaimonBoltHdfsFileSystem.h"
+#include "bolt/connectors/paimon/PaimonBoltFileSystem.h"
 
 #include <algorithm>
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -28,8 +30,6 @@
 #include "bolt/common/config/Config.h"
 #include "bolt/common/file/File.h"
 #include "bolt/common/file/FileSystems.h"
-#include "bolt/connectors/hive/storage_adapters/hdfs/HdfsFileSystem.h"
-#include "bolt/connectors/hive/storage_adapters/hdfs/RegisterHdfsFileSystem.h"
 
 #include "paimon/factories/factory_creator.h"
 #include "paimon/result.h"
@@ -40,7 +40,7 @@ namespace bytedance::bolt::connector::paimon {
 namespace {
 
 constexpr std::string_view kHdfsScheme{"hdfs://"};
-constexpr std::string_view kIdentifier{"bolt_hdfs"};
+constexpr std::string_view kIdentifier{"bolt"};
 
 std::string uriAuthorityPrefix(const std::string& uri) {
   if (uri.rfind(std::string(kHdfsScheme), 0) != 0) {
@@ -68,9 +68,63 @@ std::string joinDirAndBasename(
   return dir + "/" + basename;
 }
 
-class PaimonBoltHdfsInputStream final : public ::paimon::InputStream {
+bool hasObjectStoreKeys(const filesystems::FileSystem& fs) {
+  return fs.name() == "S3" || fs.name() == "GCS";
+}
+
+std::optional<filesystems::FileInfo> findFileInfo(
+    filesystems::FileSystem& fs,
+    const std::string& path) {
+  // Object existence does not account for directories represented by prefixes.
+  if (!hasObjectStoreKeys(fs) && !fs.exists(path)) {
+    return std::nullopt;
+  }
+  try {
+    return fs.fileInfo(path);
+  } catch (const BoltException& e) {
+    if (e.errorCode() == error_code::kFileNotFound) {
+      return std::nullopt;
+    }
+    throw;
+  }
+}
+
+std::vector<std::string> listDirectChildren(
+    filesystems::FileSystem& fs,
+    const std::string& directory) {
+  if (!hasObjectStoreKeys(fs)) {
+    auto entries = fs.list(directory);
+    for (auto& entry : entries) {
+      entry = joinDirAndBasename(directory, entry);
+    }
+    return entries;
+  }
+
+  std::string prefix = directory;
+  if (prefix.back() != '/') {
+    prefix += '/';
+  }
+  const auto keyStart = prefix.find('/', prefix.find("://") + 3) + 1;
+  const auto keyPrefix = prefix.substr(keyStart);
+  std::set<std::string> children;
+  // S3 returns prefix-matching keys; GCS currently returns bucket-wide keys.
+  // Filter on a directory boundary and collapse descendants to direct children.
+  for (const auto& key : fs.list(prefix)) {
+    if (key.compare(0, keyPrefix.size(), keyPrefix) != 0) {
+      continue;
+    }
+    const auto relative = key.substr(keyPrefix.size());
+    const auto child = relative.substr(0, relative.find('/'));
+    if (!child.empty()) {
+      children.emplace(prefix + child);
+    }
+  }
+  return {children.begin(), children.end()};
+}
+
+class PaimonBoltInputStream final : public ::paimon::InputStream {
  public:
-  PaimonBoltHdfsInputStream(
+  PaimonBoltInputStream(
       std::shared_ptr<bytedance::bolt::ReadFile> file,
       std::string uri)
       : file_(std::move(file)), uri_(std::move(uri)) {}
@@ -156,9 +210,9 @@ class PaimonBoltHdfsInputStream final : public ::paimon::InputStream {
   std::atomic<int64_t> pos_{0};
 };
 
-class PaimonBoltHdfsOutputStream final : public ::paimon::OutputStream {
+class PaimonBoltOutputStream final : public ::paimon::OutputStream {
  public:
-  PaimonBoltHdfsOutputStream(
+  PaimonBoltOutputStream(
       std::shared_ptr<bytedance::bolt::WriteFile> file,
       std::string uri)
       : file_(std::move(file)), uri_(std::move(uri)) {}
@@ -211,9 +265,9 @@ class PaimonBoltHdfsOutputStream final : public ::paimon::OutputStream {
   int64_t pos_{0};
 };
 
-class PaimonBoltHdfsBasicFileStatus final : public ::paimon::BasicFileStatus {
+class PaimonBoltBasicFileStatus final : public ::paimon::BasicFileStatus {
  public:
-  PaimonBoltHdfsBasicFileStatus(std::string path, bool isDir)
+  PaimonBoltBasicFileStatus(std::string path, bool isDir)
       : path_(std::move(path)), isDir_(isDir) {}
 
   bool IsDir() const override {
@@ -229,9 +283,9 @@ class PaimonBoltHdfsBasicFileStatus final : public ::paimon::BasicFileStatus {
   bool isDir_{false};
 };
 
-class PaimonBoltHdfsFileStatus final : public ::paimon::FileStatus {
+class PaimonBoltFileStatus final : public ::paimon::FileStatus {
  public:
-  PaimonBoltHdfsFileStatus(
+  PaimonBoltFileStatus(
       std::string path,
       bool isDir,
       uint64_t len,
@@ -277,8 +331,8 @@ std::unordered_map<std::string, std::string> toUnordered(
 void ensurePaimonFactoryRegistered() {
   static std::once_flag flag;
   std::call_once(flag, []() {
-    auto* factory = new bytedance::bolt::connector::paimon::
-        PaimonBoltHdfsFileSystemFactory();
+    auto* factory =
+        new bytedance::bolt::connector::paimon::PaimonBoltFileSystemFactory();
     ::paimon::FactoryCreator::GetInstance()->Register(
         factory->Identifier(), factory);
   });
@@ -286,237 +340,230 @@ void ensurePaimonFactoryRegistered() {
 
 } // namespace
 
-PaimonBoltHdfsFileSystem::PaimonBoltHdfsFileSystem(
+PaimonBoltFileSystem::PaimonBoltFileSystem(
     std::map<std::string, std::string> options)
     : connectorProperties_(
           std::make_shared<bytedance::bolt::config::ConfigBase>(
               toUnordered(options),
               /*_mutable=*/false)) {}
 
-PaimonBoltHdfsFileSystem::~PaimonBoltHdfsFileSystem() = default;
+PaimonBoltFileSystem::~PaimonBoltFileSystem() = default;
 
 ::paimon::Result<std::unique_ptr<::paimon::InputStream>>
-PaimonBoltHdfsFileSystem::Open(const std::string& path) const {
-  auto fs =
-      bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
+PaimonBoltFileSystem::Open(const std::string& path) const {
   try {
-    auto file = fs->openFileForRead(path, {});
+    auto fs =
+        bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
+    bytedance::bolt::filesystems::FileOptions options;
+    bytedance::bolt::filesystems::copyOpenFileOptionsFromConfig(
+        connectorProperties_.get(), options);
+    auto file = fs->openFileForRead(path, options);
     auto shared = std::shared_ptr<bytedance::bolt::ReadFile>(std::move(file));
-    return std::make_unique<PaimonBoltHdfsInputStream>(std::move(shared), path);
+    return std::make_unique<PaimonBoltInputStream>(std::move(shared), path);
   } catch (const std::exception& e) {
-    return ::paimon::Status::IOError(std::string("Open failed: ") + e.what());
+    return ::paimon::Status::IOError(
+        "Open failed for " + path + ": " + e.what());
   }
 }
 
 ::paimon::Result<std::unique_ptr<::paimon::OutputStream>>
-PaimonBoltHdfsFileSystem::Create(const std::string& path, bool overwrite)
-    const {
-  auto fs =
-      bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
+PaimonBoltFileSystem::Create(const std::string& path, bool overwrite) const {
   try {
+    auto fs =
+        bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
     if (fs->exists(path)) {
       if (!overwrite) {
         return ::paimon::Status::Invalid(
-            "do not allow overwrite, but the file already exists");
+            "Do not allow overwrite, but the file already exists: " + path);
       }
       fs->remove(path);
     }
 
     bytedance::bolt::filesystems::FileOptions options;
+    bytedance::bolt::filesystems::copyOpenFileOptionsFromConfig(
+        connectorProperties_.get(), options);
     options.shouldCreateParentDirectories = true;
     options.shouldThrowOnFileAlreadyExists = false;
     auto file = fs->openFileForWrite(path, options);
     auto shared = std::shared_ptr<bytedance::bolt::WriteFile>(std::move(file));
-    return std::make_unique<PaimonBoltHdfsOutputStream>(
-        std::move(shared), path);
+    return std::make_unique<PaimonBoltOutputStream>(std::move(shared), path);
   } catch (const std::exception& e) {
-    return ::paimon::Status::IOError(std::string("Create failed: ") + e.what());
+    return ::paimon::Status::IOError(
+        "Create failed for " + path + ": " + e.what());
   }
 }
 
-::paimon::Status PaimonBoltHdfsFileSystem::Mkdirs(
-    const std::string& path) const {
-  auto fs =
-      bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
+::paimon::Status PaimonBoltFileSystem::Mkdirs(const std::string& path) const {
   try {
+    auto fs =
+        bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
     fs->mkdir(path);
     return ::paimon::Status::OK();
   } catch (const std::exception& e) {
-    return ::paimon::Status::IOError(std::string("Mkdirs failed: ") + e.what());
+    return ::paimon::Status::IOError(
+        "Mkdirs failed for " + path + ": " + e.what());
   }
 }
 
-::paimon::Status PaimonBoltHdfsFileSystem::Rename(
+::paimon::Status PaimonBoltFileSystem::Rename(
     const std::string& src,
     const std::string& dst) const {
   const auto srcPrefix = uriAuthorityPrefix(src);
   const auto dstPrefix = uriAuthorityPrefix(dst);
   if (!srcPrefix.empty() && !dstPrefix.empty() && srcPrefix != dstPrefix) {
     return ::paimon::Status::Invalid(
-        "Rename across different HDFS authorities is not supported");
+        "Rename across different HDFS authorities is not supported: " + src +
+        " -> " + dst);
   }
 
-  auto fs =
-      bytedance::bolt::filesystems::getFileSystem(src, connectorProperties_);
   try {
-    fs->rename(src, dst, /*overwrite=*/false);
+    auto sourceFs =
+        bytedance::bolt::filesystems::getFileSystem(src, connectorProperties_);
+    auto destinationFs =
+        bytedance::bolt::filesystems::getFileSystem(dst, connectorProperties_);
+    if (sourceFs->name() != destinationFs->name()) {
+      return ::paimon::Status::Invalid(
+          "Rename across different Bolt filesystems is not supported: " + src +
+          " -> " + dst);
+    }
+    sourceFs->rename(src, dst, /*overwrite=*/false);
     return ::paimon::Status::OK();
   } catch (const std::exception& e) {
-    return ::paimon::Status::IOError(std::string("Rename failed: ") + e.what());
+    return ::paimon::Status::IOError(
+        "Rename failed for " + src + " -> " + dst + ": " + e.what());
   }
 }
 
-::paimon::Status PaimonBoltHdfsFileSystem::Delete(
+::paimon::Status PaimonBoltFileSystem::Delete(
     const std::string& path,
     bool recursive) const {
-  auto fs =
-      bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
   try {
-    auto* hdfsFs =
-        dynamic_cast<bytedance::bolt::filesystems::HdfsFileSystem*>(fs.get());
-    if (!hdfsFs) {
+    auto fs =
+        bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
+    const bool isDirectory = fs->fileInfo(path).isDirectory;
+    if (isDirectory && fs->name() == "GCS") {
+      // GCS rmdir currently deletes the whole bucket, and remove only deletes
+      // a marker object without checking for children. Neither is safe here.
       return ::paimon::Status::NotImplemented(
-          "hdfs:// path did not resolve to HdfsFileSystem");
+          "GCS directory deletion is not supported by the Bolt Paimon filesystem: " +
+          path);
     }
-
-    if (hdfsFs->stat(path).isDir) {
-      if (!recursive) {
-        return ::paimon::Status::Invalid(
-            "non-recursive directory delete is not supported");
-      }
+    if (isDirectory && recursive) {
       fs->rmdir(path);
     } else {
+      // Let the backend reject non-empty directories without relying on
+      // listing or risking a recursive deletion of newly created children.
       fs->remove(path);
     }
     return ::paimon::Status::OK();
   } catch (const std::exception& e) {
-    return ::paimon::Status::IOError(std::string("Delete failed: ") + e.what());
+    return ::paimon::Status::IOError(
+        "Delete failed for " + path + ": " + e.what());
   }
 }
 
 ::paimon::Result<std::unique_ptr<::paimon::FileStatus>>
-PaimonBoltHdfsFileSystem::GetFileStatus(const std::string& path) const {
-  auto fs =
-      bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
+PaimonBoltFileSystem::GetFileStatus(const std::string& path) const {
   try {
-    auto* hdfsFs =
-        dynamic_cast<bytedance::bolt::filesystems::HdfsFileSystem*>(fs.get());
-    if (!hdfsFs) {
-      return ::paimon::Status::NotImplemented(
-          "hdfs:// path did not resolve to HdfsFileSystem");
-    }
-    auto info = hdfsFs->stat(path);
-    return std::make_unique<PaimonBoltHdfsFileStatus>(
-        path, info.isDir, info.size, info.modificationTimeMs);
+    auto fs =
+        bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
+    const auto info = fs->fileInfo(path);
+    return std::make_unique<PaimonBoltFileStatus>(
+        path, info.isDirectory, info.size, info.modificationTimeMs);
   } catch (const std::exception& e) {
     return ::paimon::Status::IOError(
-        std::string("GetFileStatus failed: ") + e.what());
+        "GetFileStatus failed for " + path + ": " + e.what());
   }
 }
 
-::paimon::Status PaimonBoltHdfsFileSystem::ListDir(
+::paimon::Status PaimonBoltFileSystem::ListDir(
     const std::string& directory,
     std::vector<std::unique_ptr<::paimon::BasicFileStatus>>* file_status_list)
     const {
-  auto fs = bytedance::bolt::filesystems::getFileSystem(
-      directory, connectorProperties_);
   try {
-    if (!fs->exists(directory)) {
+    auto fs = bytedance::bolt::filesystems::getFileSystem(
+        directory, connectorProperties_);
+    const auto info = findFileInfo(*fs, directory);
+    if (!info) {
       return ::paimon::Status::OK();
     }
-
-    auto* hdfsFs =
-        dynamic_cast<bytedance::bolt::filesystems::HdfsFileSystem*>(fs.get());
-    if (!hdfsFs) {
-      return ::paimon::Status::NotImplemented(
-          "hdfs:// path did not resolve to HdfsFileSystem");
-    }
-    if (!hdfsFs->stat(directory).isDir) {
+    if (!info->isDirectory) {
       return ::paimon::Status::IOError(
-          "ListDir target exists and is not a directory");
+          "ListDir target is not a directory: " + directory);
     }
 
-    auto entries = fs->list(directory);
+    auto entries = listDirectChildren(*fs, directory);
     file_status_list->reserve(file_status_list->size() + entries.size());
-    for (const auto& entry : entries) {
-      const std::string full = joinDirAndBasename(directory, entry);
-      const bool isDir = hdfsFs->stat(full).isDir;
+    for (const auto& full : entries) {
+      const bool isDir = fs->fileInfo(full).isDirectory;
       file_status_list->emplace_back(
-          std::make_unique<PaimonBoltHdfsBasicFileStatus>(full, isDir));
+          std::make_unique<PaimonBoltBasicFileStatus>(full, isDir));
     }
     return ::paimon::Status::OK();
   } catch (const std::exception& e) {
     return ::paimon::Status::IOError(
-        std::string("ListDir failed: ") + e.what());
+        "ListDir failed for " + directory + ": " + e.what());
   }
 }
 
-::paimon::Status PaimonBoltHdfsFileSystem::ListFileStatus(
+::paimon::Status PaimonBoltFileSystem::ListFileStatus(
     const std::string& path,
     std::vector<std::unique_ptr<::paimon::FileStatus>>* file_status_list)
     const {
-  auto fs =
-      bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
   try {
-    if (!fs->exists(path)) {
+    auto fs =
+        bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
+    const auto info = findFileInfo(*fs, path);
+    if (!info) {
+      return ::paimon::Status::OK();
+    }
+    if (!info->isDirectory) {
+      file_status_list->emplace_back(std::make_unique<PaimonBoltFileStatus>(
+          path, info->isDirectory, info->size, info->modificationTimeMs));
       return ::paimon::Status::OK();
     }
 
-    auto* hdfsFs =
-        dynamic_cast<bytedance::bolt::filesystems::HdfsFileSystem*>(fs.get());
-    if (!hdfsFs) {
-      return ::paimon::Status::NotImplemented(
-          "hdfs:// path did not resolve to HdfsFileSystem");
-    }
-
-    if (!hdfsFs->stat(path).isDir) {
-      auto info = hdfsFs->stat(path);
-      file_status_list->emplace_back(std::make_unique<PaimonBoltHdfsFileStatus>(
-          path, info.isDir, info.size, info.modificationTimeMs));
-      return ::paimon::Status::OK();
-    }
-
-    auto entries = fs->list(path);
+    auto entries = listDirectChildren(*fs, path);
     file_status_list->reserve(file_status_list->size() + entries.size());
-    for (const auto& entry : entries) {
-      const std::string full = joinDirAndBasename(path, entry);
-      auto info = hdfsFs->stat(full);
-      file_status_list->emplace_back(std::make_unique<PaimonBoltHdfsFileStatus>(
-          full, info.isDir, info.size, info.modificationTimeMs));
+    for (const auto& full : entries) {
+      const auto entryInfo = fs->fileInfo(full);
+      file_status_list->emplace_back(std::make_unique<PaimonBoltFileStatus>(
+          full,
+          entryInfo.isDirectory,
+          entryInfo.size,
+          entryInfo.modificationTimeMs));
     }
     return ::paimon::Status::OK();
   } catch (const std::exception& e) {
     return ::paimon::Status::IOError(
-        std::string("ListFileStatus failed: ") + e.what());
+        "ListFileStatus failed for " + path + ": " + e.what());
   }
 }
 
-::paimon::Result<bool> PaimonBoltHdfsFileSystem::Exists(
+::paimon::Result<bool> PaimonBoltFileSystem::Exists(
     const std::string& path) const {
-  auto fs =
-      bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
   try {
+    auto fs =
+        bytedance::bolt::filesystems::getFileSystem(path, connectorProperties_);
     return fs->exists(path);
   } catch (const std::exception& e) {
-    return ::paimon::Status::IOError(std::string("Exists failed: ") + e.what());
+    return ::paimon::Status::IOError(
+        "Exists failed for " + path + ": " + e.what());
   }
 }
 
-const char* PaimonBoltHdfsFileSystemFactory::Identifier() const {
+const char* PaimonBoltFileSystemFactory::Identifier() const {
   return kIdentifier.data();
 }
 
 ::paimon::Result<std::unique_ptr<::paimon::FileSystem>>
-PaimonBoltHdfsFileSystemFactory::Create(
+PaimonBoltFileSystemFactory::Create(
     const std::string& /*path*/,
     const std::map<std::string, std::string>& options) const {
-  return std::make_unique<PaimonBoltHdfsFileSystem>(options);
+  return std::make_unique<PaimonBoltFileSystem>(options);
 }
 
-void EnsurePaimonBoltHdfsFileSystemRegistered() {
-  static std::once_flag flag;
-  std::call_once(
-      flag, []() { bytedance::bolt::filesystems::registerHdfsFileSystem(); });
+void EnsurePaimonBoltFileSystemRegistered() {
   ensurePaimonFactoryRegistered();
 }
 
