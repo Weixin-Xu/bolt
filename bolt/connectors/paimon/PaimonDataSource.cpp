@@ -296,7 +296,7 @@ PaimonDataSource::PaimonDataSource(
   filterRowType_ = ROW(std::move(filterNames), std::move(filterTypes));
   VLOG(1) << "PaimonDataSource::PaimonDataSource(): Read schema: "
           << folly::join(", ", columns);
-  ctxBuilder.SetReadSchema(columns);
+  ctxBuilder.SetReadFieldNames(columns);
   ctxBuilder.EnableMultiThreadRowToBatch(paimonConfig->multiThreadRowToBatch());
   if (paimonConfig->multiThreadRowToBatch()) {
     ctxBuilder.SetRowToBatchThreadNumber(
@@ -450,7 +450,7 @@ std::optional<RowVectorPtr> PaimonDataSource::next(
   VLOG(1) << "Imported RowVector size: " << row->size()
           << ", number of fields: " << rowType.size();
 
-  if (rowType.nameOf(0) == "_VALUE_KIND" && rowType.size() > 1) {
+  if (rowType.size() > 1 && rowType.nameOf(0) == "_VALUE_KIND") {
     VLOG(1) << "Dropping _VALUE_KIND field";
 
     std::vector<VectorPtr> newChildren;
