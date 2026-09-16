@@ -311,7 +311,8 @@ PaimonDataSource::PaimonDataSource(
     ctxBuilder.AddOption(key, value);
   }
 
-  ctxBuilder.EnablePredicateFilter(paimonConfig->predicateFilterEnabled());
+  const bool predicateFilterEnabled = paimonConfig->predicateFilterEnabled();
+  ctxBuilder.EnablePredicateFilter(predicateFilterEnabled);
 
   // Prefetch tuning — disabled by default; when enabled, overlaps I/O with
   // computation for high-latency storage backends (S3, HDFS, OSS).
@@ -329,9 +330,10 @@ PaimonDataSource::PaimonDataSource(
               << filterPlan.first->ToString();
     }
     ctxBuilder.SetPredicate(filterPlan.first);
-    if (filterPlan.second) {
-      remainingFilterExprSet_ =
-          expressionEvaluator_->compile(filterPlan.second);
+    const auto& remainingFilter =
+        predicateFilterEnabled ? filterPlan.second : tableHandle_->filter();
+    if (remainingFilter) {
+      remainingFilterExprSet_ = expressionEvaluator_->compile(remainingFilter);
     }
   } else {
     ctxBuilder.SetPredicate(nullptr);
