@@ -35,7 +35,8 @@ class GlutenCiTest(unittest.TestCase):
         self.assertTrue(SCRIPT.is_file(), "The Gluten CI entry point is missing")
         spec = importlib.util.spec_from_file_location("gluten_ci", SCRIPT)
         self.ci = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.ci)
+        with patch.object(sys, "path", [str(SCRIPT.parent), *sys.path]):
+            spec.loader.exec_module(self.ci)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -293,15 +294,6 @@ class GlutenCiTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ScalaTest.*exit"):
             self.ci.verify_scalatest_exit(forks, [])
 
-    def test_prepare_rejects_a_matrix_the_commands_do_not_implement(self):
-        config = json.loads(self.ci.CONFIG.read_text())
-        config["jdk"] = "21"
-        path = self.root / "versions.json"
-        path.write_text(json.dumps(config))
-        self.ci.CONFIG = path
-        with self.assertRaisesRegex(ValueError, "Unsupported.*matrix"):
-            self.ci.prepare(self.root)
-
     def test_local_prepare_records_host_without_an_image(self):
         with patch.dict("os.environ", {}, clear=True):
             self.ci.prepare(self.root, local=True, gluten=self.ci.ROOT)
@@ -312,6 +304,42 @@ class GlutenCiTest(unittest.TestCase):
         self.assertEqual(
             inputs["bolt_tested_sha"], self.ci.git(self.ci.ROOT, "rev-parse", "HEAD")
         )
+
+    def test_local_prepare_uses_the_runtime_without_a_versions_file(self):
+        checkout, _, _, _ = self.patch_fixture()
+        scripts = checkout / ".github/scripts"
+        scripts.mkdir(parents=True)
+        for name in (
+            "gluten_ci.py",
+            "setup_gluten_ci_environment.py",
+            "DiscoverGlutenSuites.java",
+        ):
+            shutil.copy2(SCRIPT.parent / name, scripts / name)
+        (checkout / ".github/gluten-ci-blacklist.txt").touch()
+        (checkout / ".github/gluten-ci-patches").mkdir()
+        reports = checkout / "reports"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(scripts / "gluten_ci.py"),
+                "prepare",
+                "--local",
+                "--gluten-dir",
+                str(checkout),
+                "--reports-dir",
+                str(reports),
+            ],
+            env={},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inputs = json.loads((reports / "inputs.json").read_text())
+        self.assertEqual(inputs["spark"], "3.5.5")
+        self.assertEqual(inputs["scala"], "2.12")
+        self.assertEqual(inputs["jdk"], "17")
+        self.assertIn("-Pspark-3.5", self.ci.maven(checkout))
+        self.assertIn("-Pjava-17", self.ci.maven(checkout))
 
     def test_actions_cannot_bypass_image_validation_with_local_mode(self):
         with patch.dict(
@@ -395,31 +423,7 @@ class GlutenCiTest(unittest.TestCase):
         inputs = json.loads((self.root / "inputs.json").read_text())
         self.assertEqual(inputs["gluten_sha"], "a" * 40)
 
-    def test_prepare_rejects_sources_other_than_apache_gluten_main(self):
-        config = json.loads(self.ci.CONFIG.read_text())
-        path = self.root / "versions.json"
-        self.ci.CONFIG = path
-        for repository, branch in (
-            ("example/gluten", "main"),
-            ("apache/gluten", "ci/bolt"),
-            ("apache/gluten", "a" * 40),
-        ):
-            config.update(gluten_repository=repository, gluten_ref=branch)
-            path.write_text(json.dumps(config))
-            with (
-                self.subTest(repository=repository, branch=branch),
-                patch.dict("os.environ", {}, clear=True),
-                self.assertRaisesRegex(ValueError, "apache/gluten:main"),
-            ):
-                self.ci.prepare(self.root, local=True, gluten=self.ci.ROOT)
-
     def test_prepare_resolves_apache_gluten_main_once(self):
-        config = json.loads(self.ci.CONFIG.read_text())
-        config.pop("gluten_sha", None)
-        config.update(gluten_repository="apache/gluten", gluten_ref="main")
-        path = self.root / "versions.json"
-        path.write_text(json.dumps(config))
-        self.ci.CONFIG = path
         image = "registry.example/ci@sha256:" + "b" * 64
         actual_output = subprocess.check_output
         remote_queries = []
@@ -454,12 +458,6 @@ class GlutenCiTest(unittest.TestCase):
         )
 
     def test_prepare_rejects_an_unresolved_or_wrong_remote_branch(self):
-        config = json.loads(self.ci.CONFIG.read_text())
-        config.pop("gluten_sha", None)
-        config.update(gluten_repository="apache/gluten", gluten_ref="main")
-        path = self.root / "versions.json"
-        path.write_text(json.dumps(config))
-        self.ci.CONFIG = path
         actual_output = subprocess.check_output
         for remote in ("", "a" * 40 + "\trefs/heads/other\n"):
 
@@ -1193,17 +1191,37 @@ class GlutenCiTest(unittest.TestCase):
             self.ci.spark_environment(home, {})
         for path in (
             home / "bin/spark-submit",
-            home / "jars/spark.jar",
+            home / "jars/spark-core_2.12-3.5.5.jar",
             home / "python/lib/pyspark.zip",
-            home / "python/lib/py4j.zip",
+            home / "python/lib/py4j-0.10.9.7-src.zip",
             home / "sql/core/src/test/resources/sql-tests/inputs/query.sql",
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
+        submit = home / "bin/spark-submit"
+        submit.chmod(0o755)
         (home / "RELEASE").write_text("Spark 3.5.5 built for Hadoop 3\n")
         env = self.ci.spark_environment(home, {"PYTHONPATH": "existing"})
         self.assertEqual(env["SPARK_HOME"], str(home))
         self.assertTrue(env["PYTHONPATH"].endswith(":existing"))
+        for name in (
+            "jars/spark-core_2.12-3.5.5.jar",
+            "python/lib/pyspark.zip",
+            "python/lib/py4j-0.10.9.7-src.zip",
+            "sql/core/src/test/resources/sql-tests/inputs/query.sql",
+        ):
+            path = home / name
+            hidden = self.root / "missing"
+            path.rename(hidden)
+            try:
+                with self.subTest(missing=name), self.assertRaises(ValueError):
+                    self.ci.spark_environment(home, {})
+            finally:
+                hidden.rename(path)
+        submit.chmod(0o644)
+        with self.assertRaises(ValueError):
+            self.ci.spark_environment(home, {})
+        submit.chmod(0o755)
         (home / "RELEASE").write_text("Spark 4.0.0 built for Hadoop 3\n")
         with self.assertRaises(ValueError):
             self.ci.spark_environment(home, {})
@@ -1219,6 +1237,7 @@ class GlutenCiTest(unittest.TestCase):
             path = home / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
+        (home / "bin/spark-submit").chmod(0o755)
         with zipfile.ZipFile(home / "python/lib/pyspark.zip", "w") as archive:
             archive.writestr("pyspark/version.py", "__version__: str = '3.5.5'\n")
         self.assertEqual(self.ci.spark_environment(home, {})["SPARK_HOME"], str(home))

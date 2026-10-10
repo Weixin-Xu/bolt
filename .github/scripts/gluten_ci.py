@@ -32,9 +32,16 @@ import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 
+from setup_gluten_ci_environment import (
+    JDK_VERSION,
+    SCALA_VERSION,
+    SPARK_VERSION,
+    validate_spark_home,
+)
+
 
 ROOT = Path(__file__).resolve().parents[2]
-CONFIG = ROOT / ".github/gluten-ci-versions.json"
+SPARK_PROFILE = SPARK_VERSION.rsplit(".", 1)[0]
 BLACKLIST = ROOT / ".github/gluten-ci-blacklist.txt"
 PATCHES = ROOT / ".github/gluten-ci-patches"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -347,23 +354,18 @@ def verify_tpc(log, expected):
 def prepare(reports, local=False, gluten=None):
     if local and os.environ.get("GITHUB_ACTIONS") == "true":
         raise ValueError("Local mode cannot run in GitHub Actions")
-    config = json.loads(CONFIG.read_text())
-    matrix = {
-        "spark": "3.5.5",
-        "scala": "2.12",
-        "jdk": "17",
+    config = {
+        "gluten_repository": "apache/gluten",
+        "gluten_ref": "main",
+        "spark": SPARK_VERSION,
+        "scala": SCALA_VERSION,
+        "jdk": JDK_VERSION,
         "os": "Linux",
         "architecture": "x86_64",
         "build_type": "Release",
     }
-    if any(config.get(key) != value for key, value in matrix.items()):
-        raise ValueError(
-            "Unsupported Gluten CI matrix; update test commands and validation together"
-        )
-    repository = config.get("gluten_repository", "")
-    branch = config.get("gluten_ref", "")
-    if (repository, branch) != ("apache/gluten", "main"):
-        raise ValueError("Gluten CI must use apache/gluten:main")
+    repository = config["gluten_repository"]
+    branch = config["gluten_ref"]
     image = None if local else os.environ.get("BOLT_GLUTEN_CI_IMAGE") or DEFAULT_IMAGE
     if not local and image != DEFAULT_IMAGE and not IMAGE.fullmatch(image):
         raise ValueError(
@@ -438,7 +440,6 @@ def prepare(reports, local=False, gluten=None):
         "execution_environment": "local-host" if local else "container",
         "runner": runner,
         "required_stages": STAGES,
-        "configuration_sha256": hashlib.sha256(CONFIG.read_bytes()).hexdigest(),
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "discovery_script_sha256": hashlib.sha256(
             (ROOT / ".github/scripts/DiscoverGlutenSuites.java").read_bytes()
@@ -563,8 +564,8 @@ def build(gluten, reports):
     java = subprocess.run(
         ["java", "-version"], capture_output=True, text=True, check=True
     )
-    if not re.search(r'version "17[.\"]', java.stderr + java.stdout):
-        raise ValueError("This matrix requires JDK 17")
+    if not re.search(rf'version "{JDK_VERSION}[.\"]', java.stderr + java.stdout):
+        raise ValueError(f"This matrix requires JDK {JDK_VERSION}")
     version = "ci-" + inputs["bolt_tested_sha"]
     options = [
         arg
@@ -793,14 +794,14 @@ def runtime_command(gluten, command):
     ]
 
 
-def maven(gluten, spark="3.5"):
+def maven(gluten, spark=SPARK_PROFILE):
     return [
         str(gluten / "build/mvn"),
         "-ntp",
         "-Pbackends-bolt",
         "-Pdelta",
         f"-Pspark-{spark}",
-        "-Pjava-17",
+        f"-Pjava-{JDK_VERSION}",
         "-DskipTests=false",
         "-Dmaven.test.skip=false",
         "-Dmaven.test.failure.ignore=false",
@@ -867,32 +868,8 @@ def verify_scalatest_exit(forks, expected_failures):
 
 
 def spark_environment(home, env):
-    release = home / "RELEASE"
-    if release.is_file():
-        version_matches = bool(re.search(r"\bSpark 3\.5\.5\b", release.read_text()))
-    else:
-        try:
-            with zipfile.ZipFile(home / "python/lib/pyspark.zip") as archive:
-                version_matches = bool(
-                    re.search(
-                        r"__version__(?:\s*:\s*str)?\s*=\s*['\"]3\.5\.5['\"]",
-                        archive.read("pyspark/version.py").decode(),
-                    )
-                )
-        except (OSError, KeyError, zipfile.BadZipFile):
-            version_matches = False
-    sql = home / "sql/core/src/test/resources/sql-tests/inputs"
+    validate_spark_home(home)
     zips = sorted((home / "python/lib").glob("*.zip"))
-    if (
-        not version_matches
-        or not (home / "bin/spark-submit").is_file()
-        or not (home / "jars").is_dir()
-        or not sql.is_dir()
-        or not zips
-    ):
-        raise ValueError(
-            "Spark UT requires Spark 3.5.5 binaries, Python ZIPs and source SQL test resources"
-        )
     pythonpath = os.pathsep.join(str(path) for path in zips)
     if env.get("PYTHONPATH"):
         pythonpath += os.pathsep + env["PYTHONPATH"]
@@ -1046,7 +1023,7 @@ def run_test_stage(stage, gluten, reports):
         log.unlink()
     output = reports / stage
     output.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "SPARK_TESTING": "true", "SPARK_SCALA_VERSION": "2.12"}
+    env = {**os.environ, "SPARK_TESTING": "true", "SPARK_SCALA_VERSION": SCALA_VERSION}
     if stage in SPARK4_PROFILES:
         return run_spark4_stage(stage, gluten, reports, output, env)
     if stage == "native":
@@ -1095,8 +1072,8 @@ def run_test_stage(stage, gluten, reports):
                         str(gluten / "build/mvn"),
                         "-ntp",
                         "install",
-                        "-Pspark-3.5",
-                        "-Pjava-17",
+                        f"-Pspark-{SPARK_PROFILE}",
+                        f"-Pjava-{JDK_VERSION}",
                     ],
                 ),
                 gluten / "tools/gluten-it",
@@ -1211,8 +1188,8 @@ def run_test_stage(stage, gluten, reports):
 
 def discover_backend_suites(gluten, output, env):
     module = gluten / "backends-bolt"
-    classes = module / "target/scala-2.12/test-classes"
-    main_classes = module / "target/scala-2.12/classes"
+    classes = module / f"target/scala-{SCALA_VERSION}/test-classes"
+    main_classes = module / f"target/scala-{SCALA_VERSION}/classes"
     dependencies = output / "test-classpath.txt"
     names = output / "discovered-suites.txt"
     log = output / "discovery.log"
@@ -1367,7 +1344,7 @@ def run_spark4_stage(stage, gluten, reports, output, env):
         *maven(gluten, profile),
         "-Pscala-2.13",
         "-Pspark-ut",
-        "-Dmaven.compiler.release=17",
+        f"-Dmaven.compiler.release={JDK_VERSION}",
     ]
     run(
         runtime_command(
