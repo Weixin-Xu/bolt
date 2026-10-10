@@ -572,6 +572,12 @@ def build(gluten, reports):
         for arg in ("-o", f"bolt/*:{key}={value}")
     ]
     overrides = " ".join(options)
+    # Some Bolt revisions have no repository overlay. Configure and package
+    # with the same host profiles so Conan resolves the same dependency graph.
+    profile = ["-pr:h", "default"]
+    overlay = ROOT / "scripts/conan/bolt.profile"
+    if overlay.is_file():
+        profile.extend(["-pr:h", str(overlay)])
     run(
         [
             "make",
@@ -579,6 +585,7 @@ def build(gluten, reports):
             "BOLT_CONAN_CONFIGURE_ONLY=1",
             f"BUILD_VERSION={version}",
             f"CONAN_OVERRIDE={overrides}",
+            f"CONAN_HOST_PROFILE_ARGS={shlex.join(profile)}",
         ],
         ROOT,
         log,
@@ -598,14 +605,7 @@ def build(gluten, reports):
         ROOT,
         log,
     )
-    profile = [
-        "-pr:h",
-        "default",
-        "-pr:h",
-        str(ROOT / "scripts/conan/bolt.profile"),
-        "-s",
-        "build_type=Release",
-    ]
+    profile.extend(["-s", "build_type=Release"])
     run(
         [
             "conan",

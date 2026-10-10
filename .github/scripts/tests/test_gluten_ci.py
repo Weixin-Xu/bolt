@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 import shutil
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1128,6 +1129,63 @@ class GlutenCiTest(unittest.TestCase):
                 log,
             )
         self.assertIn("failure evidence", log.read_text())
+
+    def test_build_keeps_configuration_and_export_host_profiles_consistent(self):
+        class ExportReached(Exception):
+            pass
+
+        for overlay_exists in (False, True):
+            with self.subTest(repository_overlay=overlay_exists):
+                checkout = self.root / str(overlay_exists)
+                checkout.mkdir()
+                overlay = checkout / "scripts/conan/bolt.profile"
+                expected_profiles = ["-pr:h", "default"]
+                if overlay_exists:
+                    overlay.parent.mkdir(parents=True)
+                    overlay.write_text(
+                        "[replace_tool_requires]\ncmake/*: cmake/3.31.10\n"
+                    )
+                    expected_profiles.extend(["-pr:h", str(overlay)])
+                reports = checkout / "reports"
+                reports.mkdir()
+                (reports / "inputs.json").write_text(
+                    json.dumps({"bolt_tested_sha": "a" * 40})
+                )
+                commands = []
+
+                def run(args, cwd, log, env=None, json_output=None):
+                    commands.append(args)
+                    if args[:2] == ["conan", "export-pkg"]:
+                        raise ExportReached
+
+                with (
+                    patch.object(self.ci, "ROOT", checkout),
+                    patch.object(self.ci, "git", side_effect=["a" * 40, ""]),
+                    patch.object(self.ci, "verify_gluten_source"),
+                    patch.object(self.ci, "run", side_effect=run),
+                    patch.dict("os.environ", {"CONAN_HOME": str(checkout / "cache")}),
+                    self.assertRaises(ExportReached),
+                ):
+                    self.ci.build(checkout / "gluten", reports)
+
+                exported_profiles = []
+                for index, arg in enumerate(commands[-1]):
+                    if arg == "-pr:h":
+                        exported_profiles.extend([arg, commands[-1][index + 1]])
+                self.assertEqual(exported_profiles, expected_profiles)
+                configured = next(args for args in commands if args[0] == "make")
+                profile_override = next(
+                    (
+                        arg
+                        for arg in configured
+                        if arg.startswith("CONAN_HOST_PROFILE_ARGS=")
+                    ),
+                    None,
+                )
+                self.assertIsNotNone(profile_override)
+                self.assertEqual(
+                    shlex.split(profile_override.split("=", 1)[1]), expected_profiles
+                )
 
     def test_spark_environment_requires_binary_and_source_test_resources(self):
         home = self.root / "spark_home"
