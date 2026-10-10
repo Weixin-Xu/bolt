@@ -33,6 +33,8 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 SPARK_VERSION = "3.5.5"
+SCALA_VERSION = "2.12"
+JDK_VERSION = "17"
 APACHE_SPARK = f"https://archive.apache.org/dist/spark/spark-{SPARK_VERSION}"
 BINARY = f"spark-{SPARK_VERSION}-bin-hadoop3"
 SOURCE = f"spark-{SPARK_VERSION}"
@@ -57,15 +59,17 @@ def validate_prerequisites():
         not (home / name).is_file()
         for name in ("bin/java", "bin/javac", "include/jni.h", "lib/libjawt.so")
     ):
-        raise ValueError("Set JAVA_HOME to a full JDK 17 with JNI headers and AWT")
+        raise ValueError(
+            f"Set JAVA_HOME to a full JDK {JDK_VERSION} with JNI headers and AWT"
+        )
     java = subprocess.run(
         [str(home / "bin/java"), "-version"],
         capture_output=True,
         text=True,
         check=True,
     )
-    if not re.search(r'version "17[.\"]', java.stdout + java.stderr):
-        raise ValueError("Gluten CI requires JDK 17")
+    if not re.search(rf'version "{JDK_VERSION}[.\"]', java.stdout + java.stderr):
+        raise ValueError(f"Gluten CI requires JDK {JDK_VERSION}")
     subprocess.run([str(home / "bin/javac"), "-version"], check=True)
 
 
@@ -161,13 +165,15 @@ def extract_archive(archive, directory, name, sql_only=False):
 def validate_spark_home(home):
     release = home / "RELEASE"
     if release.is_file():
-        version_matches = bool(re.search(r"\bSpark 3\.5\.5\b", release.read_text()))
+        version_matches = bool(
+            re.search(rf"\bSpark {re.escape(SPARK_VERSION)}\b", release.read_text())
+        )
     else:
         try:
             with zipfile.ZipFile(home / "python/lib/pyspark.zip") as archive:
                 version_matches = bool(
                     re.search(
-                        r"__version__(?:\s*:\s*str)?\s*=\s*['\"]3\.5\.5['\"]",
+                        rf"__version__(?:\s*:\s*str)?\s*=\s*['\"]{re.escape(SPARK_VERSION)}['\"]",
                         archive.read("pyspark/version.py").decode(),
                     )
                 )
@@ -176,11 +182,11 @@ def validate_spark_home(home):
     if (
         not version_matches
         or not os.access(home / "bin/spark-submit", os.X_OK)
-        or not (home / "jars/spark-core_2.12-3.5.5.jar").is_file()
+        or not (home / f"jars/spark-core_{SCALA_VERSION}-{SPARK_VERSION}.jar").is_file()
         or not (home / "python/lib/pyspark.zip").is_file()
         or not list((home / "python/lib").glob("py4j-*-src.zip"))
     ):
-        raise ValueError("Spark 3.5.5 binary distribution is incomplete")
+        raise ValueError(f"Spark {SPARK_VERSION} binary distribution is incomplete")
     inputs = home / "sql/core/src/test/resources/sql-tests/inputs"
     if not inputs.is_dir() or not any(inputs.iterdir()):
         raise ValueError("Matching Spark SQL test resources are missing")
