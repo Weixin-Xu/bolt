@@ -70,3 +70,18 @@ index 3d9feae51d..f36e0f7851 100644
    override protected def createTPCHNotNullTables(): Unit = {
      val tableDir = getClass.getResource(resourcePath).getFile
      TPCHTables
+diff --git a/tools/gluten-it/sbin/gluten-it.sh b/tools/gluten-it/sbin/gluten-it.sh
+--- a/tools/gluten-it/sbin/gluten-it.sh
++++ b/tools/gluten-it/sbin/gluten-it.sh
+@@ -29,7 +29,10 @@
+ fi
+ 
+-JAR_PATH=$LIB_DIR/*
++# Load Gluten's Arrow classes together with their relocated FlatBuffers before
++# Spark's Arrow jars; Java wildcard classpath ordering is unspecified.
++printf -v JAR_PATH '%s:' "$LIB_DIR"/gluten-package-*.jar
++JAR_PATH+="$LIB_DIR/*"
+ 
+ SPARK_JVM_OPTIONS=$($JAVA_HOME/bin/java -cp $JAR_PATH org.apache.gluten.integration.SparkJvmOptions)
+ 
+ EMBEDDED_SPARK_HOME=$BASEDIR/../spark-home

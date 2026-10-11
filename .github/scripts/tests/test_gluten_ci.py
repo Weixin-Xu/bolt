@@ -1084,6 +1084,47 @@ class GlutenCiTest(unittest.TestCase):
                     {"graph": {"nodes": {"0": {}, "1": dict(installed, **update)}}},
                 )
 
+    def test_tpc_launcher_loads_gluten_before_spark_arrow(self):
+        library = self.root / "tools/gluten-it/package/target/lib"
+        library.mkdir(parents=True)
+        bundle = library / "gluten-package-1.8.0-SNAPSHOT.jar"
+        bundle.touch()
+        metadata = library / "gluten-package-1.8.0-SNAPSHOT-3.5.jar"
+        metadata.touch()
+        (library / "arrow-vector-12.0.1.jar").touch()
+        script = self.root / "tools/gluten-it/sbin/gluten-it.sh"
+        script.parent.mkdir()
+        script.write_text(
+            f"LIB_DIR={shlex.quote(str(library))}\n\n"
+            "if false; then\n  exit 1\nfi\n\n"
+            "JAR_PATH=$LIB_DIR/*\n\n"
+            "SPARK_JVM_OPTIONS=$($JAVA_HOME/bin/java -cp $JAR_PATH "
+            "org.apache.gluten.integration.SparkJvmOptions)\n\n"
+            "EMBEDDED_SPARK_HOME=$BASEDIR/../spark-home\n\n"
+            "printf '%s\\n' \"$JAR_PATH\"\n"
+        )
+        java = self.root / "jdk/bin/java"
+        java.parent.mkdir(parents=True)
+        java.write_text("#!/bin/sh\nexit 0\n")
+        java.chmod(0o755)
+        subprocess.run(
+            [
+                "git",
+                "apply",
+                "--allow-empty",
+                "--include=tools/gluten-it/sbin/gluten-it.sh",
+                str(self.ci.PATCHES / "003-bolt-delta-tpch-fixture.patch"),
+            ],
+            cwd=self.root,
+            check=True,
+        )
+        classpath = subprocess.check_output(
+            ["bash", str(script)], env={"JAVA_HOME": str(java.parents[1])}, text=True
+        ).strip()
+        entries = classpath.split(":")
+        self.assertEqual(set(entries[:-1]), {str(bundle), str(metadata)})
+        self.assertEqual(entries[-1], f"{library}/*")
+
     def test_tpc_rejects_baseline_only_native_and_missing_queries(self):
         log = (
             "Running baseline query q1 (iteration 0)...\n"
