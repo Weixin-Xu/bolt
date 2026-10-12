@@ -120,7 +120,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.BOLT_GLUTEN_CI_RUNNER || '["self-hosted", "medium"]') }}
     timeout-minutes: 1440
     container:
-      image: ${{ vars.BOLT_GLUTEN_CI_IMAGE || 'bolt-registry:5000/bolt-ci:20260114' }}
+      image: ${{ vars.BOLT_GLUTEN_CI_IMAGE || 'bolt-registry:5000/bolt-ci:20260921' }}
       options: --user root --init
     services:
       conanserver:
