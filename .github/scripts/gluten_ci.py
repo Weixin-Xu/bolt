@@ -12,17 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Strict, local and Actions entry points for the Gluten Bolt backend."""
+"""Validate Gluten CI inputs, candidate artifacts and completed test runs."""
 
 import argparse
 from collections import Counter
-from contextlib import contextmanager, ExitStack
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import re
 import shlex
 import shutil
@@ -32,15 +29,10 @@ import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 
-from setup_gluten_ci_environment import (
-    JDK_VERSION,
-    SCALA_VERSION,
-    SPARK_VERSION,
-    validate_spark_home,
-)
-
-
 ROOT = Path(__file__).resolve().parents[2]
+SPARK_VERSION = "3.5.5"
+SCALA_VERSION = "2.12"
+JDK_VERSION = "17"
 SPARK_PROFILE = SPARK_VERSION.rsplit(".", 1)[0]
 BLACKLIST = ROOT / ".github/gluten-ci-blacklist.txt"
 PATCHES = ROOT / ".github/gluten-ci-patches"
@@ -61,38 +53,6 @@ STAGES = (
     "spark40",
     "spark41",
 )
-SPARK4_PROFILES = {"spark40": "4.0", "spark41": "4.1"}
-SPARK4_SUITES = ",".join(
-    ["org.apache.spark.sql.GlutenBoltBackendSmokeSuite"]
-    + [
-        f"org.apache.spark.sql.catalyst.expressions.Gluten{name}Suite"
-        for name in (
-            "ArithmeticExpression",
-            "BitwiseExpressions",
-            "ConditionalExpression",
-            "LiteralExpression",
-            "NullExpressions",
-            "Predicate",
-        )
-    ]
-)
-SPARK_GROUPS = (
-    "org.apache.spark.sql.streaming,org.apache.spark.GlutenSortShuffleSuite,org.apache.gluten",
-    "org.apache.spark.sql.execution,org.apache.spark.sql.catalyst,org.apache.spark.sql.errors,org.apache.spark.sql.extension",
-    "org.apache.spark.sql.GlutenSQL,org.apache.spark.sql.Gluten,org.apache.spark.sql.connector,org.apache.spark.sql.sources,org.apache.spark.sql.hive,org.apache.spark.sql.gluten,org.apache.spark.sql.shim",
-)
-EXCLUDED_TAGS = ",".join(
-    f"org.apache.gluten.tags.{tag}"
-    for tag in ("UDFTest", "EnhancedFeaturesTest", "CudfTest", "SkipTest")
-)
-BOLT_OPTIONS = {
-    "spark_compatible": "True",
-    "enable_testutil": "True",
-    "shared": "False",
-    "enable_hdfs": "False",
-    "enable_s3": "False",
-    "enable_asan": "False",
-}
 
 
 def write_atomic(path, content):
@@ -113,36 +73,6 @@ def write_json(path, value):
 
 def git(path, *args):
     return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
-
-
-def run(args, cwd, log, env=None, json_output=None):
-    """Keep failure evidence while preserving the subprocess exit status."""
-    log.parent.mkdir(parents=True, exist_ok=True)
-    command = shlex.join(str(arg) for arg in args)
-    print(f"[{cwd}] {command}", flush=True)
-    with log.open("a") as output:
-        output.write(command + "\n")
-        output.flush()
-        if json_output:
-            with json_output.open("w") as data:
-                subprocess.run(
-                    args, cwd=cwd, env=env, stdout=data, stderr=output, check=True
-                )
-        else:
-            process = subprocess.Popen(
-                args,
-                cwd=cwd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            for line in process.stdout:
-                output.write(line)
-                print(line, end="", flush=True)
-            process.stdout.close()
-            if process.wait():
-                raise subprocess.CalledProcessError(process.returncode, args)
 
 
 def verify_reports(paths, blacklist=None):
@@ -441,6 +371,9 @@ def prepare(reports, local=False, gluten=None):
         "runner": runner,
         "required_stages": STAGES,
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "shell_script_sha256": hashlib.sha256(
+            (ROOT / ".github/scripts/gluten_ci.sh").read_bytes()
+        ).hexdigest(),
         "discovery_script_sha256": hashlib.sha256(
             (ROOT / ".github/scripts/DiscoverGlutenSuites.java").read_bytes()
         ).hexdigest(),
@@ -536,286 +469,6 @@ def apply_gluten_patches(gluten, reports):
         print(f"Gluten compatibility patch {name}: {record['status']}", flush=True)
 
 
-def build(gluten, reports):
-    inputs = json.loads((reports / "inputs.json").read_text())
-    if platform.system() != "Linux" or platform.machine() != "x86_64":
-        raise ValueError("Native CI requires Linux x86_64")
-    if git(ROOT, "rev-parse", "HEAD") != inputs["bolt_tested_sha"] or git(
-        ROOT, "diff", "HEAD", "--"
-    ):
-        raise ValueError(f"Checkout is not the exact unmodified candidate: {ROOT}")
-    verify_gluten_source(gluten, inputs)
-    index = (
-        Path(os.environ.get("CONAN_HOME", str(Path.home() / ".conan2")))
-        / "conan-center-index"
-    )
-    if index.is_dir():
-        inputs["conan_recipe_index_sha"] = git(index, "rev-parse", "HEAD")
-        write_json(reports / "inputs.json", inputs)
-    log = reports / "build.log"
-    for command in (
-        ["java", "-version"],
-        ["c++", "--version"],
-        ["conan", "--version"],
-        ["cmake", "--version"],
-        ["conan", "profile", "show"],
-    ):
-        run(command, ROOT, log)
-    java = subprocess.run(
-        ["java", "-version"], capture_output=True, text=True, check=True
-    )
-    if not re.search(rf'version "{JDK_VERSION}[.\"]', java.stderr + java.stdout):
-        raise ValueError(f"This matrix requires JDK {JDK_VERSION}")
-    version = "ci-" + inputs["bolt_tested_sha"]
-    options = [
-        arg
-        for key, value in BOLT_OPTIONS.items()
-        for arg in ("-o", f"bolt/*:{key}={value}")
-    ]
-    overrides = " ".join(options)
-    # Some Bolt revisions have no repository overlay. Configure and package
-    # with the same host profiles so Conan resolves the same dependency graph.
-    profile = ["-pr:h", "default"]
-    overlay = ROOT / "scripts/conan/bolt.profile"
-    if overlay.is_file():
-        profile.extend(["-pr:h", str(overlay)])
-    run(
-        [
-            "make",
-            "release_spark_with_test",
-            "BOLT_CONAN_CONFIGURE_ONLY=1",
-            f"BUILD_VERSION={version}",
-            f"CONAN_OVERRIDE={overrides}",
-            f"CONAN_HOST_PROFILE_ARGS={shlex.join(profile)}",
-        ],
-        ROOT,
-        log,
-    )
-    run(
-        [
-            "cmake",
-            "--build",
-            "--preset",
-            "conan-release",
-            "--target",
-            "bolt_engine",
-            "bolt_testutils_static",
-            "--parallel",
-            os.environ.get("CI_NUM_THREADS", "16"),
-        ],
-        ROOT,
-        log,
-    )
-    profile.extend(["-s", "build_type=Release"])
-    run(
-        [
-            "conan",
-            "export-pkg",
-            ".",
-            "--name=bolt",
-            f"--version={version}",
-            *profile,
-            *options,
-            "-c",
-            "bolt/*:tools.build:skip_test=False",
-            "--format=json",
-        ],
-        ROOT,
-        log,
-        json_output=reports / "bolt-export.json",
-    )
-    env = {**os.environ, "BOLT_BUILD_VERSION": version}
-    gluten_options = [
-        arg
-        for key, value in {
-            "shared": "True",
-            "build_tests": "True",
-            "enable_hdfs": "False",
-            "enable_s3": "False",
-            "enable_asan": "False",
-        }.items()
-        for arg in ("-o", f"gluten/*:{key}={value}")
-    ]
-    common = [
-        ".",
-        "--name=gluten",
-        "--version=ci-" + inputs["gluten_sha"],
-        *profile,
-        *options,
-        *gluten_options,
-        "-c",
-        "arrow/*:tools.build:download_source=True",
-    ]
-    # Graph resolution executes no package builds. Check the local Bolt binary
-    # before installation, then verify the entire installed recipe/ABI graph.
-    # A flat Conan lock can replay ranges differently across build subgraphs
-    # (e.g. zlib 1.2.13 for Thrift and 1.3.1 for other tools). Keep the graph
-    # snapshot and use the same isolated recipe cache with updates disabled.
-    # Conan's missing-build policy can override --build=~bolt/* exclusions.
-    run(
-        [
-            "conan",
-            "graph",
-            "info",
-            *common,
-            "--build=missing",
-            "--lockfile=",
-            "--format=json",
-        ],
-        gluten / "cpp",
-        log,
-        env,
-        reports / "gluten-preflight.json",
-    )
-    exported = json.loads((reports / "bolt-export.json").read_text())
-    preflight = json.loads((reports / "gluten-preflight.json").read_text())
-    verify_package(exported, preflight)
-    run(
-        [
-            "conan",
-            "install",
-            *common,
-            "--lockfile=",
-            "--build=missing",
-            "--build=~bolt/*",
-            "--format=json",
-        ],
-        gluten / "cpp",
-        log,
-        env,
-        reports / "gluten-install.json",
-    )
-    installed = json.loads((reports / "gluten-install.json").read_text())
-    identity = verify_package(
-        json.loads((reports / "bolt-export.json").read_text()),
-        installed,
-    )
-    write_json(reports / "bolt-package.json", identity)
-    write_json(
-        reports / "conan-dependencies.json",
-        verify_dependency_graph(preflight, installed),
-    )
-    arrows = [
-        node
-        for node in installed["graph"]["nodes"].values()
-        if node.get("name") == "arrow" and node.get("context") == "host"
-    ]
-    if len(arrows) != 1 or not arrows[0]["ref"].startswith("arrow/15.0.1-oss#"):
-        raise ValueError(
-            "The Arrow Java helper requires the installed arrow/15.0.1-oss recipe"
-        )
-    arrow_ref = arrows[0]["ref"]
-    source = (
-        Path(
-            subprocess.check_output(
-                ["conan", "cache", "path", arrow_ref, "--folder=source"], text=True
-            ).strip()
-        )
-        / "src"
-    )
-    recipe = subprocess.check_output(
-        ["conan", "cache", "path", arrow_ref], text=True
-    ).strip()
-    helper_recipe = subprocess.check_output(
-        ["conan", "cache", "path", "arrow/15.0.1-oss"], text=True
-    ).strip()
-    if not source.is_dir() or recipe != helper_recipe:
-        raise ValueError(
-            "Arrow helper source cache does not match the installed recipe revision"
-        )
-    write_json(reports / "arrow-source.json", {"ref": arrow_ref, "source": str(source)})
-    run(["cmake", "--preset", "conan-release"], gluten / "cpp", log, env)
-    run(
-        [
-            "cmake",
-            "--build",
-            "--preset",
-            "conan-release",
-            "--parallel",
-            os.environ.get("CI_NUM_THREADS", "16"),
-        ],
-        gluten / "cpp",
-        log,
-        env,
-    )
-    run(["bash", "dev/build_bolt_arrow.sh"], gluten, log, env)
-    # Install this checkout's JVM/test artifacts before running each required
-    # module independently. A failing backend test must not prevent the Spark
-    # reactor from reaching its own test module or force it to rerun backend UT.
-    run(
-        runtime_command(
-            gluten,
-            [
-                *maven(gluten),
-                "install",
-                "-Pspark-ut",
-                "-pl",
-                "backends-bolt,gluten-ut/spark35",
-                "-am",
-                "-DskipTests=true",
-            ],
-        ),
-        gluten,
-        log,
-        env,
-    )
-    native = gluten / "cpp/build/releases"
-    packaged = gluten / "cpp/build/package/bolt/linux/amd64"
-    for name in ("libgluten.so", "libbolt_backend.so", "libglutenlibloader.so"):
-        source = native / name
-        if not source.is_file() or not (packaged / name).is_file():
-            raise ValueError(f"Required native library is missing: {source}")
-        if source.read_bytes() != (packaged / name).read_bytes():
-            raise ValueError(
-                f"Gluten native staging contains a different library: {name}"
-            )
-    write_json(
-        reports / "native-libraries.json",
-        {
-            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in packaged.glob("*.so")
-        },
-    )
-
-
-def runtime_command(gluten, command):
-    activation = gluten / "cpp/build/Release/generators/conanrun.sh"
-    if not activation.is_file():
-        raise ValueError(
-            "Missing Conan runtime activation; native dependency closure is unavailable"
-        )
-    return [
-        "bash",
-        "-c",
-        'source "$1" && shift && exec "$@"',
-        "gluten-ci",
-        str(activation),
-        *command,
-    ]
-
-
-def maven(gluten, spark=SPARK_PROFILE):
-    return [
-        str(gluten / "build/mvn"),
-        "-ntp",
-        "-Pbackends-bolt",
-        "-Pdelta",
-        f"-Pspark-{spark}",
-        f"-Pjava-{JDK_VERSION}",
-        "-DskipTests=false",
-        "-Dmaven.test.skip=false",
-        "-Dmaven.test.failure.ignore=false",
-        "-DfailIfNoTests=false",
-    ]
-
-
-def spark_test_home(home):
-    # local-cluster executors also use this property to locate Spark JARs.
-    # Keep the runtime distribution, even when its SQL resources are linked
-    # from a separate source tree.
-    return home.resolve()
-
-
 def java_executable(env):
     java_home = env.get("JAVA_HOME")
     java = (
@@ -865,15 +518,6 @@ def verify_scalatest_exit(forks, expected_failures):
     expected = 1 if expected_failures else 0
     if type(code) is not int or code != expected:
         raise ValueError(f"ScalaTest fork exit {code!r} does not match test results")
-
-
-def spark_environment(home, env):
-    validate_spark_home(home)
-    zips = sorted((home / "python/lib").glob("*.zip"))
-    pythonpath = os.pathsep.join(str(path) for path in zips)
-    if env.get("PYTHONPATH"):
-        pythonpath += os.pathsep + env["PYTHONPATH"]
-    return {**env, "SPARK_HOME": str(home), "PYTHONPATH": pythonpath}
 
 
 def gluten_package_jars(directory):
@@ -975,353 +619,6 @@ def snapshot_blacklist(reports):
     return entries
 
 
-@contextmanager
-def stage_lock(gluten, stage):
-    """Reject concurrent stages that would overwrite the same test reports."""
-    module = (
-        "backends-bolt"
-        if stage == "jvm"
-        else "native"
-        if stage == "native"
-        else "gluten-it"
-        if stage.startswith("tpc-")
-        else "spark-ut"
-    )
-    lock = gluten / ".ci" / f"gluten-bolt-{module}.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    with ExitStack() as stack:
-        if stage != "native":
-            profile = stack.enter_context(
-                (gluten / ".ci/gluten-bolt-profile.lock").open("a")
-            )
-            mode = fcntl.LOCK_EX if stage in SPARK4_PROFILES else fcntl.LOCK_SH
-            try:
-                fcntl.flock(profile, mode | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise ValueError(
-                    "Another Java stage or profile change is already running"
-                ) from error
-        handle = stack.enter_context(lock.open("a"))
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise ValueError(f"Another {module} stage is already running") from error
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-
-
-def test_stage(stage, gluten, reports):
-    with stage_lock(gluten, stage):
-        return run_test_stage(stage, gluten, reports)
-
-
-def run_test_stage(stage, gluten, reports):
-    log = reports / f"{stage}.log"
-    if log.exists():
-        log.unlink()
-    output = reports / stage
-    output.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "SPARK_TESTING": "true", "SPARK_SCALA_VERSION": SCALA_VERSION}
-    if stage in SPARK4_PROFILES:
-        return run_spark4_stage(stage, gluten, reports, output, env)
-    if stage == "native":
-        for library in (gluten / "cpp/build/releases").glob("*.so"):
-            run(runtime_command(gluten, ["ldd", str(library)]), gluten, log, env)
-        if "not found" in log.read_text():
-            raise ValueError("Native library runtime dependencies are missing")
-        xml = output / "TEST-native.xml"
-        run(
-            runtime_command(
-                gluten,
-                [
-                    "ctest",
-                    "--test-dir",
-                    str(gluten / "cpp/build/Release"),
-                    "--no-tests=error",
-                    "--output-on-failure",
-                    "--output-junit",
-                    str(xml),
-                    "--timeout",
-                    "7200",
-                    "-j",
-                    os.environ.get("CI_NUM_THREADS", "16"),
-                ],
-            ),
-            gluten,
-            log,
-            env,
-        )
-        return verify_reports([xml])
-    if stage.startswith("tpc-"):
-        if stage == "tpc-h":
-            run(
-                runtime_command(
-                    gluten, [*maven(gluten), "install", "-DskipTests=true"]
-                ),
-                gluten,
-                log,
-                env,
-            )
-            verify_jar(gluten, reports)
-            run(
-                runtime_command(
-                    gluten,
-                    [
-                        str(gluten / "build/mvn"),
-                        "-ntp",
-                        "install",
-                        f"-Pspark-{SPARK_PROFILE}",
-                        f"-Pjava-{JDK_VERSION}",
-                    ],
-                ),
-                gluten / "tools/gluten-it",
-                log,
-                env,
-            )
-        candidate_jar = verify_jar(gluten, reports)
-        runtime_jars = gluten_package_jars(
-            gluten / "tools/gluten-it/package/target/lib"
-        )
-        if (
-            len(runtime_jars) != 1
-            or runtime_jars[0].read_bytes() != candidate_jar.read_bytes()
-        ):
-            raise ValueError(
-                "TPC runtime classpath does not contain the current candidate Gluten package"
-            )
-        kind = "h" if stage == "tpc-h" else "ds"
-        resources = (
-            gluten / f"tools/gluten-it/common/src/main/resources/tpc{kind}-queries"
-        )
-        queries = {path.stem for path in resources.glob("*.sql")}
-        if not queries:
-            raise ValueError("TPC query resources are missing")
-        run(
-            runtime_command(
-                gluten,
-                [
-                    "bash",
-                    "sbin/gluten-it.sh",
-                    "queries-compare",
-                    "--local",
-                    "--preset=velox",
-                    "--baseline-preset=vanilla",
-                    f"--benchmark-type={kind}",
-                    "--error-on-memleak",
-                    "--explain",
-                    "--off-heap-size=10g",
-                    "-s=1.0",
-                    "--threads=16",
-                    "--iterations=1",
-                ],
-            ),
-            gluten / "tools/gluten-it",
-            log,
-            {**env, "GLUTEN_IT_JVM_ARGS": "-Xmx6G"},
-        )
-        return verify_tpc(log.read_text(), queries)
-    # Separate report directories prevent earlier runs from satisfying discovery.
-    spark_home = Path(
-        os.environ.get("BOLT_GLUTEN_SPARK_HOME", "/opt/shims/spark35/spark_home")
-    )
-    env = spark_environment(spark_home, env)
-    command = [
-        *maven(gluten),
-        "test",
-        f"-DargLine=-Dspark.test.home={spark_test_home(spark_home)}",
-    ]
-    if stage == "jvm":
-        command += ["-pl", "backends-bolt", f"-DtagsToExclude={EXCLUDED_TAGS}"]
-        env.pop("GLUTEN_TEST_BLACKLIST", None)
-        env["GLUTEN_TEST_ENABLE_SLOW_HIVE"] = "false"
-        return run_backend_groups(gluten, reports, command, env)
-    else:
-        command += ["-Pspark-ut", "-pl", "gluten-ut/spark35"]
-        if stage.startswith("spark-"):
-            command += [
-                f"-DwildcardSuites={SPARK_GROUPS[int(stage[-1]) - 1]}",
-                "-DtagsToExclude=org.apache.spark.tags.ExtendedSQLTest,"
-                "org.apache.spark.tags.SlowHiveTest," + EXCLUDED_TAGS,
-            ]
-        else:
-            tag = "ExtendedSQLTest" if stage == "extended" else "SlowHiveTest"
-            command += [
-                f"-DtagsToInclude=org.apache.spark.tags.{tag}",
-                f"-DtagsToExclude={EXCLUDED_TAGS}",
-            ]
-        report_roots = [gluten / "gluten-ut/spark35"]
-    entries = snapshot_blacklist(reports)
-    forks = output / "forks"
-    command.append(f"-Djvm={scalatest_jvm(forks)}")
-    # Execute the tests, then classify exact expected failures in Bolt. Never
-    # activate the former Gluten registration-time ignore hook through the host.
-    env.pop("GLUTEN_TEST_BLACKLIST", None)
-    command = [
-        "-Dmaven.test.failure.ignore=true"
-        if arg == "-Dmaven.test.failure.ignore=false"
-        else arg
-        for arg in command
-    ]
-    env["GLUTEN_TEST_ENABLE_SLOW_HIVE"] = "true" if stage == "slow-hive" else "false"
-    # ScalaTest can override reportsDirectory; remove stale XML in target modules,
-    # then preserve each stage's XML immediately before the next invocation.
-    for root in report_roots:
-        for path in root.glob("target/*reports/TEST-*.xml"):
-            path.unlink()
-    paths = []
-    try:
-        run(runtime_command(gluten, command), gluten, log, env)
-    finally:
-        for root in report_roots:
-            for path in root.glob("target/*reports/TEST-*.xml"):
-                target = output / (root.name + "-" + path.name)
-                shutil.copy2(path, target)
-                paths.append(target)
-    evidence = verify_reports(paths, blacklist=entries)
-    verify_scalatest_run(log.read_text(), paths)
-    verify_scalatest_exit(forks, evidence["expected_failures"])
-    write_json(reports / f"blacklist-{stage}.json", evidence)
-    return evidence
-
-
-def discover_backend_suites(gluten, output, env):
-    module = gluten / "backends-bolt"
-    classes = module / f"target/scala-{SCALA_VERSION}/test-classes"
-    main_classes = module / f"target/scala-{SCALA_VERSION}/classes"
-    dependencies = output / "test-classpath.txt"
-    names = output / "discovered-suites.txt"
-    log = output / "discovery.log"
-    for path in (dependencies, names, log):
-        if path.exists():
-            path.unlink()
-    run(
-        runtime_command(
-            gluten,
-            [*maven(gluten), "test-compile", "-pl", "backends-bolt"],
-        ),
-        gluten,
-        log,
-        env,
-    )
-    if not classes.is_dir() or not main_classes.is_dir():
-        raise ValueError("Backend test compilation produced no class directories")
-    run(
-        runtime_command(
-            gluten,
-            [
-                *maven(gluten),
-                "dependency:build-classpath",
-                "-pl",
-                "backends-bolt",
-                "-DincludeScope=test",
-                f"-Dmdep.outputFile={dependencies.resolve()}",
-            ],
-        ),
-        gluten,
-        log,
-        env,
-    )
-    classpath = os.pathsep.join(
-        [str(classes), str(main_classes), dependencies.read_text().strip()]
-    )
-    run(
-        [
-            java_executable(env),
-            "--class-path",
-            classpath,
-            str(ROOT / ".github/scripts/DiscoverGlutenSuites.java"),
-            str(names),
-            str(classes),
-            str(main_classes),
-        ],
-        gluten,
-        log,
-        env,
-    )
-    suites = names.read_text().splitlines()
-    if (
-        not suites
-        or len(suites) != len(set(suites))
-        or any(
-            not re.fullmatch(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+", name)
-            for name in suites
-        )
-    ):
-        raise ValueError("Invalid or empty backend suite discovery")
-    return suites
-
-
-def run_backend_groups(gluten, reports, command, env):
-    output = reports / "jvm"
-    entries = snapshot_blacklist(reports)
-    suites = discover_backend_suites(gluten, output, env)
-    delta = [name for name in suites if name.startswith("org.apache.spark.sql.delta.")]
-    ordinary = [name for name in suites if name not in delta]
-    if not ordinary:
-        raise ValueError("No ordinary backend ScalaTest suites discovered")
-    groups = [("backend", ordinary)] + [(name, [name]) for name in delta]
-    write_json(output / "suite-groups.json", dict(groups))
-    module = gluten / "backends-bolt"
-    results = {"tests": 0, "skipped": 0, "expected_failures": [], "groups": {}}
-    errors = []
-    for number, (name, selected) in enumerate(groups):
-        group = output / str(number)
-        group.mkdir(exist_ok=True)
-        log = group / "run.log"
-        if log.exists():
-            log.unlink()
-        forks = group / "forks"
-        args = [
-            "scalatest:test" if number and arg == "test" else arg for arg in command
-        ]
-        args = [
-            "-Dmaven.test.failure.ignore=true"
-            if arg == "-Dmaven.test.failure.ignore=false"
-            else arg
-            for arg in args
-        ]
-        args += [f"-Dsuites={','.join(selected)}", f"-Djvm={scalatest_jvm(forks)}"]
-        for path in module.glob("target/*reports/TEST-*.xml"):
-            path.unlink()
-        paths = []
-        try:
-            try:
-                run(runtime_command(gluten, args), gluten, log, env)
-            finally:
-                for path in module.glob("target/*reports/TEST-*.xml"):
-                    target = group / path.name
-                    shutil.copy2(path, target)
-                    paths.append(target)
-            reported = {
-                suite.get("name")
-                for path in paths
-                for suite in ET.parse(path).getroot().iter("testsuite")
-            }
-            if not set(selected).issubset(reported):
-                raise ValueError("Missing discovered backend suite reports")
-            evidence = verify_reports(paths, blacklist=entries)
-            verify_scalatest_run(log.read_text(), paths)
-            verify_scalatest_exit(forks, evidence["expected_failures"])
-            results["groups"][name] = {"result": "success", **evidence}
-            for key in ("tests", "skipped"):
-                results[key] += evidence[key]
-            results["expected_failures"].extend(evidence["expected_failures"])
-        except (
-            ValueError,
-            OSError,
-            subprocess.CalledProcessError,
-            ET.ParseError,
-        ) as error:
-            errors.append(f"{name}: {error}")
-            results["groups"][name] = {"result": "failure", "error": str(error)}
-        write_json(reports / "blacklist-jvm.json", results)
-    if errors:
-        raise ValueError("Backend test groups failed: " + "; ".join(errors))
-    return results
-
-
 def verify_spark4_native(gluten, reports):
     expected = json.loads((reports / "native-libraries.json").read_text())
     classes = gluten / "backends-bolt/target/scala-2.13/classes"
@@ -1336,102 +633,6 @@ def verify_spark4_native(gluten, reports):
             )
 
 
-def run_spark4_stage(stage, gluten, reports, output, env):
-    profile = SPARK4_PROFILES[stage]
-    env = {**env, "SPARK_SCALA_VERSION": "2.13"}
-    env.pop("GLUTEN_TEST_BLACKLIST", None)
-    command = [
-        *maven(gluten, profile),
-        "-Pscala-2.13",
-        "-Pspark-ut",
-        f"-Dmaven.compiler.release={JDK_VERSION}",
-    ]
-    run(
-        runtime_command(
-            gluten,
-            [
-                *command,
-                "clean",
-                "install",
-                "-pl",
-                f"backends-bolt,gluten-ut/{stage}",
-                "-am",
-                "-DskipTests=true",
-            ],
-        ),
-        gluten,
-        reports / f"{stage}-compile.log",
-        env,
-    )
-    verify_spark4_native(gluten, reports)
-    results = {}
-    for name, module, suites, argline in (
-        (
-            "backend",
-            "backends-bolt",
-            "org.apache.gluten.execution.BoltParquetDataTypeValidationSuite,org.apache.gluten.execution.BoltOrcDataTypeValidationSuite",
-            "-Dspark.sql.ansi.enabled=false",
-        ),
-        ("ut", f"gluten-ut/{stage}", SPARK4_SUITES, ""),
-    ):
-        directory = output / name
-        directory.mkdir(parents=True, exist_ok=True)
-        module_root = gluten / module
-        for path in module_root.glob("target/*reports/TEST-*.xml"):
-            path.unlink()
-        log = reports / f"{stage}-{name}.log"
-        if log.exists():
-            log.unlink()
-        forks = directory / "forks"
-        invocation = [
-            *command,
-            "test",
-            "-pl",
-            module,
-            f"-Dsuites={suites}",
-            f"-Djvm={scalatest_jvm(forks)}",
-        ]
-        if argline:
-            invocation.append(f"-DargLine={argline}")
-        paths = []
-        try:
-            run(runtime_command(gluten, invocation), gluten, log, env)
-        finally:
-            for path in module_root.glob("target/*reports/TEST-*.xml"):
-                target = directory / path.name
-                shutil.copy2(path, target)
-                paths.append(target)
-        # Spark 4 coverage is intentionally strict; Spark 3.5's temporary
-        # blacklist must not turn a new-version incompatibility into success.
-        results[name] = verify_reports(paths)
-        verify_scalatest_run(log.read_text(), paths)
-        verify_scalatest_exit(forks, [])
-    write_json(reports / f"{stage}-results.json", results)
-    return results
-
-
-def test_all(gluten, reports):
-    results = {}
-    for stage in STAGES:
-        try:
-            evidence = test_stage(stage, gluten, reports)
-            results[stage] = {"result": "success", **evidence}
-        except (
-            ValueError,
-            OSError,
-            KeyError,
-            subprocess.CalledProcessError,
-            ET.ParseError,
-        ) as error:
-            results[stage] = {"result": "failure", "error": str(error)}
-            print(f"::error::{stage}: {error}", flush=True)
-        write_json(reports / "results.json", results)
-    if any(result["result"] != "success" for result in results.values()):
-        raise ValueError(
-            "Required Gluten backend tests failed; see results.json and stage logs"
-        )
-
-
 def gate():
     needs = json.loads(os.environ["GLUTEN_CI_NEEDS"])
     for job in ("prepare", "compatibility", "integration"):
@@ -1440,21 +641,219 @@ def gate():
     print("All required Gluten Bolt integration jobs succeeded")
 
 
+def validate_spark_home(home):
+    release = home / "RELEASE"
+    if release.is_file():
+        version_matches = bool(
+            re.search(rf"\bSpark {re.escape(SPARK_VERSION)}\b", release.read_text())
+        )
+    else:
+        try:
+            with zipfile.ZipFile(home / "python/lib/pyspark.zip") as archive:
+                version_matches = bool(
+                    re.search(
+                        rf"__version__(?:\s*:\s*str)?\s*=\s*['\"]{re.escape(SPARK_VERSION)}['\"]",
+                        archive.read("pyspark/version.py").decode(),
+                    )
+                )
+        except (OSError, KeyError, zipfile.BadZipFile):
+            version_matches = False
+    if (
+        not version_matches
+        or not os.access(home / "bin/spark-submit", os.X_OK)
+        or not (home / f"jars/spark-core_{SCALA_VERSION}-{SPARK_VERSION}.jar").is_file()
+        or not (home / "python/lib/pyspark.zip").is_file()
+        or not list((home / "python/lib").glob("py4j-*-src.zip"))
+    ):
+        raise ValueError(f"Spark {SPARK_VERSION} binary distribution is incomplete")
+    inputs = home / "sql/core/src/test/resources/sql-tests/inputs"
+    if not inputs.is_dir() or not any(inputs.iterdir()):
+        raise ValueError("Matching Spark SQL test resources are missing")
+
+
+def configuration(reports):
+    values = {
+        "SPARK_VERSION": SPARK_VERSION,
+        "SPARK_PROFILE": SPARK_PROFILE,
+        "SCALA_VERSION": SCALA_VERSION,
+        "JDK_VERSION": JDK_VERSION,
+    }
+    if (reports / "inputs.json").is_file():
+        inputs = json.loads((reports / "inputs.json").read_text())
+        for name, key in (
+            ("BOLT_BUILD_VERSION", "bolt_tested_sha"),
+            ("GLUTEN_BUILD_VERSION", "gluten_sha"),
+        ):
+            if not SHA.fullmatch(inputs[key]):
+                raise ValueError(f"Invalid source identity: {key}")
+            values[name] = "ci-" + inputs[key]
+    print("\n".join(f"{key}={shlex.quote(value)}" for key, value in values.items()))
+
+
+def verify_candidate(gluten, reports):
+    inputs = json.loads((reports / "inputs.json").read_text())
+    if git(ROOT, "rev-parse", "HEAD") != inputs["bolt_tested_sha"] or git(
+        ROOT, "diff", "HEAD", "--"
+    ):
+        raise ValueError("Bolt checkout differs from the unmodified candidate")
+    verify_gluten_source(gluten, inputs)
+    index = (
+        Path(os.environ.get("CONAN_HOME", str(Path.home() / ".conan2")))
+        / "conan-center-index"
+    )
+    if index.is_dir():
+        inputs["conan_recipe_index_sha"] = git(index, "rev-parse", "HEAD")
+        write_json(reports / "inputs.json", inputs)
+
+
+def verify_arrow_source(reports):
+    installed = json.loads((reports / "gluten-install.json").read_text())
+    arrows = [
+        node
+        for node in installed["graph"]["nodes"].values()
+        if node.get("name") == "arrow" and node.get("context") == "host"
+    ]
+    if len(arrows) != 1 or not arrows[0]["ref"].startswith("arrow/15.0.1-oss#"):
+        raise ValueError("The Arrow Java helper requires arrow/15.0.1-oss")
+    ref = arrows[0]["ref"]
+    source = (
+        Path(
+            subprocess.check_output(
+                ["conan", "cache", "path", ref, "--folder=source"], text=True
+            ).strip()
+        )
+        / "src"
+    )
+    recipe = subprocess.check_output(["conan", "cache", "path", ref], text=True).strip()
+    helper = subprocess.check_output(
+        ["conan", "cache", "path", "arrow/15.0.1-oss"], text=True
+    ).strip()
+    if not source.is_dir() or recipe != helper:
+        raise ValueError("Arrow helper source does not match the installed recipe")
+    write_json(reports / "arrow-source.json", {"ref": ref, "source": str(source)})
+
+
+def verify_native(gluten, reports):
+    native = gluten / "cpp/build/releases"
+    packaged = gluten / "cpp/build/package/bolt/linux/amd64"
+    for name in ("libgluten.so", "libbolt_backend.so", "libglutenlibloader.so"):
+        if not (native / name).is_file() or not (packaged / name).is_file():
+            raise ValueError(f"Missing native library: {name}")
+        if (native / name).read_bytes() != (packaged / name).read_bytes():
+            raise ValueError(f"Native staging contains a different library: {name}")
+    write_json(
+        reports / "native-libraries.json",
+        {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in packaged.glob("*.so")
+        },
+    )
+
+
+def verify_stage(args, gluten, reports):
+    output = reports / args.stage
+    if args.group:
+        output /= args.group
+    log = output / "run.log"
+    if args.stage.startswith("tpc-"):
+        kind = "h" if args.stage == "tpc-h" else "ds"
+        queries = {
+            p.stem
+            for p in (
+                gluten / f"tools/gluten-it/common/src/main/resources/tpc{kind}-queries"
+            ).glob("*.sql")
+        }
+        if not queries:
+            raise ValueError("TPC query resources are missing")
+        evidence = verify_tpc(log.read_text(), queries)
+    else:
+        paths = sorted(output.glob("*TEST-*.xml"))
+        blacklist = (
+            None
+            if args.stage in ("native", "spark40", "spark41")
+            else snapshot_blacklist(reports)
+        )
+        evidence = verify_reports(paths, blacklist)
+        if args.suites:
+            selected = set(args.suites.split(","))
+            reported = {
+                suite.get("name")
+                for path in paths
+                for suite in ET.parse(path).getroot().iter("testsuite")
+            }
+            if not selected.issubset(reported):
+                raise ValueError("Missing discovered backend suite reports")
+        if args.stage != "native":
+            verify_scalatest_run(log.read_text(), paths)
+            verify_scalatest_exit(
+                output / "forks", evidence.get("expected_failures", [])
+            )
+    record_stage(reports, args.stage, {"result": "success", **evidence}, args.group)
+
+
+def record_stage(reports, stage, evidence, group=""):
+    path = reports / "results.json"
+    results = json.loads(path.read_text()) if path.is_file() else {}
+    if group:
+        groups = results.get(stage, {}).get("groups", {})
+        groups[group] = evidence
+        evidence = {
+            "groups": groups,
+            "result": "success"
+            if all(g["result"] == "success" for g in groups.values())
+            else "failure",
+            "tests": sum(g.get("tests", 0) for g in groups.values()),
+            "skipped": sum(g.get("skipped", 0) for g in groups.values()),
+            "expected_failures": sorted(
+                f for g in groups.values() for f in g.get("expected_failures", [])
+            ),
+        }
+        evidence["passed"] = (
+            evidence["tests"] - evidence["skipped"] - len(evidence["expected_failures"])
+        )
+    results[stage] = evidence
+    write_json(path, results)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=("prepare", "patch", "build", "test", "gate")
+        "command",
+        choices=(
+            "prepare",
+            "patch",
+            "config",
+            "source",
+            "package",
+            "arrow",
+            "native",
+            "spark4-native",
+            "spark-home",
+            "jar",
+            "runner",
+            "verify",
+            "failed",
+            "reset",
+            "gate",
+        ),
     )
-    parser.add_argument(
-        "--local",
-        action="store_true",
-        help="Prepare on the local host without an image (unavailable in Actions)",
-    )
+    parser.add_argument("stage", nargs="?", choices=STAGES)
+    parser.add_argument("--local", action="store_true")
     parser.add_argument("--gluten-dir", type=Path, default=ROOT / "gluten")
     parser.add_argument("--reports-dir", type=Path, default=ROOT / ".ci/gluten-bolt")
+    parser.add_argument("--consumed", type=Path)
+    parser.add_argument("--graph", type=Path)
+    parser.add_argument("--directory", type=Path)
+    parser.add_argument("--group", default="")
+    parser.add_argument("--suites", default="")
+    parser.add_argument("--tpc", action="store_true")
     args = parser.parse_args()
     if args.local and args.command != "prepare":
         parser.error("--local applies only to prepare")
+    if args.command in ("verify", "failed", "reset") and not args.stage:
+        parser.error("A test stage is required")
+    if args.group and not re.fullmatch(r"[\w.$-]+", args.group):
+        parser.error("Invalid report group")
     reports, gluten = args.reports_dir.resolve(), args.gluten_dir.resolve()
     reports.mkdir(parents=True, exist_ok=True)
     try:
@@ -1462,10 +861,56 @@ def main():
             prepare(reports, local=args.local, gluten=gluten if args.local else None)
         elif args.command == "patch":
             apply_gluten_patches(gluten, reports)
-        elif args.command == "build":
-            build(gluten, reports)
-        elif args.command == "test":
-            test_all(gluten, reports)
+        elif args.command == "config":
+            configuration(reports)
+        elif args.command == "source":
+            verify_candidate(gluten, reports)
+        elif args.command == "package":
+            if args.consumed is None:
+                parser.error("--consumed is required")
+            actual = json.loads(args.consumed.read_text())
+            identity = verify_package(
+                json.loads((reports / "bolt-export.json").read_text()), actual
+            )
+            write_json(reports / "bolt-package.json", identity)
+            if args.graph:
+                write_json(
+                    reports / "conan-dependencies.json",
+                    verify_dependency_graph(json.loads(args.graph.read_text()), actual),
+                )
+        elif args.command == "arrow":
+            verify_arrow_source(reports)
+        elif args.command == "native":
+            verify_native(gluten, reports)
+        elif args.command == "spark4-native":
+            verify_spark4_native(gluten, reports)
+        elif args.command == "spark-home":
+            if args.directory is None:
+                parser.error("--directory is required")
+            validate_spark_home(args.directory)
+        elif args.command == "jar":
+            candidate = verify_jar(gluten, reports)
+            if args.tpc:
+                jars = gluten_package_jars(
+                    gluten / "tools/gluten-it/package/target/lib"
+                )
+                if len(jars) != 1 or jars[0].read_bytes() != candidate.read_bytes():
+                    raise ValueError(
+                        "TPC runtime does not contain the candidate Gluten package"
+                    )
+        elif args.command == "runner":
+            if args.directory is None:
+                parser.error("--directory is required")
+            print(scalatest_jvm(args.directory))
+        elif args.command == "verify":
+            verify_stage(args, gluten, reports)
+        elif args.command == "reset":
+            path = reports / "results.json"
+            results = json.loads(path.read_text()) if path.is_file() else {}
+            results.pop(args.stage, None)
+            write_json(path, results)
+        elif args.command == "failed":
+            raise ValueError("Test command exited unsuccessfully; see the stage log")
         else:
             gate()
     except (
@@ -1476,6 +921,13 @@ def main():
         ET.ParseError,
     ) as error:
         write_json(reports / f"{args.command}-error.json", {"error": str(error)})
+        if args.stage:
+            record_stage(
+                reports,
+                args.stage,
+                {"result": "failure", "error": str(error)},
+                args.group,
+            )
         print(f"::error::{error}", file=sys.stderr)
         return 1
     return 0
