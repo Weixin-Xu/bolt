@@ -15,8 +15,9 @@ runs:
           --compiler clang \
           --libcxx libstdc++11 \
           --linker mold \
-          --lto none  && \
-        echo "core.download:parallel=1" >> ~/.conan2/global.conf
+          --extra-link-flags=-Wl,--allow-multiple-definition \
+          --lto none
+        echo "core.download:parallel=1" >> "$(conan config home)/global.conf"
 
     - name: Add CI conan remote
       shell: bash

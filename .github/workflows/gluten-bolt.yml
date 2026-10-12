@@ -187,24 +187,28 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Configure Conan and Bolt dependencies
+        uses: ./.github/actions/bolt-build-base
       - name: Provision Gluten Spark test environment
         run: |
           source .github/scripts/gluten_ci.sh
           ci_init
-          ci_environment
-      - name: Configure Conan and Bolt dependencies
-        run: |
-          conan profile detect
-          profile_path="$(conan profile path default)"
-          cat >> "$profile_path" <<'EOF'
-
-          [conf]
-          tools.build:exelinkflags=['-fuse-ld=mold', '-Wl,--allow-multiple-definition']
-          tools.build:sharedlinkflags=['-fuse-ld=mold', '-Wl,--allow-multiple-definition']
-          EOF
-          echo 'core.download:parallel=1' >> "${CONAN_HOME}/global.conf"
-          conan remote add --index=0 ci http://conanserver:9300
-          ./scripts/install-bolt-deps.sh
+          python3 -m pip install --disable-pip-version-check \
+            setuptools==77.0.3 Cython==3.3.0 numpy==1.26.4 \
+            "pyspark==${SPARK_VERSION}" pandas==2.2.3 pyarrow==20.0.0
+          command -v shasum
+          resources="${BOLT_ROOT}/.ci/spark35"
+          bash "${GLUTEN_DIR}/.github/workflows/util/install-spark-resources.sh" \
+            "${SPARK_PROFILE}" "${resources}"
+          export BOLT_GLUTEN_SPARK_HOME="${resources}/shims/spark35/spark_home"
+          # Gluten keeps jars in the source assembly layout; Spark's launchers
+          # also need the binary distribution layout.
+          ln -s "assembly/target/scala-${SCALA_VERSION}/jars" \
+            "${BOLT_GLUTEN_SPARK_HOME}/jars"
+          ci_spark_environment
+          printf 'BOLT_GLUTEN_SPARK_HOME=%s\nSPARK_HOME=%s\nPYTHONPATH=%s\nPYSPARK_PYTHON=%s\n' \
+            "${BOLT_GLUTEN_SPARK_HOME}" "${SPARK_HOME}" "${PYTHONPATH}" \
+            "$(command -v python3)" >> "${GITHUB_ENV}"
       - name: Build and export the candidate Bolt package and Gluten native backend
         id: build
         run: |
