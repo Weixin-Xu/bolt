@@ -1,0 +1,27 @@
+diff --git a/cpp/bolt.CMakeLists.cmake b/cpp/bolt.CMakeLists.cmake
+index d4ee2eef1d..b8ff46f0ad 100644
+--- a/cpp/bolt.CMakeLists.cmake
++++ b/cpp/bolt.CMakeLists.cmake
+@@ -135,7 +135,7 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+   add_compile_definitions(_GNU_SOURCE)
+ endif()
+
+-if(NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
++if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-class-memaccess")
+ endif()
+
+diff --git a/cpp/bolt/CMakeLists.txt b/cpp/bolt/CMakeLists.txt
+index 14b71e4744..f17faa52be 100644
+--- a/cpp/bolt/CMakeLists.txt
++++ b/cpp/bolt/CMakeLists.txt
+@@ -66,8 +66,8 @@ endif()
+
+ set(CMAKE_CXX_FLAGS
+     "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations -Wno-attributes")
+-if(NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
++if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-class-memaccess")
+ endif()
+
+ message("Bolt module final CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")
