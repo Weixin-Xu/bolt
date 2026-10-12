@@ -169,7 +169,7 @@ repository Actions variables use these defaults:
 
 | Optional variable | Default |
 | --- | --- |
-| `BOLT_GLUTEN_CI_IMAGE` | `bolt-registry:5000/bolt-ci:20260114` |
+| `BOLT_GLUTEN_CI_IMAGE` | `bolt-registry:5000/bolt-ci:20260921` |
 | `BOLT_GLUTEN_CI_CONAN_IMAGE` | `bolt-registry:5000/conan-server:latest` |
 | `BOLT_GLUTEN_CI_RUNNER` | `["self-hosted", "medium"]` |
 
@@ -197,15 +197,10 @@ export JAVA_HOME=/path/to/jdk17
 export PATH="$JAVA_HOME/bin:$PATH"
 export BOLT_GLUTEN_SPARK_HOME=/path/to/spark-3.5.5
 export CONAN_HOME="$PWD/.ci/conan"
-conan profile detect
-profile_path="$(conan profile path default)"
-cat >> "$profile_path" <<'EOF'
-
-[conf]
-tools.build:exelinkflags=['-fuse-ld=mold', '-Wl,--allow-multiple-definition']
-tools.build:sharedlinkflags=['-fuse-ld=mold', '-Wl,--allow-multiple-definition']
-EOF
 ./scripts/install-bolt-deps.sh
+python3 scripts/configure-conan-profile.py \
+  --compiler clang --libcxx libstdc++11 --linker mold --lto none \
+  --extra-link-flags=-Wl,--allow-multiple-definition
 source .github/scripts/gluten_ci.sh
 ci_apply_patches
 ci_init
