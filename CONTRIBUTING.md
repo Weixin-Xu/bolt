@@ -199,8 +199,7 @@ export BOLT_GLUTEN_SPARK_HOME=/path/to/spark-3.5.5
 export CONAN_HOME="$PWD/.ci/conan"
 ./scripts/install-bolt-deps.sh
 python3 scripts/configure-conan-profile.py \
-  --compiler clang --libcxx libstdc++11 --linker mold --lto none \
-  --extra-link-flags=-Wl,--allow-multiple-definition
+  --compiler clang --libcxx libstdc++11 --linker mold --lto none
 source .github/scripts/gluten_ci.sh
 ci_apply_patches
 ci_init
