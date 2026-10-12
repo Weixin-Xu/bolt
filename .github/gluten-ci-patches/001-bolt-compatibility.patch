@@ -40,3 +40,46 @@ index 14b71e4744..f17faa52be 100644
  endif()
 
  message("Bolt module final CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")
+diff --git a/cpp/bolt/compute/BoltRuntime.h b/cpp/bolt/compute/BoltRuntime.h
+index 8276ccce34..40d3f0aa0e 100644
+--- a/cpp/bolt/compute/BoltRuntime.h
++++ b/cpp/bolt/compute/BoltRuntime.h
+@@ -117,6 +117,9 @@ class BoltRuntime final : public Runtime {
+       std::vector<bytedance::bolt::core::PlanNodeId>& scanIds,
+       std::vector<bytedance::bolt::core::PlanNodeId>& streamIds);
+
++  using Runtime::createShuffleReader;
++  using Runtime::createShuffleWriter;
++
+   std::shared_ptr<ShuffleWriterBase> createShuffleWriter(
+       const ShuffleWriterInfo& info,
+       std::shared_ptr<RssClient> rssClient,
+diff --git a/cpp/bolt/jni/BoltJniWrapper.cc b/cpp/bolt/jni/BoltJniWrapper.cc
+index 7fcabb65c4..a17a6bd383 100644
+--- a/cpp/bolt/jni/BoltJniWrapper.cc
++++ b/cpp/bolt/jni/BoltJniWrapper.cc
+@@ -479,9 +479,8 @@ static inline std::vector<std::string> FromByteArrToStringVector(JNIEnv* env, jo
+   for (int i = 0; i < length; i++) {
+     jbyteArray byte_array = reinterpret_cast<jbyteArray>(env->GetObjectArrayElement(str_array, i));
+     int bytes_len = env->GetArrayLength(byte_array);
+-    signed char array[bytes_len];
+-    env->GetByteArrayRegion(byte_array, 0, bytes_len, array);
+-    std::string j_string(reinterpret_cast<char*>(array), sizeof(array));
++    std::string j_string(bytes_len, '\0');
++    env->GetByteArrayRegion(byte_array, 0, bytes_len, reinterpret_cast<jbyte*>(j_string.data()));
+     vector.push_back(j_string);
+   }
+   return vector;
+diff --git a/cpp/bolt/tests/MemoryManagerTest.cc b/cpp/bolt/tests/MemoryManagerTest.cc
+index 860e95e9e7..cf899aaac4 100644
+--- a/cpp/bolt/tests/MemoryManagerTest.cc
++++ b/cpp/bolt/tests/MemoryManagerTest.cc
+@@ -376,7 +376,7 @@ TEST_F(MultiMemoryManagerTest, spill) {
+         pool->setReclaimer(std::make_unique<MockMemoryReclaimer>(buffs[i], allocateSize));
+         listener->set(tmm.newListener(
+             [](uint64_t bytes) -> uint64_t { return 0; },
+-            [i, &vmms, &mutex, &pool](uint64_t bytes) -> uint64_t {
++            [i, &vmms, &mutex](uint64_t bytes) -> uint64_t {
+               std::unique_lock<std::recursive_mutex> l(mutex);
+               return vmms[i]->getMemoryManager()->arbitrator()->shrinkCapacity(bytes, true);
+             }));
