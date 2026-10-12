@@ -120,9 +120,23 @@ ci_maven_test() (
   rm -f "${reports[@]}" || return
   cd "${GLUTEN_DIR}" || return
   ci_run "${log}" ci_runtime "${command[@]}" || status=$?
-  local path
+  local path suite executed=0 count
   for path in "${GLUTEN_DIR}/${module}"/target/*reports/TEST-*.xml; do
-    [[ ! -f "${path}" ]] || cp "${path}" "${output}/" || return
+    [[ -f "${path}" ]] || continue
+    cp "${path}" "${output}/" || return
+    if [[ "${status}" == 0 ]]; then
+      count=$(xmllint --nonet --xpath 'count(//testcase[not(skipped)])' "${path}") || return
+      # Unrelated Surefire tests must not hide an empty ScalaTest selection.
+      suite="${path##*/TEST-}"
+      if [[ -n "${CI_SUITES:-}" && ",${CI_SUITES}," != *",${suite%.xml},"* ]]; then
+        continue
+      fi
+      executed=$((executed + count))
+    fi
   done
+  if [[ "${status}" == 0 && "${executed}" == 0 ]]; then
+    echo "No executed tests in fresh reports for ${stage}/${module}" | tee -a "${log}" >&2
+    return 1
+  fi
   return "${status}"
 )

@@ -18,7 +18,7 @@ index 3d9feae51d..f36e0f7851 100644
 -
 -  override protected val resourcePath: String =
 -    getClass.getResource("/tpch-data-parquet").getFile
-+class BoltTPCHDeltaSuite extends BoltWholeStageTransformerSuite {
++class BoltTPCHDeltaSuite extends WholeStageTransformerSuite {
 +  override protected val resourcePath: String = "/tpch-data-parquet"
 +  override protected val fileFormat: String = "parquet"
  
@@ -73,13 +73,15 @@ index 3d9feae51d..f36e0f7851 100644
 diff --git a/tools/gluten-it/sbin/gluten-it.sh b/tools/gluten-it/sbin/gluten-it.sh
 --- a/tools/gluten-it/sbin/gluten-it.sh
 +++ b/tools/gluten-it/sbin/gluten-it.sh
-@@ -29,7 +29,10 @@
+@@ -29,7 +29,12 @@
  fi
  
 -JAR_PATH=$LIB_DIR/*
 +# Load Gluten's Arrow classes together with their relocated FlatBuffers before
 +# Spark's Arrow jars; Java wildcard classpath ordering is unspecified.
++set +f
 +printf -v JAR_PATH '%s:' "$LIB_DIR"/gluten-package-*.jar
++set -f
 +JAR_PATH+="$LIB_DIR/*"
  
  SPARK_JVM_OPTIONS=$($JAVA_HOME/bin/java -cp $JAR_PATH org.apache.gluten.integration.SparkJvmOptions)
