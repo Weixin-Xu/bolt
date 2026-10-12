@@ -164,7 +164,7 @@ jobs:
           source .github/scripts/gluten_ci.sh
           ci_init
           apt-get update
-          apt-get install -y --no-install-recommends jq
+          apt-get install -y --no-install-recommends jq libxml2-utils
           python3 -m pip install --disable-pip-version-check \
             setuptools==77.0.3 Cython==3.3.0 numpy==1.26.4 \
             "pyspark==${SPARK_VERSION}" pandas==2.2.3 pyarrow==20.0.0

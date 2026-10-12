@@ -182,7 +182,8 @@ Spark binaries and SQL test resources come from Gluten's existing
 requires `shasum` in the CI image.
 
 Local execution requires Linux x86_64, a full JDK 17 with AWT, Python 3.10+,
-Conan 2.32.0, Maven, CMake 3.31, Ninja, mold, curl, jq and a C++ compiler. Provide a
+Conan 2.32.0, Maven, CMake 3.31, Ninja, mold, curl, jq, xmllint (libxml2-utils)
+and a C++ compiler. Provide a
 Spark 3.5.5 binary distribution with Python ZIPs and the matching source `sql/`
 test resources, plus PySpark 3.5.5, pandas 2.2.3 and PyArrow 20.0.0. Set
 `BOLT_GLUTEN_SPARK_HOME` to the binary directory; its `sql/` can be a symlink
@@ -217,6 +218,8 @@ candidate Bolt package into the selected Conan home. The example above runs
 one suite after that build. Set `CI_NUM_THREADS` for local build parallelism.
 Reports and failure logs go to `.ci/gluten-bolt/`.
 The shell helper handles runtime activation, logging and fresh report capture.
+Maven test stages also require valid fresh XML reports with executed tests;
+missing, malformed, empty or entirely skipped reports cannot pass a stage.
 Tests use CTest, Maven and Gluten's `gluten-it.sh` entry points directly; their
 exit status determines whether a stage succeeds. The workflow checks that
 Gluten consumes the exported candidate Bolt package and native libraries.
