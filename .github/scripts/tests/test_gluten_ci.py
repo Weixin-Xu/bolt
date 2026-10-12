@@ -170,20 +170,6 @@ class GlutenCiTest(unittest.TestCase):
         ):
             self.ci.apply_gluten_patches(gluten, self.root)
 
-    def test_spark_test_home_preserves_the_runtime_distribution(self):
-        source = self.root / "spark-source"
-        binary = self.root / "spark-binary"
-        (source / "sql").mkdir(parents=True)
-        (binary / "jars").mkdir(parents=True)
-        (binary / "sql").symlink_to(source / "sql", target_is_directory=True)
-        alias = self.root / "spark-home"
-        alias.symlink_to(binary, target_is_directory=True)
-        for home in (binary, alias):
-            test_home = self.ci.spark_test_home(home)
-            self.assertEqual(test_home, binary)
-            self.assertTrue((test_home / "jars").is_dir())
-            self.assertEqual((test_home / "sql").resolve(), source / "sql")
-
     def test_gate_requires_the_supported_version_compilation_matrix(self):
         for result in (None, "failure", "skipped", "cancelled"):
             needs = {job: {"result": "success"} for job in ("prepare", "integration")}
@@ -195,44 +181,6 @@ class GlutenCiTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "compatibility"):
                     self.ci.gate()
-
-    def test_stages_cannot_share_a_mutable_module_report_directory(self):
-        with self.ci.stage_lock(self.root, "spark-1"):
-            with self.assertRaisesRegex(ValueError, "already running"):
-                with self.ci.stage_lock(self.root, "slow-hive"):
-                    self.fail("Concurrent Spark UT stages acquired the same module")
-            with self.ci.stage_lock(self.root, "jvm"):
-                pass
-        with self.ci.stage_lock(self.root, "slow-hive"):
-            pass
-
-    def test_stage_lock_is_released_after_a_failure(self):
-        with self.assertRaisesRegex(RuntimeError, "interrupted"):
-            with self.ci.stage_lock(self.root, "spark-2"):
-                raise RuntimeError("interrupted")
-        with self.ci.stage_lock(self.root, "extended"):
-            pass
-
-    def test_spark4_profile_changes_exclude_other_java_stages(self):
-        with self.ci.stage_lock(self.root, "jvm"):
-            with self.assertRaisesRegex(ValueError, "already running"):
-                with self.ci.stage_lock(self.root, "spark40"):
-                    self.fail("Profile changed during another Java stage")
-        with self.ci.stage_lock(self.root, "spark41"):
-            for stage in ("jvm", "spark-2", "tpc-h", "spark40"):
-                with (
-                    self.subTest(stage=stage),
-                    self.assertRaisesRegex(ValueError, "already running"),
-                ):
-                    with self.ci.stage_lock(self.root, stage):
-                        self.fail("Java stage overlapped a profile change")
-
-    def test_spark4_stages_use_the_requested_profile(self):
-        for module, profile in (("spark40", "4.0"), ("spark41", "4.1")):
-            self.assertIn(module, self.ci.STAGES)
-            command = self.ci.maven(self.root, profile)
-            self.assertIn(f"-Pspark-{profile}", command)
-            self.assertNotIn("-Pspark-3.5", command)
 
     def test_spark4_packaging_rejects_stale_native_resources(self):
         reports = self.root / "reports"
@@ -311,7 +259,7 @@ class GlutenCiTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         for name in (
             "gluten_ci.py",
-            "setup_gluten_ci_environment.py",
+            "gluten_ci.sh",
             "DiscoverGlutenSuites.java",
         ):
             shutil.copy2(SCRIPT.parent / name, scripts / name)
@@ -338,8 +286,6 @@ class GlutenCiTest(unittest.TestCase):
         self.assertEqual(inputs["spark"], "3.5.5")
         self.assertEqual(inputs["scala"], "2.12")
         self.assertEqual(inputs["jdk"], "17")
-        self.assertIn("-Pspark-3.5", self.ci.maven(checkout))
-        self.assertIn("-Pjava-17", self.ci.maven(checkout))
 
     def test_actions_cannot_bypass_image_validation_with_local_mode(self):
         with patch.dict(
@@ -628,75 +574,6 @@ class GlutenCiTest(unittest.TestCase):
             [junit, scala],
         )
 
-    def test_backend_jvm_explicitly_excludes_skipped_suites(self):
-        activation = self.root / "cpp/build/Release/generators/conanrun.sh"
-        activation.parent.mkdir(parents=True)
-        activation.touch()
-
-        def record_report(*args, **kwargs):
-            report = (
-                self.root / "backends-bolt/target/surefire-reports/TEST-backend.xml"
-            )
-            report.parent.mkdir(parents=True, exist_ok=True)
-            suite = next(
-                arg.removeprefix("-Dsuites=")
-                for arg in args[0]
-                if arg.startswith("-Dsuites=")
-            )
-            report.write_text(
-                f'<testsuite name="{suite}" tests="1"><testcase/></testsuite>'
-            )
-            args[2].write_text(
-                "Run completed in 1 second.\nTotal number of tests run: 1\n"
-                "Suites: completed 1, aborted 0\n"
-                "Tests: succeeded 1, failed 0, canceled 0, ignored 0, pending 0\n"
-            )
-            fork = next(
-                arg.removeprefix("-Djvm=")
-                for arg in args[0]
-                if arg.startswith("-Djvm=")
-            )
-            (Path(fork).parent.parent / "scalatest-fork-1.json").write_text(
-                '{"exit_code": 0}'
-            )
-
-        with (
-            patch.object(
-                self.ci,
-                "discover_backend_suites",
-                return_value=["org.example.FutureSuite"]
-                + [f"org.apache.spark.sql.delta.Delete{i}Suite" for i in range(5)],
-            ),
-            patch.object(
-                self.ci, "spark_environment", side_effect=lambda home, env: env
-            ),
-            patch.object(self.ci, "run", side_effect=record_report) as command,
-        ):
-            self.ci.test_stage("jvm", self.root, self.root / "reports")
-        arguments = command.call_args.args[0]
-        excluded = next(
-            (
-                arg.split("=", 1)[1]
-                for arg in arguments
-                if arg.startswith("-DtagsToExclude=")
-            ),
-            "",
-        ).split(",")
-        self.assertIn("org.apache.gluten.tags.SkipTest", excluded)
-        self.assertIn("org.apache.gluten.tags.UDFTest", excluded)
-        self.assertIn("org.apache.gluten.tags.EnhancedFeaturesTest", excluded)
-        self.assertIn("org.apache.gluten.tags.CudfTest", excluded)
-        self.assertNotIn("-am", arguments)
-        self.assertEqual(command.call_count, 6)
-        ordinary = command.call_args_list[0].args[0]
-        self.assertIn("-Dsuites=org.example.FutureSuite", ordinary)
-        for call in command.call_args_list[1:]:
-            self.assertIn("scalatest:test", call.args[0])
-            self.assertTrue(any(arg.startswith("-Dsuites=") for arg in call.args[0]))
-        evidence = json.loads((self.root / "reports/blacklist-jvm.json").read_text())
-        self.assertEqual(evidence["tests"], 6)
-        self.assertEqual(len(evidence["groups"]), 6)
-
     @unittest.skipUnless(shutil.which("javac") and shutil.which("java"), "Requires JDK")
     def test_discovery_preserves_unusual_packages_without_initializing_suites(self):
         version = subprocess.check_output(
@@ -784,163 +661,6 @@ class GlutenCiTest(unittest.TestCase):
                 "future.WrappedSuite",
             ],
         )
-
-    def test_backend_group_abort_is_fatal_but_other_groups_still_run(self):
-        self.check_backend_group_failure(
-            '<testsuite name="{suite}" tests="0" errors="1"/>'
-        )
-
-    def test_truncated_backend_report_is_fatal_but_delta_groups_still_run(self):
-        self.check_backend_group_failure('<testsuite name="{suite}"><testcase')
-
-    def check_backend_group_failure(self, first_report):
-        activation = self.root / "cpp/build/Release/generators/conanrun.sh"
-        activation.parent.mkdir(parents=True)
-        activation.touch()
-        calls = []
-
-        def reports(args, cwd, log, env):
-            suite = next(
-                a.removeprefix("-Dsuites=") for a in args if a.startswith("-Dsuites=")
-            )
-            calls.append(suite)
-            report = self.root / "backends-bolt/target/surefire-reports/TEST-suite.xml"
-            report.parent.mkdir(parents=True, exist_ok=True)
-            if len(calls) == 1:
-                report.write_text(first_report.format(suite=suite))
-                log.write_text("Run aborted.\n")
-            else:
-                report.write_text(
-                    f'<testsuite name="{suite}" tests="1"><testcase/></testsuite>'
-                )
-                log.write_text(
-                    "Run completed in 1 second.\nTotal number of tests run: 1\n"
-                    "Suites: completed 1, aborted 0\n"
-                    "Tests: succeeded 1, failed 0, canceled 0, ignored 0, pending 0\n"
-                )
-            fork = next(
-                a.removeprefix("-Djvm=") for a in args if a.startswith("-Djvm=")
-            )
-            (Path(fork).parent.parent / "scalatest-fork-1.json").write_text(
-                '{"exit_code":0}'
-            )
-
-        with (
-            patch.object(
-                self.ci,
-                "discover_backend_suites",
-                return_value=[
-                    "org.example.FutureSuite",
-                    "org.apache.spark.sql.delta.DeleteSuite",
-                ],
-            ),
-            patch.object(
-                self.ci, "spark_environment", side_effect=lambda home, env: env
-            ),
-            patch.object(self.ci, "run", side_effect=reports),
-            self.assertRaisesRegex(ValueError, "Backend test groups failed"),
-        ):
-            self.ci.test_stage("jvm", self.root, self.root / "reports")
-        self.assertEqual(
-            calls, ["org.example.FutureSuite", "org.apache.spark.sql.delta.DeleteSuite"]
-        )
-        evidence = json.loads((self.root / "reports/blacklist-jvm.json").read_text())
-        self.assertEqual(evidence["groups"]["backend"]["result"], "failure")
-        self.assertEqual(evidence["groups"][calls[1]]["result"], "success")
-        self.assertEqual(evidence["tests"], 1)
-
-    def test_missing_stage_metadata_is_fatal_but_later_stages_still_run(self):
-        calls = []
-
-        def stage(name, gluten, reports):
-            calls.append(name)
-            if len(calls) == 1:
-                raise KeyError("JAVA_HOME")
-            return {"tests": 1}
-
-        with patch.object(self.ci, "test_stage", side_effect=stage):
-            with self.assertRaisesRegex(
-                ValueError, "Required Gluten backend tests failed"
-            ):
-                self.ci.test_all(self.root, self.root)
-        self.assertEqual(calls, list(self.ci.STAGES))
-        results = json.loads((self.root / "results.json").read_text())
-        self.assertEqual(results[calls[0]]["result"], "failure")
-        self.assertTrue(all(results[name]["result"] == "success" for name in calls[1:]))
-
-    def test_backend_discovery_uses_java_from_the_supplied_path(self):
-        activation = self.root / "cpp/build/Release/generators/conanrun.sh"
-        activation.parent.mkdir(parents=True)
-        activation.touch()
-        java = self.root / "jdk/bin/java"
-        java.parent.mkdir(parents=True)
-        java.touch()
-        java.chmod(0o755)
-        output = self.root / "reports"
-        output.mkdir()
-        classes = self.root / "backends-bolt/target/scala-2.12/test-classes"
-        classes.mkdir(parents=True)
-        (classes.parent / "classes").mkdir()
-        commands = []
-
-        def run(args, cwd, log, env):
-            commands.append(args)
-            if "dependency:build-classpath" in args:
-                (output / "test-classpath.txt").write_text("fixture.jar")
-            if "--class-path" in args:
-                Path(args[-3]).write_text("org.example.FutureSuite\n")
-
-        with patch.object(self.ci, "run", side_effect=run):
-            suites = self.ci.discover_backend_suites(
-                self.root, output, {"PATH": str(java.parent)}
-            )
-        self.assertEqual(suites, ["org.example.FutureSuite"])
-        self.assertEqual(commands[-1][0], str(java.resolve()))
-
-    def test_spark_stages_run_only_the_required_test_module(self):
-        activation = self.root / "cpp/build/Release/generators/conanrun.sh"
-        activation.parent.mkdir(parents=True)
-        activation.touch()
-
-        def record_report(*args, **kwargs):
-            report = (
-                self.root / "gluten-ut/spark35/target/surefire-reports/TEST-spark.xml"
-            )
-            report.parent.mkdir(parents=True, exist_ok=True)
-            report.write_text('<testsuite tests="1"><testcase/></testsuite>')
-            args[2].write_text(
-                "Run completed in 1 second.\nTotal number of tests run: 1\n"
-                "Suites: completed 1, aborted 0\n"
-                "Tests: succeeded 1, failed 0, canceled 0, ignored 0, pending 0\n"
-            )
-            fork = next(
-                arg.removeprefix("-Djvm=")
-                for arg in args[0]
-                if arg.startswith("-Djvm=")
-            )
-            (Path(fork).parent.parent / "scalatest-fork-1.json").write_text(
-                '{"exit_code": 0}'
-            )
-
-        for stage in ("spark-1", "spark-2", "spark-3", "extended", "slow-hive"):
-            with (
-                self.subTest(stage=stage),
-                patch.object(
-                    self.ci, "spark_environment", side_effect=lambda home, env: env
-                ),
-                patch.object(self.ci, "run", side_effect=record_report) as command,
-            ):
-                self.ci.test_stage(stage, self.root, self.root / "reports")
-                self.assertEqual(
-                    command.call_args.args[3]["GLUTEN_TEST_ENABLE_SLOW_HIVE"],
-                    "true" if stage == "slow-hive" else "false",
-                )
-                arguments = command.call_args.args[0]
-                self.assertIn("-pl", arguments)
-                self.assertEqual(
-                    arguments[arguments.index("-pl") + 1], "gluten-ut/spark35"
-                )
-                self.assertNotIn("-am", arguments)
 
     def test_gate_fails_for_missing_skipped_cancelled_and_failed_jobs(self):
         for needs in (
@@ -1159,77 +879,10 @@ class GlutenCiTest(unittest.TestCase):
         )
         self.assertEqual(self.ci.verify_tpc(final, {"q1"})["native_queries"], ["q1"])
 
-    def test_command_failure_preserves_log_and_exit_failure(self):
-        log = self.root / "failure.log"
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.ci.run(
-                [sys.executable, "-c", "print('failure evidence'); exit(7)"],
-                self.root,
-                log,
-            )
-        self.assertIn("failure evidence", log.read_text())
-
-    def test_build_keeps_configuration_and_export_host_profiles_consistent(self):
-        class ExportReached(Exception):
-            pass
-
-        for overlay_exists in (False, True):
-            with self.subTest(repository_overlay=overlay_exists):
-                checkout = self.root / str(overlay_exists)
-                checkout.mkdir()
-                overlay = checkout / "scripts/conan/bolt.profile"
-                expected_profiles = ["-pr:h", "default"]
-                if overlay_exists:
-                    overlay.parent.mkdir(parents=True)
-                    overlay.write_text(
-                        "[replace_tool_requires]\ncmake/*: cmake/3.31.10\n"
-                    )
-                    expected_profiles.extend(["-pr:h", str(overlay)])
-                reports = checkout / "reports"
-                reports.mkdir()
-                (reports / "inputs.json").write_text(
-                    json.dumps({"bolt_tested_sha": "a" * 40})
-                )
-                commands = []
-
-                def run(args, cwd, log, env=None, json_output=None):
-                    commands.append(args)
-                    if args[:2] == ["conan", "export-pkg"]:
-                        raise ExportReached
-
-                with (
-                    patch.object(self.ci, "ROOT", checkout),
-                    patch.object(self.ci, "git", side_effect=["a" * 40, ""]),
-                    patch.object(self.ci, "verify_gluten_source"),
-                    patch.object(self.ci, "run", side_effect=run),
-                    patch.dict("os.environ", {"CONAN_HOME": str(checkout / "cache")}),
-                    self.assertRaises(ExportReached),
-                ):
-                    self.ci.build(checkout / "gluten", reports)
-
-                exported_profiles = []
-                for index, arg in enumerate(commands[-1]):
-                    if arg == "-pr:h":
-                        exported_profiles.extend([arg, commands[-1][index + 1]])
-                self.assertEqual(exported_profiles, expected_profiles)
-                configured = next(args for args in commands if args[0] == "make")
-                profile_override = next(
-                    (
-                        arg
-                        for arg in configured
-                        if arg.startswith("CONAN_HOST_PROFILE_ARGS=")
-                    ),
-                    None,
-                )
-                self.assertIsNotNone(profile_override)
-                self.assertEqual(
-                    shlex.split(profile_override.split("=", 1)[1]), expected_profiles
-                )
-
     def test_spark_environment_requires_binary_and_source_test_resources(self):
         home = self.root / "spark_home"
         with self.assertRaises(ValueError):
-            self.ci.spark_environment(home, {})
+            self.ci.validate_spark_home(home)
         for path in (
             home / "bin/spark-submit",
             home / "jars/spark-core_2.12-3.5.5.jar",
@@ -1242,9 +895,7 @@ class GlutenCiTest(unittest.TestCase):
         submit = home / "bin/spark-submit"
         submit.chmod(0o755)
         (home / "RELEASE").write_text("Spark 3.5.5 built for Hadoop 3\n")
-        env = self.ci.spark_environment(home, {"PYTHONPATH": "existing"})
-        self.assertEqual(env["SPARK_HOME"], str(home))
-        self.assertTrue(env["PYTHONPATH"].endswith(":existing"))
+        self.ci.validate_spark_home(home)
         for name in (
             "jars/spark-core_2.12-3.5.5.jar",
             "python/lib/pyspark.zip",
@@ -1256,16 +907,16 @@ class GlutenCiTest(unittest.TestCase):
             path.rename(hidden)
             try:
                 with self.subTest(missing=name), self.assertRaises(ValueError):
-                    self.ci.spark_environment(home, {})
+                    self.ci.validate_spark_home(home)
             finally:
                 hidden.rename(path)
         submit.chmod(0o644)
         with self.assertRaises(ValueError):
-            self.ci.spark_environment(home, {})
+            self.ci.validate_spark_home(home)
         submit.chmod(0o755)
         (home / "RELEASE").write_text("Spark 4.0.0 built for Hadoop 3\n")
         with self.assertRaises(ValueError):
-            self.ci.spark_environment(home, {})
+            self.ci.validate_spark_home(home)
 
     def test_spark_environment_accepts_versioned_pyspark_distribution(self):
         home = self.root / "pyspark_home"
@@ -1281,11 +932,11 @@ class GlutenCiTest(unittest.TestCase):
         (home / "bin/spark-submit").chmod(0o755)
         with zipfile.ZipFile(home / "python/lib/pyspark.zip", "w") as archive:
             archive.writestr("pyspark/version.py", "__version__: str = '3.5.5'\n")
-        self.assertEqual(self.ci.spark_environment(home, {})["SPARK_HOME"], str(home))
+        self.ci.validate_spark_home(home)
         with zipfile.ZipFile(home / "python/lib/pyspark.zip", "w") as archive:
             archive.writestr("pyspark/version.py", "__version__ = '4.0.0'\n")
         with self.assertRaises(ValueError):
-            self.ci.spark_environment(home, {})
+            self.ci.validate_spark_home(home)
 
     def test_binary_jar_is_verified_even_when_sources_jar_is_present(self):
         import hashlib
@@ -1340,6 +991,137 @@ class GlutenCiTest(unittest.TestCase):
             jar.writestr("org/apache/gluten/Stale.class", b"stale")
         with self.assertRaisesRegex(ValueError, "classifier.*metadata"):
             self.ci.verify_jar(self.root, self.root)
+
+
+class GlutenCiShellTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        scripts = self.root / ".github/scripts"
+        scripts.mkdir(parents=True)
+        for source in SCRIPT.parent.glob("gluten_ci.*"):
+            shutil.copy2(source, scripts / source.name)
+        (self.root / ".github/gluten-ci-blacklist.txt").write_text(
+            "org.example.NativeSuite#known failure\n"
+        )
+        self.gluten = self.root / "gluten"
+        activation = self.gluten / "cpp/build/Release/generators/conanrun.sh"
+        activation.parent.mkdir(parents=True)
+        activation.write_text("true\n")
+        self.java = self.root / "jdk/bin/java"
+        self.java.parent.mkdir(parents=True)
+        self.java.write_text('#!/bin/sh\nexit "${FAKE_FORK_EXIT:-0}"\n')
+        self.java.chmod(0o755)
+        self.maven = self.gluten / "fake-maven.py"
+        self.maven.write_text(
+            "import os, pathlib, subprocess, sys\n"
+            "from xml.sax.saxutils import escape\n"
+            "report = pathlib.Path('gluten-ut/spark35/target/test-reports/TEST-suite.xml')\n"
+            "report.parent.mkdir(parents=True, exist_ok=True)\n"
+            "name = os.environ.get('FAKE_FAILURE', '')\n"
+            "failed = 1 if name else 0\n"
+            'body = \'<testcase name="pass" classname="org.example.NativeSuite"/>\'\n'
+            "if failed:\n"
+            "    body += '<testcase name=\"' + escape(name) + '\" classname=\"org.example.NativeSuite\"><failure/></testcase>'\n"
+            "report.write_text('<testsuite name=\"org.example.NativeSuite\" tests=\"' + str(1+failed) + '\" failures=\"' + str(failed) + '\">' + body + '</testsuite>')\n"
+            "jvm = next(arg.split('=',1)[1] for arg in sys.argv if arg.startswith('-Djvm='))\n"
+            "subprocess.run([jvm, 'org.scalatest.tools.Runner'], check=False)\n"
+            "print('Run completed in 1 second.\\nTotal number of tests run: ' + str(1+failed) + '\\nSuites: completed 1, aborted 0\\nTests: succeeded 1, failed ' + str(failed) + ', canceled 0, ignored 0, pending 0')\n"
+            "sys.exit(int(os.environ.get('FAKE_MAVEN_EXIT', '0')))\n"
+        )
+
+    def run_stage(self, **overrides):
+        import os
+
+        env = {
+            **os.environ,
+            "JAVA_HOME": str(self.java.parent.parent),
+            "GLUTEN_DIR": str(self.gluten),
+            **overrides,
+        }
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; ci_init; status=0; ci_maven_test spark-2 gluten-ut/spark35 "$2" "$3" || status=$?; exit "$status"',
+                "test",
+                str(self.root / ".github/scripts/gluten_ci.sh"),
+                sys.executable,
+                str(self.maven),
+            ],
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_shell_runner_records_verified_reports(self):
+        result = self.run_stage()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = self.root / ".ci/gluten-bolt/results.json"
+        self.assertEqual(json.loads(report.read_text())["spark-2"]["passed"], 1)
+
+    def test_shell_runner_accepts_only_exact_registered_failures(self):
+        result = self.run_stage(FAKE_FAILURE="known failure", FAKE_FORK_EXIT="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.run_stage(FAKE_FAILURE="new failure", FAKE_FORK_EXIT="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unlisted failed test", result.stdout + result.stderr)
+
+    def test_shell_runner_rejects_crash_even_with_complete_passing_xml(self):
+        result = self.run_stage(FAKE_FORK_EXIT="137")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fork exit", result.stdout + result.stderr)
+
+    def test_shell_runner_preserves_reports_after_maven_failure(self):
+        result = self.run_stage(FAKE_MAVEN_EXIT="9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(
+            list((self.root / ".ci/gluten-bolt/spark-2").glob("*TEST-*.xml"))
+        )
+
+    def test_later_group_cannot_hide_an_earlier_failed_group(self):
+        result = self.run_stage(
+            CI_GROUP="first", FAKE_FAILURE="new failure", FAKE_FORK_EXIT="1"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        result = self.run_stage(CI_GROUP="second")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads((self.root / ".ci/gluten-bolt/results.json").read_text())
+        self.assertEqual(report["spark-2"]["result"], "failure")
+        self.assertEqual(report["spark-2"]["groups"]["first"]["result"], "failure")
+
+    def test_profile_change_lock_prevents_test_execution(self):
+        import time
+
+        lock = self.gluten / ".ci/gluten-bolt-profile.lock"
+        lock.parent.mkdir()
+        marker = self.root / "locked"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import fcntl, sys, time; "
+                "lock = open(sys.argv[1], 'w'); fcntl.flock(lock, fcntl.LOCK_EX); "
+                "Path(sys.argv[2]).touch(); time.sleep(30)",
+                str(lock),
+                str(marker),
+            ]
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(marker.exists())
+            result = self.run_stage()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(
+                (self.gluten / "gluten-ut/spark35/target/test-reports").exists()
+            )
+        finally:
+            holder.terminate()
+            holder.wait(timeout=5)
 
 
 if __name__ == "__main__":

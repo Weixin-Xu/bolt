@@ -158,6 +158,10 @@ jobs:
       # Defaults to the existing Bolt CI image; resource checks run in the helper.
       CI_NUM_THREADS: '16'
       IN_CI: '1'
+      GLUTEN_EXCLUDED_TAGS: org.apache.gluten.tags.UDFTest,org.apache.gluten.tags.EnhancedFeaturesTest,org.apache.gluten.tags.CudfTest,org.apache.gluten.tags.SkipTest
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Locate Conan cache in the container workspace
         run: echo "CONAN_HOME=${GITHUB_WORKSPACE}/.ci/conan" >> "$GITHUB_ENV"
@@ -184,7 +188,10 @@ jobs:
           distribution: temurin
           java-version: '17'
       - name: Provision Gluten Spark test environment
-        run: python3 .github/scripts/setup_gluten_ci_environment.py
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_init
+          ci_environment
       - name: Configure Conan and Bolt dependencies
         run: |
           conan profile detect
@@ -199,9 +206,210 @@ jobs:
           conan remote add --index=0 ci http://conanserver:9300
           ./scripts/install-bolt-deps.sh
       - name: Build and export the candidate Bolt package and Gluten native backend
-        run: python3 .github/scripts/gluten_ci.py build
-      - name: Run native, Spark 3.5 integration and Spark 4 compatibility tests
-        run: python3 .github/scripts/gluten_ci.py test
+        id: build
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_init
+          ci_check source
+          exec > >(tee "${GLUTEN_REPORTS_DIR}/build.log") 2>&1
+          java -version
+          c++ --version
+          conan --version
+          cmake --version
+          conan profile show
+          options=(-o "bolt/*:spark_compatible=True" -o "bolt/*:enable_testutil=True"
+            -o "bolt/*:shared=False" -o "bolt/*:enable_hdfs=False"
+            -o "bolt/*:enable_s3=False" -o "bolt/*:enable_asan=False")
+          profile=(-pr:h default)
+          if [[ -f scripts/conan/bolt.profile ]]; then
+            profile+=(-pr:h "${BOLT_ROOT}/scripts/conan/bolt.profile")
+          fi
+          printf -v profile_args '%q ' "${profile[@]}"
+          make release_spark_with_test BOLT_CONAN_CONFIGURE_ONLY=1 \
+            "BUILD_VERSION=${BOLT_BUILD_VERSION}" "CONAN_OVERRIDE=${options[*]}" \
+            "CONAN_HOST_PROFILE_ARGS=${profile_args}"
+          cmake --build --preset conan-release --target bolt_engine bolt_testutils_static \
+            --parallel "${CI_NUM_THREADS}"
+          profile+=(-s build_type=Release)
+          conan export-pkg . --name=bolt "--version=${BOLT_BUILD_VERSION}" \
+            "${profile[@]}" "${options[@]}" -c bolt/*:tools.build:skip_test=False \
+            --format=json > "${GLUTEN_REPORTS_DIR}/bolt-export.json"
+          export BOLT_BUILD_VERSION
+          cd "${GLUTEN_DIR}/cpp"
+          common=(. --name=gluten "--version=${GLUTEN_BUILD_VERSION}"
+            "${profile[@]}" "${options[@]}" -o "gluten/*:shared=True"
+            -o "gluten/*:build_tests=True" -o "gluten/*:enable_hdfs=False"
+            -o "gluten/*:enable_s3=False" -o "gluten/*:enable_asan=False"
+            -c arrow/*:tools.build:download_source=True --lockfile=)
+          conan graph info "${common[@]}" --build=missing --format=json \
+            > "${GLUTEN_REPORTS_DIR}/gluten-preflight.json"
+          ci_check package --consumed "${GLUTEN_REPORTS_DIR}/gluten-preflight.json"
+          conan install "${common[@]}" --build=missing "--build=~bolt/*" --format=json \
+            > "${GLUTEN_REPORTS_DIR}/gluten-install.json"
+          ci_check package --consumed "${GLUTEN_REPORTS_DIR}/gluten-install.json" \
+            --graph "${GLUTEN_REPORTS_DIR}/gluten-preflight.json"
+          ci_check arrow
+          cmake --preset conan-release
+          cmake --build --preset conan-release --parallel "${CI_NUM_THREADS}"
+          cd "${GLUTEN_DIR}"
+          bash dev/build_bolt_arrow.sh
+          ci_runtime "${MVN[@]}" install -Pspark-ut \
+            -pl backends-bolt,gluten-ut/spark35 -am -DskipTests=true
+          ci_check native
+      - name: Run native CTest
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_init
+          output="${GLUTEN_REPORTS_DIR}/native"
+          mkdir -p "${output}"
+          : > "${output}/run.log"
+          for library in "${GLUTEN_DIR}"/cpp/build/releases/*.so; do
+            ci_run "${output}/run.log" ci_runtime ldd "${library}"
+          done
+          if grep -q 'not found' "${output}/run.log"; then exit 1; fi
+          rm -f "${output}/TEST-native.xml"
+          ci_run "${output}/run.log" ci_runtime ctest \
+            --test-dir "${GLUTEN_DIR}/cpp/build/Release" --no-tests=error \
+            --output-on-failure --output-junit "${output}/TEST-native.xml" \
+            --timeout 7200 -j "${CI_NUM_THREADS}"
+          ci_check verify native
+      - name: Run backend JVM and isolated Delta suites
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_init
+          ci_spark_environment
+          ci_check reset jvm
+          output="${GLUTEN_REPORTS_DIR}/jvm"
+          mkdir -p "${output}"
+          cd "${GLUTEN_DIR}"
+          ci_runtime "${MVN[@]}" test-compile -pl backends-bolt
+          ci_runtime "${MVN[@]}" dependency:build-classpath -pl backends-bolt \
+            -DincludeScope=test "-Dmdep.outputFile=${output}/test-classpath.txt"
+          classes="${GLUTEN_DIR}/backends-bolt/target/scala-${SCALA_VERSION}"
+          "${JAVA_HOME}/bin/java" --class-path \
+            "${classes}/test-classes:${classes}/classes:$(cat "${output}/test-classpath.txt")" \
+            "${BOLT_ROOT}/.github/scripts/DiscoverGlutenSuites.java" \
+            "${output}/discovered-suites.txt" "${classes}/test-classes" "${classes}/classes"
+          ordinary=() delta=()
+          while IFS= read -r suite; do
+            if [[ "${suite}" == org.apache.spark.sql.delta.* ]]; then
+              delta+=("${suite}")
+            else
+              ordinary+=("${suite}")
+            fi
+          done < "${output}/discovered-suites.txt"
+          ((${#ordinary[@]} > 0))
+          failed=0
+          selected="$(IFS=,; printf '%s' "${ordinary[*]}")"
+          CI_GROUP=backend CI_SUITES="${selected}" ci_maven_test jvm backends-bolt \
+            "${MVN[@]}" test "-DtagsToExclude=${GLUTEN_EXCLUDED_TAGS}" \
+            "-DargLine=-Dspark.test.home=${SPARK_HOME}" || failed=1
+          for suite in "${delta[@]}"; do
+            CI_GROUP="${suite}" CI_SUITES="${suite}" ci_maven_test jvm backends-bolt \
+              "${MVN[@]}" scalatest:test "-DtagsToExclude=${GLUTEN_EXCLUDED_TAGS}" \
+              "-DargLine=-Dspark.test.home=${SPARK_HOME}" || failed=1
+          done
+          exit "${failed}"
+      - name: Run Spark 3.5 SQL unit test groups
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_init
+          ci_spark_environment
+          groups=(
+            org.apache.spark.sql.streaming,org.apache.spark.GlutenSortShuffleSuite,org.apache.gluten
+            org.apache.spark.sql.execution,org.apache.spark.sql.catalyst,org.apache.spark.sql.errors,org.apache.spark.sql.extension
+            org.apache.spark.sql.GlutenSQL,org.apache.spark.sql.Gluten,org.apache.spark.sql.connector,org.apache.spark.sql.sources,org.apache.spark.sql.hive,org.apache.spark.sql.gluten,org.apache.spark.sql.shim
+          )
+          excluded="org.apache.spark.tags.ExtendedSQLTest,org.apache.spark.tags.SlowHiveTest,${GLUTEN_EXCLUDED_TAGS}"
+          failed=0
+          for group in 1 2 3; do
+            ci_maven_test "spark-${group}" gluten-ut/spark35 "${MVN[@]}" test -Pspark-ut \
+              "-DwildcardSuites=${groups[$((group-1))]}" "-DtagsToExclude=${excluded}" \
+              "-DargLine=-Dspark.test.home=${SPARK_HOME}" || failed=1
+          done
+          exit "${failed}"
+      - name: Run Extended SQL and Slow Hive tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_init
+          ci_spark_environment
+          failed=0
+          for tag in ExtendedSQLTest SlowHiveTest; do
+            stage=extended
+            [[ "${tag}" != SlowHiveTest ]] || stage=slow-hive
+            ci_maven_test "${stage}" gluten-ut/spark35 "${MVN[@]}" test -Pspark-ut \
+              "-DtagsToInclude=org.apache.spark.tags.${tag}" \
+              "-DtagsToExclude=${GLUTEN_EXCLUDED_TAGS}" \
+              "-DargLine=-Dspark.test.home=${SPARK_HOME}" || failed=1
+          done
+          exit "${failed}"
+      - name: Compare TPC-H and TPC-DS against vanilla Spark
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_init
+          cd "${GLUTEN_DIR}"
+          ci_runtime "${MVN[@]}" install -DskipTests=true
+          ci_check jar
+          cd tools/gluten-it
+          ci_runtime "${GLUTEN_DIR}/build/mvn" -ntp install \
+            "-Pspark-${SPARK_PROFILE}" "-Pjava-${JDK_VERSION}"
+          ci_check jar --tpc
+          failed=0
+          for kind in h ds; do
+            stage="tpc-${kind}"
+            output="${GLUTEN_REPORTS_DIR}/${stage}"
+            mkdir -p "${output}"
+            : > "${output}/run.log"
+            status=0
+            GLUTEN_IT_JVM_ARGS=-Xmx6G ci_run "${output}/run.log" ci_runtime \
+              bash sbin/gluten-it.sh queries-compare --local --preset=velox \
+              --baseline-preset=vanilla "--benchmark-type=${kind}" --error-on-memleak \
+              --explain --off-heap-size=10g -s=1.0 --threads=16 --iterations=1 || status=$?
+            if ((status)); then
+              ci_check failed "${stage}" || failed=1
+            else
+              ci_check verify "${stage}" || failed=1
+            fi
+          done
+          exit "${failed}"
+      - name: Run Spark 4.0 and 4.1 compatibility subsets
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_init
+          ci_profile_lock exclusive
+          expressions=(ArithmeticExpression BitwiseExpressions ConditionalExpression
+            LiteralExpression NullExpressions Predicate)
+          suites=org.apache.spark.sql.GlutenBoltBackendSmokeSuite
+          for name in "${expressions[@]}"; do
+            suites+=",org.apache.spark.sql.catalyst.expressions.Gluten${name}Suite"
+          done
+          failed=0
+          for profile in 4.0 4.1; do
+            (
+              stage="spark${profile/./}"
+              ci_set_maven "${profile}" || exit "$?"
+              export SPARK_SCALA_VERSION=2.13
+              ci_check reset "${stage}" || exit "$?"
+              cd "${GLUTEN_DIR}" || exit "$?"
+              ci_run "${GLUTEN_REPORTS_DIR}/${stage}-compile.log" ci_runtime \
+                "${MVN[@]}" clean install -Pspark-ut \
+                -pl "backends-bolt,gluten-ut/${stage}" -am -DskipTests=true || exit "$?"
+              ci_check spark4-native || exit "$?"
+              CI_GROUP=backend \
+                CI_SUITES=org.apache.gluten.execution.BoltParquetDataTypeValidationSuite,org.apache.gluten.execution.BoltOrcDataTypeValidationSuite \
+                ci_maven_test "${stage}" backends-bolt "${MVN[@]}" test -Pspark-ut \
+                  -DargLine=-Dspark.sql.ansi.enabled=false || exit "$?"
+              CI_GROUP=ut CI_SUITES="${suites}" ci_maven_test "${stage}" \
+                "gluten-ut/${stage}" "${MVN[@]}" test -Pspark-ut
+            ) || failed=1
+          done
+          exit "${failed}"
       - name: Preserve reports, source identities and failure logs
         if: always()
         uses: actions/upload-artifact@v4

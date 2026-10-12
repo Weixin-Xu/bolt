@@ -183,7 +183,7 @@ inside the existing image; Spark archives are verified against Apache SHA512
 manifests.
 
 Local execution requires Linux x86_64, a full JDK 17 with AWT, Python 3.10+,
-Conan 2.32.0, Maven, CMake 3.31, Ninja, mold and a C++ compiler. Provide a
+Conan 2.32.0, Maven, CMake 3.31, Ninja, mold, curl and a C++ compiler. Provide a
 Spark 3.5.5 binary distribution with Python ZIPs and the matching source `sql/`
 test resources, plus PySpark 3.5.5, pandas 2.2.3 and PyArrow 20.0.0. Set
 `BOLT_GLUTEN_SPARK_HOME` to the binary directory; its `sql/` can be a symlink
@@ -209,13 +209,24 @@ EOF
 ./scripts/install-bolt-deps.sh
 python3 .github/scripts/gluten_ci.py prepare --local
 python3 .github/scripts/gluten_ci.py patch
-python3 .github/scripts/gluten_ci.py build
-python3 .github/scripts/gluten_ci.py test
+source .github/scripts/gluten_ci.sh
+ci_init
+ci_spark_environment
+# Run one backend suite against the native backend built from this checkout.
+CI_SUITES=org.apache.gluten.execution.BoltLiteralSuite \
+  ci_maven_test jvm backends-bolt "${MVN[@]}" test \
+    "-DargLine=-Dspark.test.home=${SPARK_HOME}"
 ```
 
 `--local` records the actual local Gluten checkout and is unavailable in
-GitHub Actions. These commands configure Release and export a Bolt package
-into the selected Conan home. Reports and failure logs go to `.ci/gluten-bolt/`.
+GitHub Actions. Build and test commands are in the `integration` job's `run`
+blocks in `.github/workflows/gluten-bolt.yml`; execute them in order for a
+complete local run. The build block configures Release and exports the
+candidate Bolt package into the selected Conan home. The example above runs
+one suite after that build. Set `CI_NUM_THREADS` for local build parallelism.
+Reports and failure logs go to `.ci/gluten-bolt/`.
+The shell helper handles runtime activation, logging and fresh report capture;
+the Python helper validates source/package identities and completed tests.
 To check the CI helper independently, use JDK 17 and run
 `python3 -m unittest discover -s .github/scripts/tests -p 'test_gluten_ci*.py'`.
 
