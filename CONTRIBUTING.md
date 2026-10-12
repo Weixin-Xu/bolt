@@ -178,9 +178,11 @@ Other image overrides require an `@sha256:` digest. The default images use
 tags because each CI host builds its own registry images; a digest override
 must be available to every selected runner. The runner must reach the Bolt
 registry and Conan service. The workflow
-installs a full JDK 17 and provisions the pinned Spark and Python test runtime
-inside the existing image; Spark archives are verified against Apache SHA512
-manifests.
+reuses `bolt-build-base` for Conan setup and `install-bolt-deps.sh`, installs a
+full JDK 17 with `setup-java`, and provisions the pinned Python test runtime.
+Spark binaries and SQL test resources come from Gluten's existing
+`.github/workflows/util/install-spark-resources.sh`; its SHA512 verification
+requires `shasum` in the CI image.
 
 Local execution requires Linux x86_64, a full JDK 17 with AWT, Python 3.10+,
 Conan 2.32.0, Maven, CMake 3.31, Ninja, mold, curl and a C++ compiler. Provide a
