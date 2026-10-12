@@ -137,8 +137,6 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Locate Conan cache in the container workspace
-        run: echo "CONAN_HOME=${GITHUB_WORKSPACE}/.ci/conan" >> "$GITHUB_ENV"
       - name: Checkout the tested Bolt merge commit
         uses: actions/checkout@v6
         with:
