@@ -162,8 +162,7 @@ code against `apache/gluten:main`.
 It compiles Spark 3.4/3.5/4.0/4.1 support and runs native, backend JVM, Spark
 and TPC checks. Temporary source compatibility fixes live in
 `.github/gluten-ci-patches/` and are applied explicitly to the resolved Apache
-main. The helper verifies their hashes, records which patches were applied or
-already upstream, and rejects unrelated source changes.
+main. Already-applied patches are accepted; incompatible patches fail the job.
 
 The default image and runner match Bolt's existing CI. Missing or empty
 repository Actions variables use these defaults:
@@ -174,10 +173,8 @@ repository Actions variables use these defaults:
 | `BOLT_GLUTEN_CI_CONAN_IMAGE` | `bolt-registry:5000/conan-server:latest` |
 | `BOLT_GLUTEN_CI_RUNNER` | `["self-hosted", "medium"]` |
 
-Other image overrides require an `@sha256:` digest. The default images use
-tags because each CI host builds its own registry images; a digest override
-must be available to every selected runner. The runner must reach the Bolt
-registry and Conan service. The workflow
+Image overrides must be available to every selected runner. The runner must
+reach the Bolt registry and Conan service. The workflow
 reuses `bolt-build-base` for Conan setup and `install-bolt-deps.sh`, installs a
 full JDK 17 with `setup-java`, and provisions the pinned Python test runtime.
 Spark binaries and SQL test resources come from Gluten's existing
@@ -185,7 +182,7 @@ Spark binaries and SQL test resources come from Gluten's existing
 requires `shasum` in the CI image.
 
 Local execution requires Linux x86_64, a full JDK 17 with AWT, Python 3.10+,
-Conan 2.32.0, Maven, CMake 3.31, Ninja, mold, curl and a C++ compiler. Provide a
+Conan 2.32.0, Maven, CMake 3.31, Ninja, mold, curl, jq and a C++ compiler. Provide a
 Spark 3.5.5 binary distribution with Python ZIPs and the matching source `sql/`
 test resources, plus PySpark 3.5.5, pandas 2.2.3 and PyArrow 20.0.0. Set
 `BOLT_GLUTEN_SPARK_HOME` to the binary directory; its `sql/` can be a symlink
@@ -209,9 +206,8 @@ tools.build:exelinkflags=['-fuse-ld=mold', '-Wl,--allow-multiple-definition']
 tools.build:sharedlinkflags=['-fuse-ld=mold', '-Wl,--allow-multiple-definition']
 EOF
 ./scripts/install-bolt-deps.sh
-python3 .github/scripts/gluten_ci.py prepare --local
-python3 .github/scripts/gluten_ci.py patch
 source .github/scripts/gluten_ci.sh
+ci_apply_patches
 ci_init
 ci_spark_environment
 # Run one backend suite against the native backend built from this checkout.
@@ -220,23 +216,24 @@ CI_SUITES=org.apache.gluten.execution.BoltLiteralSuite \
     "-DargLine=-Dspark.test.home=${SPARK_HOME}"
 ```
 
-`--local` records the actual local Gluten checkout and is unavailable in
-GitHub Actions. Build and test commands are in the `integration` job's `run`
+Build and test commands are in the `integration` job's `run`
 blocks in `.github/workflows/gluten-bolt.yml`; execute them in order for a
 complete local run. The build block configures Release and exports the
 candidate Bolt package into the selected Conan home. The example above runs
 one suite after that build. Set `CI_NUM_THREADS` for local build parallelism.
 Reports and failure logs go to `.ci/gluten-bolt/`.
-The shell helper handles runtime activation, logging and fresh report capture;
-the Python helper validates source/package identities and completed tests.
-To check the CI helper independently, use JDK 17 and run
-`python3 -m unittest discover -s .github/scripts/tests -p 'test_gluten_ci*.py'`.
+The shell helper handles runtime activation, logging and fresh report capture.
+Tests use CTest, Maven and Gluten's `gluten-it.sh` entry points directly; their
+exit status determines whether a stage succeeds. The workflow checks that
+Gluten consumes the exported candidate Bolt package and native libraries.
 
-`.github/gluten-ci-blacklist.txt` lists temporary exact testcase exceptions.
-Every test still executes its original assertions; only listed failures are
-classified after execution. Compilation errors, suite aborts, crashes and
-missing or incomplete reports remain fatal. Spark 4 stages do not use the
-Spark 3.5 blacklist. Repair patches remove only entries verified to pass.
+`.github/gluten-ci-blacklist.txt` lists temporary exact testcase exclusions.
+`ci_init` exports its path as `GLUTEN_TEST_BLACKLIST`; a Gluten test-layer patch
+registers matching cases as ignored before executing their bodies. Unlisted
+failures, compilation errors, suite aborts and crashes remain fatal to Maven.
+Unset `GLUTEN_TEST_BLACKLIST` after `ci_init` to retest excluded cases. Spark 4
+stages run without the Spark 3.5 blacklist. Remove entries only after verifying
+the corresponding fixes.
 
 ### Working with IDE
 

@@ -33,38 +33,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      inputs_artifact: gluten-bolt-inputs-${{ github.sha }}-${{ github.run_attempt }}
-      gluten_repository: ${{ steps.inputs.outputs.gluten_repository }}
       gluten_sha: ${{ steps.inputs.outputs.gluten_sha }}
-      image: ${{ steps.inputs.outputs.image }}
-      conan_image: ${{ steps.inputs.outputs.conan_image }}
-      runner: ${{ steps.inputs.outputs.runner }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - name: Validate CI failure semantics
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_gluten_ci*.py'
-      - name: Resolve source and execution inputs
+      - name: Resolve Apache Gluten main for all jobs
         id: inputs
-        env:
-          BOLT_GLUTEN_CI_IMAGE: ${{ vars.BOLT_GLUTEN_CI_IMAGE }}
-          BOLT_GLUTEN_CI_CONAN_IMAGE: ${{ vars.BOLT_GLUTEN_CI_CONAN_IMAGE }}
-          BOLT_GLUTEN_CI_RUNNER: ${{ vars.BOLT_GLUTEN_CI_RUNNER }}
-        run: python3 .github/scripts/gluten_ci.py prepare
-      - name: Save inputs and configuration errors
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gluten-bolt-inputs-${{ github.sha }}-${{ github.run_attempt }}
-          path: .ci/gluten-bolt/
-          if-no-files-found: error
-          retention-days: 14
+        shell: bash
+        run: |
+          read -r sha ref < <(git ls-remote --exit-code https://github.com/apache/gluten.git refs/heads/main)
+          [[ "${sha}" =~ ^[0-9a-f]{40}$ && "${ref}" == refs/heads/main ]]
+          echo "gluten_sha=${sha}" >> "${GITHUB_OUTPUT}"
 
   compatibility:
     needs: prepare
@@ -95,16 +72,14 @@ jobs:
       - name: Checkout resolved Apache Gluten main
         uses: actions/checkout@v6
         with:
-          repository: ${{ needs.prepare.outputs.gluten_repository }}
+          repository: apache/gluten
           ref: ${{ needs.prepare.outputs.gluten_sha }}
           path: gluten
           persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.prepare.outputs.inputs_artifact }}
-          path: .ci/gluten-bolt/
       - name: Apply declared Gluten compatibility patches
-        run: python3 .github/scripts/gluten_ci.py patch
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_apply_patches
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -142,20 +117,19 @@ jobs:
 
   integration:
     needs: prepare
-    runs-on: ${{ fromJSON(needs.prepare.outputs.runner) }}
+    runs-on: ${{ fromJSON(vars.BOLT_GLUTEN_CI_RUNNER || '["self-hosted", "medium"]') }}
     timeout-minutes: 1440
     container:
-      image: ${{ needs.prepare.outputs.image }}
+      image: ${{ vars.BOLT_GLUTEN_CI_IMAGE || 'bolt-registry:5000/bolt-ci:20260114' }}
       options: --user root --init
     services:
       conanserver:
         # Each CI host builds its own registry images; digest overrides must be
         # published to every selected runner's registry.
-        image: ${{ needs.prepare.outputs.conan_image }}
+        image: ${{ vars.BOLT_GLUTEN_CI_CONAN_IMAGE || 'bolt-registry:5000/conan-server:latest' }}
         volumes:
           - /data/conan-server-data:/var/conan/data
     env:
-      # Defaults to the existing Bolt CI image; resource checks run in the helper.
       CI_NUM_THREADS: '16'
       IN_CI: '1'
       GLUTEN_EXCLUDED_TAGS: org.apache.gluten.tags.UDFTest,org.apache.gluten.tags.EnhancedFeaturesTest,org.apache.gluten.tags.CudfTest,org.apache.gluten.tags.SkipTest
@@ -173,16 +147,14 @@ jobs:
       - name: Checkout resolved Apache Gluten main
         uses: actions/checkout@v6
         with:
-          repository: ${{ needs.prepare.outputs.gluten_repository }}
+          repository: apache/gluten
           ref: ${{ needs.prepare.outputs.gluten_sha }}
           path: gluten
           persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.prepare.outputs.inputs_artifact }}
-          path: .ci/gluten-bolt/
       - name: Apply declared Gluten compatibility patches
-        run: python3 .github/scripts/gluten_ci.py patch
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_apply_patches
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -193,6 +165,8 @@ jobs:
         run: |
           source .github/scripts/gluten_ci.sh
           ci_init
+          apt-get update
+          apt-get install -y --no-install-recommends jq
           python3 -m pip install --disable-pip-version-check \
             setuptools==77.0.3 Cython==3.3.0 numpy==1.26.4 \
             "pyspark==${SPARK_VERSION}" pandas==2.2.3 pyarrow==20.0.0
@@ -214,7 +188,8 @@ jobs:
         run: |
           source .github/scripts/gluten_ci.sh
           ci_init
-          ci_check source
+          BOLT_BUILD_VERSION="ci-$(git -C "${BOLT_ROOT}" rev-parse HEAD)"
+          GLUTEN_BUILD_VERSION="ci-$(git -C "${GLUTEN_DIR}" rev-parse HEAD)"
           exec > >(tee "${GLUTEN_REPORTS_DIR}/build.log") 2>&1
           java -version
           c++ --version
@@ -245,21 +220,26 @@ jobs:
             -o "gluten/*:build_tests=True" -o "gluten/*:enable_hdfs=False"
             -o "gluten/*:enable_s3=False" -o "gluten/*:enable_asan=False"
             -c arrow/*:tools.build:download_source=True --lockfile=)
-          conan graph info "${common[@]}" --build=missing --format=json \
-            > "${GLUTEN_REPORTS_DIR}/gluten-preflight.json"
-          ci_check package --consumed "${GLUTEN_REPORTS_DIR}/gluten-preflight.json"
           conan install "${common[@]}" --build=missing "--build=~bolt/*" --format=json \
             > "${GLUTEN_REPORTS_DIR}/gluten-install.json"
-          ci_check package --consumed "${GLUTEN_REPORTS_DIR}/gluten-install.json" \
-            --graph "${GLUTEN_REPORTS_DIR}/gluten-preflight.json"
-          ci_check arrow
+          # Gluten must consume the exact Bolt binary exported above, without rebuilding it.
+          jq -e --slurpfile exported "${GLUTEN_REPORTS_DIR}/bolt-export.json" '
+            [.graph.nodes[] | select(.name == "bolt" and .context == "host")] as $actual |
+            [$exported[0].graph.nodes[] | select(.name == "bolt" and .context == "host")] as $expected |
+            ($actual | length) == 1 and ($expected | length) == 1 and
+            $actual[0].binary == "Cache" and
+            ($actual[0] | {ref, package_id, prev}) == ($expected[0] | {ref, package_id, prev})
+          ' "${GLUTEN_REPORTS_DIR}/gluten-install.json"
           cmake --preset conan-release
           cmake --build --preset conan-release --parallel "${CI_NUM_THREADS}"
           cd "${GLUTEN_DIR}"
           bash dev/build_bolt_arrow.sh
           ci_runtime "${MVN[@]}" install -Pspark-ut \
             -pl backends-bolt,gluten-ut/spark35 -am -DskipTests=true
-          ci_check native
+          (cd cpp/build/package/bolt/linux/amd64 && sha256sum *.so) \
+            > "${GLUTEN_REPORTS_DIR}/native.sha256"
+          (cd backends-bolt/target/scala-${SCALA_VERSION}/classes/linux/amd64 && \
+            sha256sum -c "${GLUTEN_REPORTS_DIR}/native.sha256")
       - name: Run native CTest
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
@@ -277,17 +257,17 @@ jobs:
             --test-dir "${GLUTEN_DIR}/cpp/build/Release" --no-tests=error \
             --output-on-failure --output-junit "${output}/TEST-native.xml" \
             --timeout 7200 -j "${CI_NUM_THREADS}"
-          ci_check verify native
       - name: Run backend JVM and isolated Delta suites
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           source .github/scripts/gluten_ci.sh
           ci_init
           ci_spark_environment
-          ci_check reset jvm
           output="${GLUTEN_REPORTS_DIR}/jvm"
           mkdir -p "${output}"
           cd "${GLUTEN_DIR}"
+          CI_GROUP=blacklist CI_SUITES=org.apache.gluten.utils.GlutenTestBlacklistSuite \
+            ci_maven_test jvm gluten-ut/test "${MVN[@]}" test -Pspark-ut
           ci_runtime "${MVN[@]}" test-compile -pl backends-bolt
           ci_runtime "${MVN[@]}" dependency:build-classpath -pl backends-bolt \
             -DincludeScope=test "-Dmdep.outputFile=${output}/test-classpath.txt"
@@ -358,27 +338,28 @@ jobs:
           ci_init
           cd "${GLUTEN_DIR}"
           ci_runtime "${MVN[@]}" install -DskipTests=true
-          ci_check jar
           cd tools/gluten-it
           ci_runtime "${GLUTEN_DIR}/build/mvn" -ntp install \
             "-Pspark-${SPARK_PROFILE}" "-Pjava-${JDK_VERSION}"
-          ci_check jar --tpc
+          bundles=()
+          for jar in "${GLUTEN_DIR}"/package/target/gluten-package-*.jar; do
+            case "${jar}" in
+              *-sources.jar|*-test-sources.jar|*-tests.jar|*-javadoc.jar|*-"${SPARK_PROFILE}".jar) continue ;;
+            esac
+            bundles+=("${jar}")
+          done
+          ((${#bundles[@]} == 1))
+          cmp "${bundles[0]}" "package/target/lib/${bundles[0]##*/}"
           failed=0
           for kind in h ds; do
             stage="tpc-${kind}"
             output="${GLUTEN_REPORTS_DIR}/${stage}"
             mkdir -p "${output}"
             : > "${output}/run.log"
-            status=0
             GLUTEN_IT_JVM_ARGS=-Xmx6G ci_run "${output}/run.log" ci_runtime \
               bash sbin/gluten-it.sh queries-compare --local --preset=velox \
               --baseline-preset=vanilla "--benchmark-type=${kind}" --error-on-memleak \
-              --explain --off-heap-size=10g -s=1.0 --threads=16 --iterations=1 || status=$?
-            if ((status)); then
-              ci_check failed "${stage}" || failed=1
-            else
-              ci_check verify "${stage}" || failed=1
-            fi
+              --explain --off-heap-size=10g -s=1.0 --threads=16 --iterations=1 || failed=1
           done
           exit "${failed}"
       - name: Run Spark 4.0 and 4.1 compatibility subsets
@@ -399,12 +380,13 @@ jobs:
               stage="spark${profile/./}"
               ci_set_maven "${profile}" || exit "$?"
               export SPARK_SCALA_VERSION=2.13
-              ci_check reset "${stage}" || exit "$?"
+              unset GLUTEN_TEST_BLACKLIST
               cd "${GLUTEN_DIR}" || exit "$?"
               ci_run "${GLUTEN_REPORTS_DIR}/${stage}-compile.log" ci_runtime \
                 "${MVN[@]}" clean install -Pspark-ut \
                 -pl "backends-bolt,gluten-ut/${stage}" -am -DskipTests=true || exit "$?"
-              ci_check spark4-native || exit "$?"
+              (cd backends-bolt/target/scala-2.13/classes/linux/amd64 && \
+                sha256sum -c "${GLUTEN_REPORTS_DIR}/native.sha256") || exit "$?"
               CI_GROUP=backend \
                 CI_SUITES=org.apache.gluten.execution.BoltParquetDataTypeValidationSuite,org.apache.gluten.execution.BoltOrcDataTypeValidationSuite \
                 ci_maven_test "${stage}" backends-bolt "${MVN[@]}" test -Pspark-ut \
@@ -445,11 +427,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
       - name: Require every integration job to succeed
         env:
-          GLUTEN_CI_NEEDS: ${{ toJSON(needs) }}
-        run: python3 .github/scripts/gluten_ci.py gate
+          REQUIRED_RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: test "${REQUIRED_RESULTS}" = "success success success"

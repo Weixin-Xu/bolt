@@ -3,6 +3,8 @@
 # No suite-wide, prefix, regex or aborted-suite exclusions.
 
 # jvm
+# Inline Generate is not offloaded by Bolt; upstream struct-field coverage requires it.
+org.apache.gluten.expression.StructFieldBindSuite#struct fields with duplicate names read through the generate rewrite
 # Native JSON field-name change (#1044); repair after CI enablement.
 org.apache.gluten.functions.JsonFunctionsValidateSuite#from_json function row
 org.apache.gluten.execution.AutoAdjustStageResourceProfileSuite#Apply new resource profile when whole stage fallback

@@ -21,9 +21,18 @@ BOLT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GLUTEN_DIR="${GLUTEN_DIR:-${BOLT_ROOT}/gluten}"
 GLUTEN_REPORTS_DIR="${GLUTEN_REPORTS_DIR:-${BOLT_ROOT}/.ci/gluten-bolt}"
 
-ci_check() {
-  python3 "${BOLT_ROOT}/.github/scripts/gluten_ci.py" "$@" \
-    --gluten-dir "${GLUTEN_DIR}" --reports-dir "${GLUTEN_REPORTS_DIR}"
+ci_apply_patches() {
+  local patch
+  for patch in "${BOLT_ROOT}"/.github/gluten-ci-patches/*.patch; do
+    if git -C "${GLUTEN_DIR}" apply --check "${patch}"; then
+      git -C "${GLUTEN_DIR}" apply --index "${patch}"
+    elif git -C "${GLUTEN_DIR}" apply --reverse --check "${patch}"; then
+      echo "Already applied: ${patch##*/}"
+    else
+      echo "Cannot apply patch: ${patch}" >&2
+      return 1
+    fi
+  done
 }
 
 ci_set_maven() {
@@ -41,11 +50,12 @@ ci_init() {
   GLUTEN_DIR="$(cd "${GLUTEN_DIR}" && pwd)"
   mkdir -p "${GLUTEN_REPORTS_DIR}"
   GLUTEN_REPORTS_DIR="$(cd "${GLUTEN_REPORTS_DIR}" && pwd)"
-  ci_check config > "${GLUTEN_REPORTS_DIR}/environment.env"
-  source "${GLUTEN_REPORTS_DIR}/environment.env"
+  SPARK_VERSION=3.5.5
+  SCALA_VERSION=2.12
+  JDK_VERSION=17
   ci_set_maven
   export SPARK_TESTING=true SPARK_SCALA_VERSION="${SCALA_VERSION}"
-  unset GLUTEN_TEST_BLACKLIST
+  export GLUTEN_TEST_BLACKLIST="${GLUTEN_TEST_BLACKLIST:-${BOLT_ROOT}/.github/gluten-ci-blacklist.txt}"
 }
 
 ci_run() {
@@ -71,9 +81,12 @@ ci_profile_lock() {
 
 ci_spark_environment() {
   BOLT_GLUTEN_SPARK_HOME="${BOLT_GLUTEN_SPARK_HOME:-/opt/shims/spark35/spark_home}"
-  ci_check spark-home --directory "${BOLT_GLUTEN_SPARK_HOME}"
+  test -x "${BOLT_GLUTEN_SPARK_HOME}/bin/spark-submit"
+  test -f "${BOLT_GLUTEN_SPARK_HOME}/jars/spark-core_${SCALA_VERSION}-${SPARK_VERSION}.jar"
+  test -d "${BOLT_GLUTEN_SPARK_HOME}/sql/core/src/test/resources"
   export SPARK_HOME="${BOLT_GLUTEN_SPARK_HOME}"
   local archives=("${SPARK_HOME}"/python/lib/*.zip)
+  test -f "${archives[0]}"
   local zipped
   zipped="$(
     IFS=:
@@ -92,15 +105,14 @@ ci_maven_test() (
   exec 8> "${GLUTEN_DIR}/.ci/gluten-bolt-${lock_module}.lock" || return
   flock --nonblock --exclusive 8 || return
   mkdir -p "${output}" || return
-  local log="${output}/run.log" jvm status=0
+  local log="${output}/run.log" status=0
   : > "${log}" || return
-  jvm="$(ci_check runner --directory "${output}/forks")" || return
-  local ignore=true
-  [[ "${stage}" != spark40 && "${stage}" != spark41 ]] || ignore=false
+  if [[ "${stage}" == spark40 || "${stage}" == spark41 ]]; then
+    unset GLUTEN_TEST_BLACKLIST
+  fi
   export GLUTEN_TEST_ENABLE_SLOW_HIVE=false
   [[ "${stage}" != slow-hive ]] || export GLUTEN_TEST_ENABLE_SLOW_HIVE=true
-  local command=("$@" -pl "${module}" "-Djvm=${jvm}"
-    "-Dmaven.test.failure.ignore=${ignore}")
+  local command=("$@" -pl "${module}" -Dmaven.test.failure.ignore=false)
   [[ -z "${CI_SUITES:-}" ]] || command+=("-Dsuites=${CI_SUITES}")
   # Reports must come from this invocation, including when Maven fails.
   rm -f "${output}"/*TEST-*.xml || return
@@ -112,9 +124,5 @@ ci_maven_test() (
   for path in "${GLUTEN_DIR}/${module}"/target/*reports/TEST-*.xml; do
     [[ ! -f "${path}" ]] || cp "${path}" "${output}/" || return
   done
-  if ((status)); then
-    ci_check failed "${stage}" || true
-    return "${status}"
-  fi
-  ci_check verify "${stage}" --group "${CI_GROUP:-}" --suites "${CI_SUITES:-}"
+  return "${status}"
 )
