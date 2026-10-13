@@ -161,7 +161,9 @@ by Build and Test on pull requests and merge groups, and also supports manual
 dispatch. It tests the candidate Bolt code against `apache/gluten:main`.
 Build and Test exports its tested Spark Release Conan package as a short-lived
 artifact; Gluten restores that package instead of compiling Bolt again. Both
-builds enable HDFS. Manual runs, skipped upstream builds and custom CI images
+builds enable HDFS. Dependencies built during the run travel with the package,
+so downstream jobs reuse them without publishing to a Conan remote.
+Manual runs, skipped upstream builds and custom CI images
 build the candidate Bolt package locally. The `gluten-bolt-check` job in Build
 and Test requires every Gluten job to succeed.
 Native CTest runs with the shared build. Ten independent jobs reuse its native
