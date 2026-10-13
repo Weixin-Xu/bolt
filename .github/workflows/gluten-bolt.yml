@@ -132,6 +132,8 @@ jobs:
     env:
       CI_NUM_THREADS: '16'
       IN_CI: '1'
+      # Java's native path encoding follows the locale, not file.encoding.
+      LC_ALL: C.UTF-8
       GLUTEN_EXCLUDED_TAGS: org.apache.gluten.tags.UDFTest,org.apache.gluten.tags.EnhancedFeaturesTest,org.apache.gluten.tags.CudfTest,org.apache.gluten.tags.SkipTest
     defaults:
       run:
