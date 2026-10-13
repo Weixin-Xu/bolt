@@ -138,6 +138,8 @@ jobs:
       uses: ./.github/actions/bolt-build-base
 
     - name: Bolt build
+      env:
+        BUILD_VERSION: ${{ matrix.build_type == 'release_spark' && format('ci-{0}', github.sha) || 'main' }}
       run: |
         make ${{ matrix.build_target }}
 
@@ -149,6 +151,51 @@ jobs:
     - name: Run tests
       run: |
         make ctest_release
+
+    - name: Export the tested Spark Release package for Gluten
+      if: ${{ matrix.build_type == 'release_spark' }}
+      shell: bash
+      run: |
+        mkdir -p .ci/bolt-spark-release
+        read -r -a options < _build/Release/conan.options
+        conan export-pkg . --name=bolt "--version=ci-${GITHUB_SHA}" \
+          "${options[@]}" -s build_type=Release -c bolt/*:tools.build:skip_test=False \
+          --format=json > .ci/bolt-spark-release/bolt-export.json
+        conan cache save "bolt/ci-${GITHUB_SHA}:*" --no-source \
+          --file .ci/bolt-spark-release/bolt.tgz
+
+    - name: Upload the tested Spark Release package
+      if: ${{ matrix.build_type == 'release_spark' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: bolt-spark-release-${{ github.sha }}
+        path: .ci/bolt-spark-release/
+        compression-level: 0
+        if-no-files-found: error
+        overwrite: true
+        retention-days: 2
+
+  gluten:
+    needs: build-test
+    if: ${{ !cancelled() && (needs.build-test.result == 'success' || needs.build-test.result == 'skipped') }}
+    uses: ./.github/workflows/gluten-bolt.yml
+    with:
+      reuse-bolt: >-
+        ${{ needs.build-test.result == 'success' &&
+            (vars.BOLT_GLUTEN_CI_IMAGE == '' ||
+             vars.BOLT_GLUTEN_CI_IMAGE == 'bolt-registry:5000/bolt-ci:20260921') }}
+
+  gluten-bolt-check:
+    name: gluten-bolt-check
+    needs: gluten
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every Gluten job to succeed
+        env:
+          GLUTEN_RESULT: ${{ needs.gluten.result }}
+        run: test "${GLUTEN_RESULT}" = success
 
   build-only:
       needs: [reuse-check, changes]

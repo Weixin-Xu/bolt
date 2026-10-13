@@ -156,9 +156,14 @@ make release_spark BUILD_VERSION=main
 
 ### Gluten Bolt backend CI
 
-The [Gluten Bolt Backend workflow](.github/workflows/gluten-bolt.yml) runs on
-pull requests, merge groups and manual dispatch. It tests the candidate Bolt
-code against `apache/gluten:main`.
+The [Gluten Bolt Backend workflow](.github/workflows/gluten-bolt.yml) is called
+by Build and Test on pull requests and merge groups, and also supports manual
+dispatch. It tests the candidate Bolt code against `apache/gluten:main`.
+Build and Test exports its tested Spark Release Conan package as a short-lived
+artifact; Gluten restores that package instead of compiling Bolt again. Both
+builds enable HDFS. Manual runs, skipped upstream builds and custom CI images
+build the candidate Bolt package locally. The `gluten-bolt-check` job in Build
+and Test requires every Gluten job to succeed.
 It compiles Spark 3.4/3.5/4.0/4.1 support and runs native, backend JVM, Spark
 and TPC checks. Temporary source compatibility fixes live in
 `.github/gluten-ci-patches/` and are applied explicitly to the resolved Apache

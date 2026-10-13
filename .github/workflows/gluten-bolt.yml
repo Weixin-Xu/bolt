@@ -15,10 +15,12 @@
 name: Gluten Bolt Backend
 
 on:
-  pull_request:
-    branches: [main]
-  merge_group:
-    types: [checks_requested]
+  workflow_call:
+    inputs:
+      reuse-bolt:
+        description: Consume the Spark Release package from this workflow run
+        type: boolean
+        default: false
   workflow_dispatch:
 
 permissions:
@@ -183,7 +185,13 @@ jobs:
           printf 'BOLT_GLUTEN_SPARK_HOME=%s\nSPARK_HOME=%s\nPYTHONPATH=%s\nPYSPARK_PYTHON=%s\n' \
             "${BOLT_GLUTEN_SPARK_HOME}" "${SPARK_HOME}" "${PYTHONPATH}" \
             "$(command -v python3)" >> "${GITHUB_ENV}"
-      - name: Build and export the candidate Bolt package and Gluten native backend
+      - name: Download the tested Spark Release package
+        if: ${{ inputs.reuse-bolt }}
+        uses: actions/download-artifact@v4
+        with:
+          name: bolt-spark-release-${{ github.sha }}
+          path: .ci/bolt-spark-release
+      - name: Prepare the candidate Bolt package and build Gluten native backend
         id: build
         run: |
           source .github/scripts/gluten_ci.sh
@@ -197,32 +205,39 @@ jobs:
           cmake --version
           conan profile show
           options=(-o "bolt/*:spark_compatible=True" -o "bolt/*:enable_testutil=True"
-            -o "bolt/*:shared=False" -o "bolt/*:enable_hdfs=False"
+            -o "bolt/*:shared=False" -o "bolt/*:enable_hdfs=True"
             -o "bolt/*:enable_s3=False" -o "bolt/*:enable_asan=False")
           profile=(-pr:h default)
           if [[ -f scripts/conan/bolt.profile ]]; then
             profile+=(-pr:h "${BOLT_ROOT}/scripts/conan/bolt.profile")
           fi
-          printf -v profile_args '%q ' "${profile[@]}"
-          make release_spark_with_test BOLT_CONAN_CONFIGURE_ONLY=1 \
-            "BUILD_VERSION=${BOLT_BUILD_VERSION}" "CONAN_OVERRIDE=${options[*]}" \
-            "CONAN_HOST_PROFILE_ARGS=${profile_args}"
-          cmake --build --preset conan-release --target bolt_engine bolt_testutils_static \
-            --parallel "${CI_NUM_THREADS}"
+          if [[ -f .ci/bolt-spark-release/bolt.tgz ]]; then
+            conan cache restore .ci/bolt-spark-release/bolt.tgz
+            cp .ci/bolt-spark-release/bolt-export.json "${GLUTEN_REPORTS_DIR}/bolt-export.json"
+            echo "Reusing the tested Spark Release Bolt package: ${BOLT_BUILD_VERSION}"
+          else
+            printf -v profile_args '%q ' "${profile[@]}"
+            make release_spark_with_test BOLT_CONAN_CONFIGURE_ONLY=1 \
+              "BUILD_VERSION=${BOLT_BUILD_VERSION}" "CONAN_OVERRIDE=${options[*]}" \
+              "CONAN_HOST_PROFILE_ARGS=${profile_args}"
+            cmake --build --preset conan-release --target bolt_engine bolt_testutils_static \
+              --parallel "${CI_NUM_THREADS}"
+            conan export-pkg . --name=bolt "--version=${BOLT_BUILD_VERSION}" \
+              "${profile[@]}" -s build_type=Release "${options[@]}" \
+              -c bolt/*:tools.build:skip_test=False \
+              --format=json > "${GLUTEN_REPORTS_DIR}/bolt-export.json"
+          fi
           profile+=(-s build_type=Release)
-          conan export-pkg . --name=bolt "--version=${BOLT_BUILD_VERSION}" \
-            "${profile[@]}" "${options[@]}" -c bolt/*:tools.build:skip_test=False \
-            --format=json > "${GLUTEN_REPORTS_DIR}/bolt-export.json"
           export BOLT_BUILD_VERSION
           cd "${GLUTEN_DIR}/cpp"
           common=(. --name=gluten "--version=${GLUTEN_BUILD_VERSION}"
             "${profile[@]}" "${options[@]}" -o "gluten/*:shared=True"
-            -o "gluten/*:build_tests=True" -o "gluten/*:enable_hdfs=False"
+            -o "gluten/*:build_tests=True" -o "gluten/*:enable_hdfs=True"
             -o "gluten/*:enable_s3=False" -o "gluten/*:enable_asan=False"
             -c arrow/*:tools.build:download_source=True --lockfile=)
           conan install "${common[@]}" --build=missing "--build=~bolt/*" --format=json \
             > "${GLUTEN_REPORTS_DIR}/gluten-install.json"
-          # Gluten must consume the exact Bolt binary exported above, without rebuilding it.
+          # Gluten must consume the exact exported Bolt binary, without rebuilding it.
           jq -e --slurpfile exported "${GLUTEN_REPORTS_DIR}/bolt-export.json" '
             [.graph.nodes[] | select(.name == "bolt" and .context == "host")] as $actual |
             [$exported[0].graph.nodes[] | select(.name == "bolt" and .context == "host")] as $expected |
@@ -420,15 +435,3 @@ jobs:
           path: gluten/cpp/build/releases/
           if-no-files-found: error
           retention-days: 2
-
-  gluten-bolt-check:
-    name: gluten-bolt-check
-    needs: [prepare, compatibility, integration]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Require every integration job to succeed
-        env:
-          REQUIRED_RESULTS: ${{ join(needs.*.result, ' ') }}
-        run: test "${REQUIRED_RESULTS}" = "success success success"
