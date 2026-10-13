@@ -171,8 +171,11 @@ libraries and Spark 3.5 Maven outputs to run backend JVM, Delta, three Spark SQL
 groups, Extended SQL, Slow Hive, TPC and Spark 4.0/4.1 checks in parallel.
 Each job restores its own workspace and verifies the native library hashes;
 Spark 4 jobs compile their JVM modules separately. Reports are uploaded per job.
-It compiles Spark 3.4/3.5/4.0/4.1 support and runs native, backend JVM, Spark
-and TPC checks. Temporary source compatibility fixes live in
+Runtime coverage is Spark 3.5 / Scala 2.12 plus selected Spark 4.0/4.1 suites;
+Spark 3.4 is compilation-only. This does not yet cover the full Velox test
+matrix: Spark 3.5 / Scala 2.13, all storage profiles and the full Spark 4 SQL
+groups are not enabled, and Spark UT selection still uses BoltTestSettings.
+Temporary source compatibility fixes live in
 `.github/gluten-ci-patches/` and are applied explicitly to the resolved Apache
 main. Already-applied patches are accepted; incompatible patches fail the job.
 
