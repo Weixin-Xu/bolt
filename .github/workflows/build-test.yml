@@ -141,7 +141,13 @@ jobs:
       env:
         BUILD_VERSION: ${{ matrix.build_type == 'release_spark' && format('ci-{0}', github.sha) || 'main' }}
       run: |
-        make ${{ matrix.build_target }}
+        if [ "${{ matrix.build_type }}" = release_spark ]; then
+          mkdir -p .ci/bolt-spark-release
+          make ${{ matrix.build_target }} \
+            "CONAN_TEST_CONFIG=-c bolt/*:tools.build:skip_test=False --format=json --out-file=${PWD}/.ci/bolt-spark-release/bolt-build.json"
+        else
+          make ${{ matrix.build_target }}
+        fi
 
     - name: Run clang-tidy
       if: ${{ matrix.build_type == 'release_spark' }}
@@ -161,7 +167,14 @@ jobs:
         conan export-pkg . --name=bolt "--version=ci-${GITHUB_SHA}" \
           "${options[@]}" -s build_type=Release -c bolt/*:tools.build:skip_test=False \
           --format=json > .ci/bolt-spark-release/bolt-export.json
-        conan cache save "bolt/ci-${GITHUB_SHA}:*" --no-source \
+        conan list --graph .ci/bolt-spark-release/bolt-build.json --graph-binaries=Build \
+          --format=json > .ci/bolt-spark-release/built-dependencies.json
+        conan list "bolt/ci-${GITHUB_SHA}:*#latest" \
+          --format=json > .ci/bolt-spark-release/bolt-package.json
+        conan pkglist merge --list .ci/bolt-spark-release/built-dependencies.json \
+          --list .ci/bolt-spark-release/bolt-package.json \
+          --format=json > .ci/bolt-spark-release/packages.json
+        conan cache save --list .ci/bolt-spark-release/packages.json --no-source \
           --file .ci/bolt-spark-release/bolt.tgz
 
     - name: Upload the tested Spark Release package

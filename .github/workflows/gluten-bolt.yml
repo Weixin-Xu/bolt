@@ -189,12 +189,14 @@ jobs:
           if [[ -f .ci/bolt-spark-release/bolt.tgz ]]; then
             conan cache restore .ci/bolt-spark-release/bolt.tgz
             cp .ci/bolt-spark-release/bolt-export.json "${GLUTEN_REPORTS_DIR}/bolt-export.json"
+            cp .ci/bolt-spark-release/bolt-build.json "${GLUTEN_REPORTS_DIR}/bolt-build.json"
             echo "Reusing the tested Spark Release Bolt package: ${BOLT_BUILD_VERSION}"
           else
             printf -v profile_args '%q ' "${profile[@]}"
             make release_spark_with_test BOLT_CONAN_CONFIGURE_ONLY=1 \
               "BUILD_VERSION=${BOLT_BUILD_VERSION}" "CONAN_OVERRIDE=${options[*]}" \
-              "CONAN_HOST_PROFILE_ARGS=${profile_args}"
+              "CONAN_HOST_PROFILE_ARGS=${profile_args}" \
+              "CONAN_TEST_CONFIG=-c bolt/*:tools.build:skip_test=False --format=json --out-file=${GLUTEN_REPORTS_DIR}/bolt-build.json"
             cmake --build --preset conan-release --target bolt_engine bolt_testutils_static \
               --parallel "${CI_NUM_THREADS}"
             conan export-pkg . --name=bolt "--version=${BOLT_BUILD_VERSION}" \
@@ -202,6 +204,8 @@ jobs:
               -c bolt/*:tools.build:skip_test=False \
               --format=json > "${GLUTEN_REPORTS_DIR}/bolt-export.json"
           fi
+          conan list --graph "${GLUTEN_REPORTS_DIR}/bolt-build.json" --graph-binaries=Build \
+            --format=json > "${GLUTEN_REPORTS_DIR}/bolt-built-dependencies.json"
           profile+=(-s build_type=Release)
           export BOLT_BUILD_VERSION
           cd "${GLUTEN_DIR}/cpp"
@@ -254,10 +258,16 @@ jobs:
         run: |
           source .github/scripts/gluten_ci.sh
           ci_init
-          conan cache save "bolt/ci-$(git rev-parse HEAD):*" --no-source \
+          conan list "bolt/ci-$(git rev-parse HEAD):*#latest" \
+            --format=json > "${GLUTEN_REPORTS_DIR}/bolt-package.json"
+          conan list --graph "${GLUTEN_REPORTS_DIR}/gluten-install.json" --graph-binaries=Build \
+            --format=json > "${GLUTEN_REPORTS_DIR}/gluten-built-dependencies.json"
+          conan pkglist merge --list "${GLUTEN_REPORTS_DIR}/bolt-package.json" \
+            --list "${GLUTEN_REPORTS_DIR}/bolt-built-dependencies.json" \
+            --list "${GLUTEN_REPORTS_DIR}/gluten-built-dependencies.json" \
+            --format=json > "${GLUTEN_REPORTS_DIR}/packages.json"
+          conan cache save --list "${GLUTEN_REPORTS_DIR}/packages.json" --no-source \
             --file "${GLUTEN_REPORTS_DIR}/bolt.tgz"
-          conan cache save 'benchmark/*:*' --no-source \
-            --file "${GLUTEN_REPORTS_DIR}/benchmark.tgz"
           # Preserve Maven's installed reactor and patched Arrow artifacts.
           tar -C "${HOME}/.m2/repository" -I 'gzip -1' -cf "${GLUTEN_REPORTS_DIR}/maven.tgz" \
             org/apache/gluten org/apache/arrow
@@ -276,7 +286,6 @@ jobs:
           name: gluten-bolt-test-build-${{ github.sha }}
           path: |
             .ci/gluten-bolt/bolt.tgz
-            .ci/gluten-bolt/benchmark.tgz
             .ci/gluten-bolt/maven.tgz
             .ci/gluten-bolt/test-build.tgz
             .ci/gluten-bolt/bolt-export.json
@@ -387,7 +396,6 @@ jobs:
           GLUTEN_BUILD_VERSION="ci-$(git -C "${GLUTEN_DIR}" rev-parse HEAD)"
           ci_conan_options
           conan cache restore "${GLUTEN_REPORTS_DIR}/bolt.tgz"
-          conan cache restore "${GLUTEN_REPORTS_DIR}/benchmark.tgz"
           mkdir -p "${HOME}/.m2/repository"
           tar -C "${HOME}/.m2/repository" -xzf "${GLUTEN_REPORTS_DIR}/maven.tgz"
           tar -C "${GLUTEN_DIR}" -xzf "${GLUTEN_REPORTS_DIR}/test-build.tgz"
