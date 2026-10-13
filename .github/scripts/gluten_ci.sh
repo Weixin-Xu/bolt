@@ -58,6 +58,30 @@ ci_init() {
   export GLUTEN_TEST_BLACKLIST="${GLUTEN_TEST_BLACKLIST:-${BOLT_ROOT}/.github/gluten-ci-blacklist.txt}"
 }
 
+ci_conan_options() {
+  options=(-o "bolt/*:spark_compatible=True" -o "bolt/*:enable_testutil=True"
+    -o "bolt/*:shared=False" -o "bolt/*:enable_hdfs=True"
+    -o "bolt/*:enable_s3=False" -o "bolt/*:enable_asan=False")
+  gluten_options=(-o "gluten/*:shared=True" -o "gluten/*:build_tests=True"
+    -o "gluten/*:enable_hdfs=True" -o "gluten/*:enable_s3=False"
+    -o "gluten/*:enable_asan=False")
+  profile=(-pr:h default)
+  if [[ -f "${BOLT_ROOT}/scripts/conan/bolt.profile" ]]; then
+    profile+=(-pr:h "${BOLT_ROOT}/scripts/conan/bolt.profile")
+  fi
+}
+
+ci_verify_bolt_package() {
+  # Gluten must consume the exact exported Bolt binary, without rebuilding it.
+  jq -e --slurpfile exported "${GLUTEN_REPORTS_DIR}/bolt-export.json" '
+    [.graph.nodes[] | select(.name == "bolt" and .context == "host")] as $actual |
+    [$exported[0].graph.nodes[] | select(.name == "bolt" and .context == "host")] as $expected |
+    ($actual | length) == 1 and ($expected | length) == 1 and
+    $actual[0].binary == "Cache" and
+    ($actual[0] | {ref, package_id, prev}) == ($expected[0] | {ref, package_id, prev})
+  ' "${GLUTEN_REPORTS_DIR}/gluten-install.json"
+}
+
 ci_run() {
   local log="$1"
   shift

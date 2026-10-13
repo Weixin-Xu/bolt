@@ -164,6 +164,11 @@ artifact; Gluten restores that package instead of compiling Bolt again. Both
 builds enable HDFS. Manual runs, skipped upstream builds and custom CI images
 build the candidate Bolt package locally. The `gluten-bolt-check` job in Build
 and Test requires every Gluten job to succeed.
+Native CTest runs with the shared build. Ten independent jobs reuse its native
+libraries and Spark 3.5 Maven outputs to run backend JVM, Delta, three Spark SQL
+groups, Extended SQL, Slow Hive, TPC and Spark 4.0/4.1 checks in parallel.
+Each job restores its own workspace and verifies the native library hashes;
+Spark 4 jobs compile their JVM modules separately. Reports are uploaded per job.
 It compiles Spark 3.4/3.5/4.0/4.1 support and runs native, backend JVM, Spark
 and TPC checks. Temporary source compatibility fixes live in
 `.github/gluten-ci-patches/` and are applied explicitly to the resolved Apache
@@ -216,7 +221,7 @@ CI_SUITES=org.apache.gluten.execution.BoltLiteralSuite \
     "-DargLine=-Dspark.test.home=${SPARK_HOME}"
 ```
 
-Build and test commands are in the `integration` job's `run`
+Build and test commands are in the `build` and `integration` jobs' `run`
 blocks in `.github/workflows/gluten-bolt.yml`; execute them in order for a
 complete local run. The build block configures Release and exports the
 candidate Bolt package into the selected Conan home. The example above runs
