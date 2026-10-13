@@ -83,3 +83,52 @@ index 860e95e9e7..cf899aaac4 100644
                std::unique_lock<std::recursive_mutex> l(mutex);
                return vmms[i]->getMemoryManager()->arbitrator()->shrinkCapacity(bytes, true);
              }));
+diff --git a/dev/build_bolt_arrow.sh b/dev/build_bolt_arrow.sh
+index d20f3dee68..c9642e639d 100644
+--- a/dev/build_bolt_arrow.sh
++++ b/dev/build_bolt_arrow.sh
+@@ -29,6 +29,8 @@ function prepare_arrow_build() {
+     ARROW_CACHE_DIR=$(conan cache path arrow/${BOLT_ARROW_BUILD_VERSION})
+     ARROW_SOURCE_DIR=${ARROW_CACHE_DIR}/../s/src
+     cp -a ${ARROW_SOURCE_DIR}/. ${ARROW_PREFIX}
++    # THRIFT-5842: Thrift 0.16 needs an explicit cstdint include with GCC 15+.
++    patch -d "${ARROW_PREFIX}" -p1 < "${CURRENT_DIR}/bolt-arrow-thrift.patch"
+ }
+
+ function build_arrow_java() {
+diff --git a/dev/bolt-arrow-thrift.patch b/dev/bolt-arrow-thrift.patch
+new file mode 100644
+index 0000000000..20ac226388
+--- /dev/null
++++ b/dev/bolt-arrow-thrift.patch
+@@ -0,0 +1,30 @@
++--- a/cpp/cmake_modules/ThirdpartyToolchain.cmake
+++++ b/cpp/cmake_modules/ThirdpartyToolchain.cmake
++@@ -1684,11 +1684,14 @@
++     set(THRIFT_DEPENDENCIES ${THRIFT_DEPENDENCIES} boost_ep)
++   endif()
++
+++  find_program(THRIFT_PATCH patch REQUIRED)
++   externalproject_add(thrift_ep
++                       ${EP_COMMON_OPTIONS}
++                       URL ${THRIFT_SOURCE_URL}
++                       URL_HASH "SHA256=${ARROW_THRIFT_BUILD_SHA256_CHECKSUM}"
++                       BUILD_BYPRODUCTS "${THRIFT_LIB}"
+++                      PATCH_COMMAND ${THRIFT_PATCH} -p1 -i
+++                                    ${CMAKE_CURRENT_LIST_DIR}/thrift-cstdint.diff
++                       CMAKE_ARGS ${THRIFT_CMAKE_ARGS}
++                       DEPENDS ${THRIFT_DEPENDENCIES})
++
++--- /dev/null
+++++ b/cpp/cmake_modules/thrift-cstdint.diff
++@@ -0,0 +1,10 @@
+++--- a/lib/cpp/src/thrift/concurrency/Mutex.h
++++++ b/lib/cpp/src/thrift/concurrency/Mutex.h
+++@@ -20,6 +20,7 @@
+++ #ifndef _THRIFT_CONCURRENCY_MUTEX_H_
+++ #define _THRIFT_CONCURRENCY_MUTEX_H_ 1
+++
++++#include <cstdint>
+++ #include <memory>
+++ #include <thrift/TNonCopyable.h>
+++
