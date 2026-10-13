@@ -407,6 +407,7 @@ jobs:
             gluten/**/core.*
             /var/log/java/hs_err_*.log
             gluten/cpp/build/Release/Testing/Temporary/
+            gluten/ep/_ep/arrow_ep/**/src/*-stamp/*.log
           if-no-files-found: error
           retention-days: 14
       - name: Preserve native artifacts from this run
