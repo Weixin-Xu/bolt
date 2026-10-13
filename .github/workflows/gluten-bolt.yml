@@ -196,7 +196,7 @@ jobs:
             make release_spark_with_test BOLT_CONAN_CONFIGURE_ONLY=1 \
               "BUILD_VERSION=${BOLT_BUILD_VERSION}" "CONAN_OVERRIDE=${options[*]}" \
               "CONAN_HOST_PROFILE_ARGS=${profile_args}" \
-              "CONAN_TEST_CONFIG=-c bolt/*:tools.build:skip_test=False --format=json --out-file=${GLUTEN_REPORTS_DIR}/bolt-build.json"
+              "CONAN_BUILD_ARGS=--format=json --out-file=${GLUTEN_REPORTS_DIR}/bolt-build.json"
             cmake --build --preset conan-release --target bolt_engine bolt_testutils_static \
               --parallel "${CI_NUM_THREADS}"
             conan export-pkg . --name=bolt "--version=${BOLT_BUILD_VERSION}" \
