@@ -144,7 +144,7 @@ jobs:
         if [ "${{ matrix.build_type }}" = release_spark ]; then
           mkdir -p .ci/bolt-spark-release
           make ${{ matrix.build_target }} \
-            "CONAN_TEST_CONFIG=-c bolt/*:tools.build:skip_test=False --format=json --out-file=${PWD}/.ci/bolt-spark-release/bolt-build.json"
+            "CONAN_BUILD_ARGS=--format=json --out-file=${PWD}/.ci/bolt-spark-release/bolt-build.json"
         else
           make ${{ matrix.build_target }}
         fi
