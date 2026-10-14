@@ -256,7 +256,7 @@ jobs:
           conan cache save --list "${GLUTEN_REPORTS_DIR}/packages.json" --no-source \
             --file "${GLUTEN_REPORTS_DIR}/bolt.tgz"
           # Preserve Maven's installed reactor and patched Arrow artifacts.
-          tar -C "${HOME}/.m2/repository" -I 'gzip -1' -cf "${GLUTEN_REPORTS_DIR}/maven.tgz" \
+          tar -C "${GLUTEN_MAVEN_REPO}" -I 'gzip -1' -cf "${GLUTEN_REPORTS_DIR}/maven.tgz" \
             org/apache/gluten org/apache/arrow
           cd "${GLUTEN_DIR}"
           targets=(cpp/build/package)
@@ -383,8 +383,8 @@ jobs:
           GLUTEN_BUILD_VERSION="ci-$(git -C "${GLUTEN_DIR}" rev-parse HEAD)"
           ci_conan_options
           conan cache restore "${GLUTEN_REPORTS_DIR}/bolt.tgz"
-          mkdir -p "${HOME}/.m2/repository"
-          tar -C "${HOME}/.m2/repository" -xzf "${GLUTEN_REPORTS_DIR}/maven.tgz"
+          mkdir -p "${GLUTEN_MAVEN_REPO}"
+          tar -C "${GLUTEN_MAVEN_REPO}" -xzf "${GLUTEN_REPORTS_DIR}/maven.tgz"
           tar -C "${GLUTEN_DIR}" -xzf "${GLUTEN_REPORTS_DIR}/test-build.tgz"
           rm "${GLUTEN_REPORTS_DIR}"/*.tgz
           cd "${GLUTEN_DIR}/cpp"
