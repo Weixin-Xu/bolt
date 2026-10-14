@@ -138,7 +138,13 @@ ci_maven_test() (
   fi
   export GLUTEN_TEST_ENABLE_SLOW_HIVE=false
   [[ "${stage}" != slow-hive ]] || export GLUTEN_TEST_ENABLE_SLOW_HIVE=true
-  local command=("$@" -pl "${module}" -Dmaven.test.failure.ignore=false)
+  local command=("$@" -Dmaven.test.failure.ignore=false)
+  if [[ "${module}" == gluten-ut/* ]]; then
+    # Keep active backend storage dependencies on the SQL test classpath.
+    command+=(-pl "backends-bolt,${module}" -Dbolt.skipTests=true)
+  else
+    command+=(-pl "${module}")
+  fi
   [[ -z "${CI_SUITES:-}" ]] || command+=("-Dsuites=${CI_SUITES}")
   # Reports must come from this invocation, including when Maven fails.
   rm -f "${output}"/*TEST-*.xml || return
@@ -146,6 +152,10 @@ ci_maven_test() (
   rm -f "${reports[@]}" || return
   cd "${GLUTEN_DIR}" || return
   ci_run "${log}" ci_runtime "${command[@]}" || status=$?
+  if grep -Fq 'Cannot use org.apache.gluten.extension.GlutenSessionExtensions' "${log}"; then
+    echo "Gluten session extension failed to initialize" | tee -a "${log}" >&2
+    status=1
+  fi
   local path suite executed=0 count
   for path in "${GLUTEN_DIR}/${module}"/target/*reports/TEST-*.xml; do
     [[ -f "${path}" ]] || continue
