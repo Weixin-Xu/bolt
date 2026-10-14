@@ -788,18 +788,40 @@ diff --git a/tools/gluten-it/sbin/gluten-it.sh b/tools/gluten-it/sbin/gluten-it.
  
  EMBEDDED_SPARK_HOME=$BASEDIR/../spark-home
 diff --git a/backends-bolt/pom.xml b/backends-bolt/pom.xml
-index e120f50bd4..d6f309d0e4 100644
+index e120f50bd4..c719a3fd99 100644
 --- a/backends-bolt/pom.xml
 +++ b/backends-bolt/pom.xml
-@@ -32,6 +32,7 @@
+@@ -29,9 +29,11 @@
+   <name>Gluten Backends Bolt</name>
+
+   <properties>
++    <bolt.skipTests>${skipTests}</bolt.skipTests>
      <cpp.build.dir>../cpp/build/</cpp.build.dir>
      <cpp.bolt.package.dir>${cpp.build.dir}/package/bolt/${platform}/${arch}/</cpp.bolt.package.dir>
      <byte-buddy.version>1.9.3</byte-buddy.version>
 +    <iceberg.spark.artifact.prefix>iceberg-spark-runtime</iceberg.spark.artifact.prefix>
    </properties>
- 
+
    <dependencies>
-@@ -365,6 +366,153 @@
+@@ -244,6 +246,9 @@
+       <plugin>
+         <groupId>org.apache.maven.plugins</groupId>
+         <artifactId>maven-surefire-plugin</artifactId>
++        <configuration>
++          <skipTests>${bolt.skipTests}</skipTests>
++        </configuration>
+       </plugin>
+       <plugin>
+         <groupId>org.scalastyle</groupId>
+@@ -261,6 +266,7 @@
+         <groupId>org.scalatest</groupId>
+         <artifactId>scalatest-maven-plugin</artifactId>
+         <configuration>
++          <skipTests>${bolt.skipTests}</skipTests>
+           <junitxml>.</junitxml>
+           <tagsToExclude>${tagsToExclude}</tagsToExclude>
+           <systemProperties>
+@@ -365,6 +371,153 @@
          </dependency>
        </dependencies>
      </profile>
@@ -953,7 +975,7 @@ index e120f50bd4..d6f309d0e4 100644
      <profile>
        <id>iceberg</id>
        <activation>
-@@ -389,7 +537,7 @@
+@@ -389,7 +542,7 @@
          </dependency>
          <dependency>
            <groupId>org.apache.iceberg</groupId>
