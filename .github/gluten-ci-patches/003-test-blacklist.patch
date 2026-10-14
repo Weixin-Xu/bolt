@@ -1,9 +1,9 @@
 diff --git a/gluten-substrait/src/test/scala/org/apache/gluten/utils/GlutenTestBlacklist.scala b/gluten-substrait/src/test/scala/org/apache/gluten/utils/GlutenTestBlacklist.scala
 new file mode 100644
-index 000000000..8f9b039a1
+index 000000000..081d1c70e
 --- /dev/null
 +++ b/gluten-substrait/src/test/scala/org/apache/gluten/utils/GlutenTestBlacklist.scala
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,92 @@
 +/*
 + * Licensed to the Apache Software Foundation (ASF) under one or more
 + * contributor license agreements.  See the NOTICE file distributed with
@@ -51,9 +51,6 @@ index 000000000..8f9b039a1
 +  // Unset means disabled. A configured file must be readable and contain unique
 +  // canonical suite#exact test name entries, optionally prefixed with [Spark/Scala]; blank lines and # comments are allowed.
 +  private lazy val entries = load(sys.env.get("GLUTEN_TEST_BLACKLIST"))
-+
-+  def isExcluded(suiteName: String, testName: String): Boolean =
-+    entries.contains((suiteName, testName))
 +
 +  private[gluten] def load(path: Option[String]): Set[(String, String)] = {
 +    path.map {

@@ -450,7 +450,7 @@ jobs:
           ci_init
           ci_restore_native
           ci_restore_jvm
-      - name: Run backend JVM and isolated Delta suites
+      - name: Run backend JVM, Iceberg helpers and isolated Delta suites
         if: ${{ !cancelled() && steps.restore.outcome == 'success' && (matrix.stage == 'jvm' || matrix.stage == 'delta' || matrix.stage == 'iceberg') }}
         run: |
           source .github/scripts/gluten_ci.sh
@@ -460,6 +460,7 @@ jobs:
           mkdir -p "${output}"
           cd "${GLUTEN_DIR}"
           if [[ "${CI_TEST_STAGE}" == iceberg ]]; then
+            echo "Native Iceberg connector fixtures are excluded; running Java helper/backend UTs"
             # Iceberg's unshaded JUnit dependencies conflict with Spark's ORC API.
             # Scala backend tests use the existing regular spark34-slow artifact.
             ci_maven_test jvm backends-bolt "${MVN[@]}" surefire:test \

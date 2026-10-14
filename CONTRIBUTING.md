@@ -169,15 +169,19 @@ Actions artifacts, without publishing to a Conan remote. The `gluten-bolt-check`
 job in Build and Test requires every Gluten job to succeed.
 Native CTest runs with the shared build. JVM compilation runs once per
 Spark/Scala/storage configuration; parallel test jobs restore the matching
-outputs, verify the native library hashes and invoke test runners directly. Spark 3.4 Iceberg JUnit fixtures
-run separately from Scala backend tests because their ORC dependencies conflict;
-Scala tests reuse the regular profile already built for Extended SQL/Slow Hive.
+outputs, verify the native library hashes and invoke test runners directly.
+Native Iceberg connector tests are skipped because Bolt does not implement that
+connector. The inherited Java fixtures are still compiled; Iceberg helper and
+ordinary backend Java UTs run separately from Scala tests because their ORC
+dependencies conflict. Scala tests reuse the regular profile already built for
+Extended SQL/Slow Hive and retain the Iceberg fallback test that checks ordinary
+Parquet scans remain offloaded when native Iceberg reads are disabled.
 Reports are uploaded per job.
 The regular x86 test scope follows Gluten's `velox_backend_x86.yml`:
 
 | Spark / Scala | Storage profiles | Spark SQL groups |
 | --- | --- | --- |
-| 3.4 / 2.12 | Iceberg (including Java tests), Delta, Hudi, Paimon | Three regular groups, Extended SQL, Slow Hive |
+| 3.4 / 2.12 | Iceberg (helper Java UTs), Delta, Hudi, Paimon | Three regular groups, Extended SQL, Slow Hive |
 | 3.5 / 2.12 | Iceberg, Delta, Hudi, Paimon | Three regular groups, Extended SQL, Slow Hive |
 | 3.5 / 2.13 | Iceberg, Delta | Three regular groups |
 | 4.0 / 2.13 | Delta, Paimon (Paimon excluded from Slow Hive) | Three regular groups, Extended SQL, Slow Hive |
@@ -270,8 +274,9 @@ registers matching cases as ignored before executing their bodies. Unlisted
 failures, compilation errors, suite aborts and crashes remain fatal to Maven.
 Entries use `[Spark/Scala]suite#exact testcase`, for example the version prefix
 `[3.5/2.12]`; exclusions apply only to that Spark minor and Scala binary version.
-The blacklist covers ScalaTest and the Bolt Iceberg JUnit fixtures, including
-exact parameterized invocations. Unset
+The blacklist covers exact observed failures in supported tests. Unsupported
+native Iceberg connector tests are excluded in `backends-bolt` rather than
+enumerated in this file. Unset
 `GLUTEN_TEST_BLACKLIST` after `ci_init` to retest excluded cases. Remove entries
 only after verifying the corresponding fixes.
 
