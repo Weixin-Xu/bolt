@@ -1,9 +1,9 @@
 diff --git a/gluten-substrait/src/test/scala/org/apache/gluten/utils/GlutenTestBlacklist.scala b/gluten-substrait/src/test/scala/org/apache/gluten/utils/GlutenTestBlacklist.scala
 new file mode 100644
-index 000000000..fcfc2792b
+index 000000000..8f9b039a1
 --- /dev/null
 +++ b/gluten-substrait/src/test/scala/org/apache/gluten/utils/GlutenTestBlacklist.scala
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,95 @@
 +/*
 + * Licensed to the Apache Software Foundation (ASF) under one or more
 + * contributor license agreements.  See the NOTICE file distributed with
@@ -49,8 +49,11 @@ index 000000000..fcfc2792b
 +
 +object GlutenTestBlacklist {
 +  // Unset means disabled. A configured file must be readable and contain unique
-+  // canonical suite#exact test name entries; blank lines and # comments are allowed.
++  // canonical suite#exact test name entries, optionally prefixed with [Spark/Scala]; blank lines and # comments are allowed.
 +  private lazy val entries = load(sys.env.get("GLUTEN_TEST_BLACKLIST"))
++
++  def isExcluded(suiteName: String, testName: String): Boolean =
++    entries.contains((suiteName, testName))
 +
 +  private[gluten] def load(path: Option[String]): Set[(String, String)] = {
 +    path.map {
@@ -64,19 +67,32 @@ index 000000000..fcfc2792b
 +              throw new IllegalArgumentException(s"Cannot read GLUTEN_TEST_BLACKLIST '$file'", e)
 +          }
 +        val entries = mutable.Set.empty[(String, String)]
++        val seen = mutable.Set.empty[String]
++        val sparkVersion = org.apache.spark.SPARK_VERSION.split("\\.").take(2).mkString(".")
++        val scalaVersion =
++          scala.util.Properties.versionNumberString.split("\\.").take(2).mkString(".")
++        val scoped = "\\[(\\d+\\.\\d+)/(\\d+\\.\\d+)\\](.+)".r
 +        lines.zipWithIndex.foreach {
 +          case (line, index) if line.trim.nonEmpty && !line.trim.startsWith("#") =>
-+            val separator = line.indexOf('#')
 +            val location = s"GLUTEN_TEST_BLACKLIST $file:${index + 1}"
++            val (matchesVersion, entry) = line match {
++              case scoped(spark, scala, value) =>
++                (spark == sparkVersion && scala == scalaVersion, value)
++              case value => (true, value)
++            }
++            val separator = entry.indexOf('#')
 +            require(separator > 0, s"$location: expected canonical suite#exact test name")
-+            val suite = line.substring(0, separator)
-+            val testName = line.substring(separator + 1)
++            val suite = entry.substring(0, separator)
++            val testName = entry.substring(separator + 1)
 +            require(
 +              suite.matches("[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)+") &&
 +                testName.trim.nonEmpty,
 +              s"$location: expected canonical suite#exact test name"
 +            )
-+            require(entries.add((suite, testName)), s"$location: duplicate entry '$line'")
++            require(seen.add(line), s"$location: duplicate entry '$line'")
++            if (matchesVersion) {
++              entries.add((suite, testName))
++            }
 +          case _ =>
 +        }
 +        entries.toSet
@@ -133,10 +149,10 @@ index c51602208..470cfac54 100644
    protected val basePath: String =
 diff --git a/gluten-ut/test/src/test/scala/org/apache/gluten/utils/GlutenTestBlacklistSuite.scala b/gluten-ut/test/src/test/scala/org/apache/gluten/utils/GlutenTestBlacklistSuite.scala
 new file mode 100644
-index 000000000..e9d4db0a1
+index 000000000..a7161f4d8
 --- /dev/null
 +++ b/gluten-ut/test/src/test/scala/org/apache/gluten/utils/GlutenTestBlacklistSuite.scala
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,192 @@
 +/*
 + * Licensed to the Apache Software Foundation (ASF) under one or more
 + * contributor license agreements.  See the NOTICE file distributed with
@@ -188,6 +204,18 @@ index 000000000..e9d4db0a1
 +
 +  test("comments and blank lines are allowed and test names retain hashes") {
 +    withBlacklist(s"# comment\n\n$fixtureSuiteName#listed # case\n") {
++      path =>
++        assert(GlutenTestBlacklist.load(Some(path)) == Set((fixtureSuiteName, "listed # case")))
++    }
++  }
++
++  test("version scoped exclusions do not suppress other Spark or Scala versions") {
++    val spark = org.apache.spark.SPARK_VERSION.split("\\.").take(2).mkString(".")
++    val scalaVersion = scala.util.Properties.versionNumberString.split("\\.").take(2).mkString(".")
++    withBlacklist(
++      s"[$spark/$scalaVersion]$fixtureSuiteName#listed # case\n" +
++        s"[0.0/$scalaVersion]$fixtureSuiteName#unlisted\n" +
++        s"[$spark/0.0]$fixtureSuiteName#unlisted\n") {
 +      path =>
 +        assert(GlutenTestBlacklist.load(Some(path)) == Set((fixtureSuiteName, "listed # case")))
 +    }
@@ -317,3 +345,87 @@ index 000000000..e9d4db0a1
 +  test("listed")(fail("blacklisted backend test body executed"))
 +  test("unlisted")(assert(true))
 +}
+diff --git a/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala b/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
+index ab7738c89..fcce17411 100644
+--- a/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
++++ b/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
+@@ -18,7 +18,7 @@ package org.apache.spark.sql
+
+ import org.apache.gluten.config.GlutenConfig
+ import org.apache.gluten.exception.GlutenException
+-import org.apache.gluten.utils.{BackendTestSettings, BackendTestUtils}
++import org.apache.gluten.utils.{BackendTestSettings, BackendTestUtils, GlutenTestBlacklist}
+
+ import org.apache.spark.{SparkConf, SparkException, SparkThrowable}
+ import org.apache.spark.ErrorMessageFormat.MINIMAL
+@@ -128,6 +128,7 @@ import scala.util.control.NonFatal
+ @ExtendedSQLTest
+ class GlutenSQLQueryTestSuite
+   extends QueryTest
++  with GlutenTestBlacklist
+   with SharedSparkSession
+   with SQLHelper
+   with SQLQueryTestHelper {
+diff --git a/gluten-ut/spark35/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala b/gluten-ut/spark35/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
+index 2ee9ecdaa..407ba91f9 100644
+--- a/gluten-ut/spark35/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
++++ b/gluten-ut/spark35/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
+@@ -18,7 +18,7 @@ package org.apache.spark.sql
+
+ import org.apache.gluten.config.GlutenConfig
+ import org.apache.gluten.exception.GlutenException
+-import org.apache.gluten.utils.{BackendTestSettings, BackendTestUtils}
++import org.apache.gluten.utils.{BackendTestSettings, BackendTestUtils, GlutenTestBlacklist}
+
+ import org.apache.spark.{SparkConf, SparkException, SparkThrowable, TestUtils}
+ import org.apache.spark.ErrorMessageFormat.MINIMAL
+@@ -60,6 +60,7 @@ import scala.util.control.NonFatal
+ @ExtendedSQLTest
+ class GlutenSQLQueryTestSuite
+   extends QueryTest
++  with GlutenTestBlacklist
+   with SharedSparkSession
+   with SQLHelper
+   with SQLQueryTestHelper {
+diff --git a/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala b/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
+index fb40c2de2..53698f1ec 100644
+--- a/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
++++ b/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
+@@ -18,7 +18,7 @@ package org.apache.spark.sql
+
+ import org.apache.gluten.config.GlutenConfig
+ // import org.apache.gluten.exception.GlutenException
+-import org.apache.gluten.utils.{BackendTestSettings, BackendTestUtils}
++import org.apache.gluten.utils.{BackendTestSettings, BackendTestUtils, GlutenTestBlacklist}
+
+ import org.apache.spark.{SparkConf, TestUtils}
+ // import org.apache.spark.ErrorMessageFormat.MINIMAL
+@@ -61,6 +61,7 @@ import scala.collection.mutable.ArrayBuffer
+ @ExtendedSQLTest
+ class GlutenSQLQueryTestSuite
+   extends QueryTest
++  with GlutenTestBlacklist
+   with SharedSparkSession
+   with SQLHelper
+   with SQLQueryTestHelper {
+diff --git a/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala b/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
+index fb40c2de2..53698f1ec 100644
+--- a/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
++++ b/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/GlutenSQLQueryTestSuite.scala
+@@ -18,7 +18,7 @@ package org.apache.spark.sql
+
+ import org.apache.gluten.config.GlutenConfig
+ // import org.apache.gluten.exception.GlutenException
+-import org.apache.gluten.utils.{BackendTestSettings, BackendTestUtils}
++import org.apache.gluten.utils.{BackendTestSettings, BackendTestUtils, GlutenTestBlacklist}
+
+ import org.apache.spark.{SparkConf, TestUtils}
+ // import org.apache.spark.ErrorMessageFormat.MINIMAL
+@@ -61,6 +61,7 @@ import scala.collection.mutable.ArrayBuffer
+ @ExtendedSQLTest
+ class GlutenSQLQueryTestSuite
+   extends QueryTest
++  with GlutenTestBlacklist
+   with SharedSparkSession
+   with SQLHelper
+   with SQLQueryTestHelper {

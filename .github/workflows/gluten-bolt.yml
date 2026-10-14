@@ -40,78 +40,6 @@ jobs:
           [[ "${sha}" =~ ^[0-9a-f]{40}$ && "${ref}" == refs/heads/main ]]
           echo "gluten_sha=${sha}" >> "${GITHUB_OUTPUT}"
 
-  compatibility:
-    needs: prepare
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - spark: '3.4'
-            module: spark34
-            scala: '2.13'
-          - spark: '3.5'
-            module: spark35
-            scala: '2.12'
-          - spark: '4.0'
-            module: spark40
-            scala: '2.13'
-          - spark: '4.1'
-            module: spark41
-            scala: '2.13'
-    steps:
-      - name: Checkout the tested Bolt merge commit
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Checkout resolved Apache Gluten main
-        uses: actions/checkout@v6
-        with:
-          repository: apache/gluten
-          ref: ${{ needs.prepare.outputs.gluten_sha }}
-          path: gluten
-          persist-credentials: false
-      - name: Apply declared Gluten compatibility patches
-        run: |
-          source .github/scripts/gluten_ci.sh
-          ci_apply_patches
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: maven
-          cache-dependency-path: gluten/**/pom.xml
-      - name: Compile Bolt backend, Delta and Spark UT support
-        working-directory: gluten
-        env:
-          SPARK_PROFILE: ${{ matrix.spark }}
-          SPARK_MODULE: ${{ matrix.module }}
-          SCALA_PROFILE: ${{ matrix.scala }}
-        run: |
-          set -o pipefail
-          storage_profiles=()
-          if [[ "${SPARK_PROFILE}" == "3.4" ]]; then
-            storage_profiles=(-Piceberg -Piceberg-test)
-          fi
-          ./build/mvn install -Pbackends-bolt -Pdelta -Pspark-ut -Pfast-build \
-            "-Pspark-${SPARK_PROFILE}" "-Pscala-${SCALA_PROFILE}" -Pjava-17 \
-            "${storage_profiles[@]}" \
-            -Dmaven.compiler.release=17 -DskipTests=true \
-            -Dmaven.test.skip=false -Dmaven.test.failure.ignore=false \
-            -pl "backends-bolt,gluten-ut/${SPARK_MODULE}" -am 2>&1 | tee compatibility.log
-      - name: Preserve compatibility compiler output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gluten-bolt-compile-${{ matrix.spark }}-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            gluten/compatibility.log
-            .ci/gluten-bolt/
-          if-no-files-found: error
-          retention-days: 14
-
   build:
     needs: prepare
     runs-on: ${{ fromJSON(vars.BOLT_GLUTEN_CI_RUNNER || '["self-hosted", "medium"]') }}
@@ -167,6 +95,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends jq libxml2-utils
       - name: Prepare the candidate Bolt package and build Gluten native backend
+        id: build
         run: |
           source .github/scripts/gluten_ci.sh
           ci_init
@@ -211,19 +140,6 @@ jobs:
           exec > >(tee "${GLUTEN_REPORTS_DIR}/arrow-build.log") 2>&1
           cd "${GLUTEN_DIR}"
           bash dev/build_bolt_arrow.sh
-      - name: Compile the shared Spark 3.5 JVM test build
-        id: build
-        run: |
-          source .github/scripts/gluten_ci.sh
-          ci_init
-          exec > >(tee "${GLUTEN_REPORTS_DIR}/jvm-build.log") 2>&1
-          cd "${GLUTEN_DIR}"
-          ci_runtime "${MVN[@]}" install -Pspark-ut \
-            -pl backends-bolt,gluten-ut/spark35 -am -DskipTests=true
-          (cd cpp/build/package/bolt/linux/amd64 && sha256sum *.so) \
-            > "${GLUTEN_REPORTS_DIR}/native.sha256"
-          (cd backends-bolt/target/scala-${SCALA_VERSION}/classes/linux/amd64 && \
-            sha256sum -c "${GLUTEN_REPORTS_DIR}/native.sha256")
       - name: Run native CTest
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
@@ -241,7 +157,7 @@ jobs:
             --test-dir "${GLUTEN_DIR}/cpp/build/Release" --no-tests=error \
             --output-on-failure --output-junit "${output}/TEST-native.xml" \
             --timeout 7200 -j "${CI_NUM_THREADS}"
-      - name: Package the shared native and JVM test build
+      - name: Package the shared native build
         run: |
           source .github/scripts/gluten_ci.sh
           ci_init
@@ -255,26 +171,20 @@ jobs:
             --format=json > "${GLUTEN_REPORTS_DIR}/packages.json"
           conan cache save --list "${GLUTEN_REPORTS_DIR}/packages.json" --no-source \
             --file "${GLUTEN_REPORTS_DIR}/bolt.tgz"
-          # Preserve Maven's installed reactor and patched Arrow artifacts.
-          tar -C "${GLUTEN_MAVEN_REPO}" -I 'gzip -1' -cf "${GLUTEN_REPORTS_DIR}/maven.tgz" \
-            org/apache/gluten org/apache/arrow
-          cd "${GLUTEN_DIR}"
-          targets=(cpp/build/package)
-          while IFS= read -r pom; do
-            target="${pom%pom.xml}target"
-            [[ ! -d "${target}" ]] || targets+=("${target}")
-          done < <(git ls-files '**/pom.xml' pom.xml)
-          # The large backend jars are already in maven.tgz. Keep nested test resources.
-          tar --no-wildcards-match-slash --exclude='backends-bolt/target/*.jar' -I 'gzip -1' \
-            -cf "${GLUTEN_REPORTS_DIR}/test-build.tgz" "${targets[@]}"
-      - name: Upload the shared test build
+          tar -C "${GLUTEN_MAVEN_REPO}" -I 'gzip -1' -cf "${GLUTEN_REPORTS_DIR}/arrow.tgz" \
+            org/apache/arrow
+          tar -C "${GLUTEN_DIR}" -I 'gzip -1' -cf "${GLUTEN_REPORTS_DIR}/native.tgz" \
+            cpp/build/package
+          (cd "${GLUTEN_DIR}/cpp/build/package/bolt/linux/amd64" && sha256sum *.so) \
+            > "${GLUTEN_REPORTS_DIR}/native.sha256"
+      - name: Upload the shared native build
         uses: actions/upload-artifact@v4
         with:
-          name: gluten-bolt-test-build-${{ github.sha }}
+          name: gluten-bolt-native-${{ github.sha }}
           path: |
             .ci/gluten-bolt/bolt.tgz
-            .ci/gluten-bolt/maven.tgz
-            .ci/gluten-bolt/test-build.tgz
+            .ci/gluten-bolt/arrow.tgz
+            .ci/gluten-bolt/native.tgz
             .ci/gluten-bolt/bolt-export.json
             .ci/gluten-bolt/native.sha256
           compression-level: 0
@@ -299,14 +209,164 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  integration:
+  jvm-build:
     needs: [prepare, build]
     runs-on: ${{ fromJSON(vars.BOLT_GLUTEN_CI_RUNNER || '["self-hosted", "medium"]') }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        stage: [jvm, delta, spark-1, spark-2, spark-3, extended, slow-hive, tpc, spark40, spark41]
+        build: [spark34, spark34-slow, spark35, spark35-scala213, spark40, spark40-hive, spark41, spark41-slow]
+    container:
+      image: ${{ vars.BOLT_GLUTEN_CI_IMAGE || 'bolt-registry:5000/bolt-ci:20260921' }}
+      options: --user root --init
+    services:
+      conanserver:
+        image: ${{ vars.BOLT_GLUTEN_CI_CONAN_IMAGE || 'bolt-registry:5000/conan-server:latest' }}
+        volumes:
+          - /data/conan-server-data:/var/conan/data
+    env:
+      CI_NUM_THREADS: '16'
+      IN_CI: '1'
+      LC_ALL: C.UTF-8
+      CI_BUILD: ${{ matrix.build }}
+      GLUTEN_EXCLUDED_TAGS: org.apache.gluten.tags.UDFTest,org.apache.gluten.tags.EnhancedFeaturesTest,org.apache.gluten.tags.CudfTest,org.apache.gluten.tags.SkipTest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout the tested Bolt merge commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Checkout resolved Apache Gluten main
+        uses: actions/checkout@v6
+        with:
+          repository: apache/gluten
+          ref: ${{ needs.prepare.outputs.gluten_sha }}
+          path: gluten
+          persist-credentials: false
+      - name: Apply declared Gluten compatibility patches
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_apply_patches
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Configure Conan and Bolt dependencies
+        uses: ./.github/actions/bolt-build-base
+      - name: Install report and package tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends jq libxml2-utils
+      - name: Download the shared native build
+        uses: actions/download-artifact@v4
+        with:
+          name: gluten-bolt-native-${{ github.sha }}
+          path: .ci/gluten-bolt
+      - name: Restore native build and compile this JVM profile
+        run: |
+          source .github/scripts/gluten_ci.sh
+          ci_init
+          ci_restore_native
+          cd "${GLUTEN_DIR}"
+          ci_run "${GLUTEN_REPORTS_DIR}/jvm-build.log" ci_runtime \
+            "${MVN[@]}" install -Pspark-ut -DskipTests=true -pl '!package'
+          ci_pack_jvm
+      - name: Upload JVM outputs for this profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: gluten-bolt-jvm-${{ matrix.build }}-${{ github.sha }}
+          path: |
+            .ci/gluten-bolt/jvm-maven.tgz
+            .ci/gluten-bolt/jvm-tests.tgz
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 2
+      - name: Preserve JVM build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gluten-bolt-jvm-build-${{ matrix.build }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            .ci/gluten-bolt/*.log
+            .ci/gluten-bolt/*.json
+          retention-days: 14
+
+  integration:
+    name: Integration (${{ matrix.build }}, ${{ matrix.stage }}, shard ${{ matrix.shard || 1 }})
+    needs: [prepare, build, jvm-build]
+    runs-on: ${{ fromJSON(vars.BOLT_GLUTEN_CI_RUNNER || '["self-hosted", "medium"]') }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [spark34, spark35, spark35-scala213, spark40, spark41]
+        stage: [jvm, delta, spark-1, spark-2, spark-3, extended, slow-hive]
+        shard: [1]
+        exclude:
+          - {build: spark34, stage: delta}
+          - {build: spark34, stage: jvm}
+          - {build: spark34, stage: extended}
+          - {build: spark34, stage: slow-hive}
+          - {build: spark35-scala213, stage: extended}
+          - {build: spark35-scala213, stage: slow-hive}
+          - {build: spark40, stage: slow-hive}
+          - {build: spark41, stage: extended}
+          - {build: spark41, stage: slow-hive}
+        include:
+          - {stage: spark-2, shards: 3}
+          - {stage: spark-3, shards: 3}
+          - {build: spark40, stage: spark-1, shards: 3}
+          - {build: spark41, stage: spark-1, shards: 3}
+          - {stage: extended, shards: 4}
+          - {build: spark34-slow, stage: extended, shard: 1, shards: 4}
+          - {build: spark34-slow, stage: slow-hive}
+          - {build: spark34-slow, stage: jvm}
+          - {build: spark34, stage: iceberg}
+          - {build: spark40-hive, stage: slow-hive}
+          - {build: spark41-slow, stage: extended, shard: 1, shards: 4}
+          - {build: spark41-slow, stage: slow-hive}
+          - {build: spark35, stage: tpc}
+          - {build: spark34, stage: spark-2, shard: 2, shards: 3}
+          - {build: spark34, stage: spark-2, shard: 3, shards: 3}
+          - {build: spark34, stage: spark-3, shard: 2, shards: 3}
+          - {build: spark34, stage: spark-3, shard: 3, shards: 3}
+          - {build: spark35, stage: spark-2, shard: 2, shards: 3}
+          - {build: spark35, stage: spark-2, shard: 3, shards: 3}
+          - {build: spark35, stage: spark-3, shard: 2, shards: 3}
+          - {build: spark35, stage: spark-3, shard: 3, shards: 3}
+          - {build: spark35-scala213, stage: spark-2, shard: 2, shards: 3}
+          - {build: spark35-scala213, stage: spark-2, shard: 3, shards: 3}
+          - {build: spark35-scala213, stage: spark-3, shard: 2, shards: 3}
+          - {build: spark35-scala213, stage: spark-3, shard: 3, shards: 3}
+          - {build: spark40, stage: spark-2, shard: 2, shards: 3}
+          - {build: spark40, stage: spark-2, shard: 3, shards: 3}
+          - {build: spark40, stage: spark-3, shard: 2, shards: 3}
+          - {build: spark40, stage: spark-3, shard: 3, shards: 3}
+          - {build: spark40, stage: spark-1, shard: 2, shards: 3}
+          - {build: spark40, stage: spark-1, shard: 3, shards: 3}
+          - {build: spark41, stage: spark-2, shard: 2, shards: 3}
+          - {build: spark41, stage: spark-2, shard: 3, shards: 3}
+          - {build: spark41, stage: spark-3, shard: 2, shards: 3}
+          - {build: spark41, stage: spark-3, shard: 3, shards: 3}
+          - {build: spark41, stage: spark-1, shard: 2, shards: 3}
+          - {build: spark41, stage: spark-1, shard: 3, shards: 3}
+          - {build: spark34-slow, stage: extended, shard: 2, shards: 4}
+          - {build: spark35, stage: extended, shard: 2, shards: 4}
+          - {build: spark40, stage: extended, shard: 2, shards: 4}
+          - {build: spark41-slow, stage: extended, shard: 2, shards: 4}
+          - {build: spark34-slow, stage: extended, shard: 3, shards: 4}
+          - {build: spark34-slow, stage: extended, shard: 4, shards: 4}
+          - {build: spark35, stage: extended, shard: 3, shards: 4}
+          - {build: spark35, stage: extended, shard: 4, shards: 4}
+          - {build: spark40, stage: extended, shard: 3, shards: 4}
+          - {build: spark40, stage: extended, shard: 4, shards: 4}
+          - {build: spark41-slow, stage: extended, shard: 3, shards: 4}
+          - {build: spark41-slow, stage: extended, shard: 4, shards: 4}
     container:
       image: ${{ vars.BOLT_GLUTEN_CI_IMAGE || 'bolt-registry:5000/bolt-ci:20260921' }}
       options: --user root --init
@@ -320,6 +380,10 @@ jobs:
       IN_CI: '1'
       LC_ALL: C.UTF-8
       CI_TEST_STAGE: ${{ matrix.stage }}
+      CI_TEST_SHARD: ${{ matrix.shard || 1 }}
+      CI_TEST_SHARDS: ${{ matrix.shards || 1 }}
+      CI_BUILD: ${{ matrix.build }}
+      GLUTEN_BOLT_USE_VELOX_TEST_SETTINGS: 'true'
       GLUTEN_EXCLUDED_TAGS: org.apache.gluten.tags.UDFTest,org.apache.gluten.tags.EnhancedFeaturesTest,org.apache.gluten.tags.CudfTest,org.apache.gluten.tags.SkipTest
     defaults:
       run:
@@ -350,17 +414,17 @@ jobs:
       - name: Provision Gluten Spark test environment
         run: |
           source .github/scripts/gluten_ci.sh
-          ci_init
           apt-get update
           apt-get install -y --no-install-recommends jq libxml2-utils
+          ci_init
           python3 -m pip install --disable-pip-version-check \
             setuptools==77.0.3 Cython==3.3.0 numpy==1.26.4 \
             "pyspark==${SPARK_VERSION}" pandas==2.2.3 pyarrow==20.0.0
           command -v shasum
-          resources="${BOLT_ROOT}/.ci/spark35"
+          resources="${BOLT_ROOT}/.ci/spark-resources"
           bash "${GLUTEN_DIR}/.github/workflows/util/install-spark-resources.sh" \
-            "${SPARK_PROFILE}" "${resources}"
-          export BOLT_GLUTEN_SPARK_HOME="${resources}/shims/spark35/spark_home"
+            "${SPARK_RESOURCE_PROFILE}" "${resources}"
+          export BOLT_GLUTEN_SPARK_HOME="${resources}/shims/${SPARK_RESOURCE_MODULE}/spark_home"
           # Gluten keeps jars in the source assembly layout; Spark's launchers
           # also need the binary distribution layout.
           ln -s "assembly/target/scala-${SCALA_VERSION}/jars" \
@@ -369,42 +433,25 @@ jobs:
           printf 'BOLT_GLUTEN_SPARK_HOME=%s\nSPARK_HOME=%s\nPYTHONPATH=%s\nPYSPARK_PYTHON=%s\n' \
             "${BOLT_GLUTEN_SPARK_HOME}" "${SPARK_HOME}" "${PYTHONPATH}" \
             "$(command -v python3)" >> "${GITHUB_ENV}"
-      - name: Download the shared test build
+      - name: Download the shared native build
         uses: actions/download-artifact@v4
         with:
-          name: gluten-bolt-test-build-${{ github.sha }}
+          name: gluten-bolt-native-${{ github.sha }}
+          path: .ci/gluten-bolt
+      - name: Download JVM outputs for this profile
+        uses: actions/download-artifact@v4
+        with:
+          name: gluten-bolt-jvm-${{ matrix.build }}-${{ github.sha }}
           path: .ci/gluten-bolt
       - name: Restore the shared build and verify native libraries
         id: restore
         run: |
           source .github/scripts/gluten_ci.sh
           ci_init
-          export BOLT_BUILD_VERSION="ci-$(git -C "${BOLT_ROOT}" rev-parse HEAD)"
-          GLUTEN_BUILD_VERSION="ci-$(git -C "${GLUTEN_DIR}" rev-parse HEAD)"
-          ci_conan_options
-          conan cache restore "${GLUTEN_REPORTS_DIR}/bolt.tgz"
-          mkdir -p "${GLUTEN_MAVEN_REPO}"
-          tar -C "${GLUTEN_MAVEN_REPO}" -xzf "${GLUTEN_REPORTS_DIR}/maven.tgz"
-          tar -C "${GLUTEN_DIR}" -xzf "${GLUTEN_REPORTS_DIR}/test-build.tgz"
-          rm "${GLUTEN_REPORTS_DIR}"/*.tgz
-          cd "${GLUTEN_DIR}/cpp"
-          # Regenerate Conan runtime paths for this job; no native compilation.
-          conan install . --name=gluten "--version=${GLUTEN_BUILD_VERSION}" \
-            "${profile[@]}" -s build_type=Release "${options[@]}" "${gluten_options[@]}" \
-            --lockfile= --build=missing "--build=~bolt/*" --format=json \
-            > "${GLUTEN_REPORTS_DIR}/gluten-install.json"
-          ci_verify_bolt_package
-          cd "${GLUTEN_DIR}"
-          (cd cpp/build/package/bolt/linux/amd64 && \
-            sha256sum -c "${GLUTEN_REPORTS_DIR}/native.sha256")
-          (cd backends-bolt/target/scala-${SCALA_VERSION}/classes/linux/amd64 && \
-            sha256sum -c "${GLUTEN_REPORTS_DIR}/native.sha256")
-          for library in cpp/build/package/bolt/linux/amd64/*.so; do
-            ci_runtime ldd "${library}"
-          done | tee "${GLUTEN_REPORTS_DIR}/native-linkage.log"
-          if grep -q 'not found' "${GLUTEN_REPORTS_DIR}/native-linkage.log"; then exit 1; fi
+          ci_restore_native
+          ci_restore_jvm
       - name: Run backend JVM and isolated Delta suites
-        if: ${{ !cancelled() && steps.restore.outcome == 'success' && (matrix.stage == 'jvm' || matrix.stage == 'delta') }}
+        if: ${{ !cancelled() && steps.restore.outcome == 'success' && (matrix.stage == 'jvm' || matrix.stage == 'delta' || matrix.stage == 'iceberg') }}
         run: |
           source .github/scripts/gluten_ci.sh
           ci_init
@@ -412,11 +459,17 @@ jobs:
           output="${GLUTEN_REPORTS_DIR}/jvm"
           mkdir -p "${output}"
           cd "${GLUTEN_DIR}"
+          if [[ "${CI_TEST_STAGE}" == iceberg ]]; then
+            # Iceberg's unshaded JUnit dependencies conflict with Spark's ORC API.
+            # Scala backend tests use the existing regular spark34-slow artifact.
+            ci_maven_test jvm backends-bolt "${MVN[@]}" surefire:test \
+              "-DargLine=-Xmx4g -Dspark.test.home=${SPARK_HOME}"
+            exit 0
+          fi
           if [[ "${CI_TEST_STAGE}" == jvm ]]; then
             CI_GROUP=blacklist CI_SUITES=org.apache.gluten.utils.GlutenTestBlacklistSuite \
-              ci_maven_test jvm gluten-ut/test "${MVN[@]}" test -Pspark-ut
+              ci_maven_test jvm gluten-ut/test "${MVN[@]}" scalatest:test -Pspark-ut
           fi
-          ci_runtime "${MVN[@]}" test-compile -pl backends-bolt
           ci_runtime "${MVN[@]}" dependency:build-classpath -pl backends-bolt \
             -DincludeScope=test "-Dmdep.outputFile=${output}/test-classpath.txt"
           classes="${GLUTEN_DIR}/backends-bolt/target/scala-${SCALA_VERSION}"
@@ -437,18 +490,18 @@ jobs:
           if [[ "${CI_TEST_STAGE}" == jvm ]]; then
             selected="$(IFS=,; printf '%s' "${ordinary[*]}")"
             CI_GROUP=backend CI_SUITES="${selected}" ci_maven_test jvm backends-bolt \
-              "${MVN[@]}" test "-DtagsToExclude=${GLUTEN_EXCLUDED_TAGS}" \
-              "-DargLine=-Dspark.test.home=${SPARK_HOME}"
+              "${MVN[@]}" surefire:test scalatest:test "-DtagsToExclude=${GLUTEN_EXCLUDED_TAGS}" \
+              "-DargLine=-Xmx4g -Dspark.test.home=${SPARK_HOME}"
             exit 0
           fi
           ((${#delta[@]} > 0))
           for suite in "${delta[@]}"; do
             CI_GROUP="${suite}" CI_SUITES="${suite}" ci_maven_test jvm backends-bolt \
               "${MVN[@]}" scalatest:test "-DtagsToExclude=${GLUTEN_EXCLUDED_TAGS}" \
-              "-DargLine=-Dspark.test.home=${SPARK_HOME}" || failed=1
+              "-DargLine=-Xmx4g -Dspark.test.home=${SPARK_HOME}" || failed=1
           done
           exit "${failed}"
-      - name: Run Spark 3.5 SQL unit test groups
+      - name: Run the reference Spark SQL unit test groups
         if: ${{ !cancelled() && steps.restore.outcome == 'success' && startsWith(matrix.stage, 'spark-') }}
         run: |
           source .github/scripts/gluten_ci.sh
@@ -461,21 +514,22 @@ jobs:
           )
           excluded="org.apache.spark.tags.ExtendedSQLTest,org.apache.spark.tags.SlowHiveTest,${GLUTEN_EXCLUDED_TAGS}"
           group="${CI_TEST_STAGE#spark-}"
-          ci_maven_test "${CI_TEST_STAGE}" gluten-ut/spark35 "${MVN[@]}" test -Pspark-ut \
+          ci_select_sql_shard "${groups[$((group-1))]}"
+          ci_maven_test "${CI_TEST_STAGE}" reactor "${MVN[@]}" surefire:test scalatest:test -Pspark-ut \
             "-DwildcardSuites=${groups[$((group-1))]}" "-DtagsToExclude=${excluded}" \
-            "-DargLine=-Dspark.test.home=${SPARK_HOME}"
+            "-DargLine=-Xmx4g -Dspark.test.home=${SPARK_HOME}"
       - name: Run Extended SQL and Slow Hive tests
         if: ${{ !cancelled() && steps.restore.outcome == 'success' && (matrix.stage == 'extended' || matrix.stage == 'slow-hive') }}
         run: |
           source .github/scripts/gluten_ci.sh
           ci_init
           ci_spark_environment
+          ci_select_sql_shard
           tag=ExtendedSQLTest
           [[ "${CI_TEST_STAGE}" != slow-hive ]] || tag=SlowHiveTest
-          ci_maven_test "${CI_TEST_STAGE}" gluten-ut/spark35 "${MVN[@]}" test -Pspark-ut \
+          ci_maven_test "${CI_TEST_STAGE}" reactor "${MVN[@]}" surefire:test scalatest:test -Pspark-ut \
             "-DtagsToInclude=org.apache.spark.tags.${tag}" \
-            "-DtagsToExclude=${GLUTEN_EXCLUDED_TAGS}" \
-            "-DargLine=-Dspark.test.home=${SPARK_HOME}"
+            "-DargLine=-Xmx4g -Dspark.test.home=${SPARK_HOME}"
       - name: Compare TPC-H and TPC-DS against vanilla Spark
         if: ${{ !cancelled() && steps.restore.outcome == 'success' && matrix.stage == 'tpc' }}
         run: |
@@ -507,41 +561,11 @@ jobs:
               --explain --off-heap-size=10g -s=1.0 --threads=16 --iterations=1 || failed=1
           done
           exit "${failed}"
-      - name: Run Spark 4.0 and 4.1 compatibility subsets
-        if: ${{ !cancelled() && steps.restore.outcome == 'success' && (matrix.stage == 'spark40' || matrix.stage == 'spark41') }}
-        run: |
-          source .github/scripts/gluten_ci.sh
-          ci_init
-          ci_profile_lock exclusive
-          expressions=(ArithmeticExpression BitwiseExpressions ConditionalExpression
-            LiteralExpression NullExpressions Predicate)
-          suites=org.apache.spark.sql.GlutenBoltBackendSmokeSuite
-          for name in "${expressions[@]}"; do
-            suites+=",org.apache.spark.sql.catalyst.expressions.Gluten${name}Suite"
-          done
-          profile=4.0
-          [[ "${CI_TEST_STAGE}" != spark41 ]] || profile=4.1
-          stage="${CI_TEST_STAGE}"
-          ci_set_maven "${profile}" || exit "$?"
-          export SPARK_SCALA_VERSION=2.13
-          unset GLUTEN_TEST_BLACKLIST
-          cd "${GLUTEN_DIR}" || exit "$?"
-          ci_run "${GLUTEN_REPORTS_DIR}/${stage}-compile.log" ci_runtime \
-            "${MVN[@]}" clean install -Pspark-ut \
-            -pl "backends-bolt,gluten-ut/${stage}" -am -DskipTests=true || exit "$?"
-          (cd backends-bolt/target/scala-2.13/classes/linux/amd64 && \
-            sha256sum -c "${GLUTEN_REPORTS_DIR}/native.sha256") || exit "$?"
-          CI_GROUP=backend \
-            CI_SUITES=org.apache.gluten.execution.BoltParquetDataTypeValidationSuite,org.apache.gluten.execution.BoltOrcDataTypeValidationSuite \
-            ci_maven_test "${stage}" backends-bolt "${MVN[@]}" test -Pspark-ut \
-              -DargLine=-Dspark.sql.ansi.enabled=false || exit "$?"
-          CI_GROUP=ut CI_SUITES="${suites}" ci_maven_test "${stage}" \
-            "gluten-ut/${stage}" "${MVN[@]}" test -Pspark-ut
       - name: Preserve reports, source identities and failure logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gluten-bolt-reports-${{ matrix.stage }}-${{ github.sha }}-${{ github.run_attempt }}
+          name: gluten-bolt-reports-${{ matrix.build }}-${{ matrix.stage }}-${{ matrix.shard || 1 }}-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             .ci/gluten-bolt/
             !.ci/gluten-bolt/*.tgz
