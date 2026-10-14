@@ -159,13 +159,14 @@ make release_spark BUILD_VERSION=main
 The [Gluten Bolt Backend workflow](.github/workflows/gluten-bolt.yml) is called
 by Build and Test on pull requests and merge groups, and also supports manual
 dispatch. It tests the candidate Bolt code against `apache/gluten:main`.
-Build and Test exports its tested Spark Release Conan package as a short-lived
-artifact; Gluten restores that package instead of compiling Bolt again. Both
-builds enable HDFS. Dependencies built during the run travel with the package,
-so downstream jobs reuse them without publishing to a Conan remote.
-Manual runs, skipped upstream builds and custom CI images
-build the candidate Bolt package locally. The `gluten-bolt-check` job in Build
-and Test requires every Gluten job to succeed.
+Gluten builds the candidate Bolt engine and test utility library with
+`release_spark` and `enable_testutil=True`; Bolt's own UT executables are not
+built on this path. The existing `release_spark_with_test` job still builds and
+runs Bolt's UTs independently, so Gluten does not wait for it. Both paths enable
+HDFS and use Bolt's existing compiler cache. Gluten shares its native build and
+newly built dependencies with all downstream test jobs through short-lived
+Actions artifacts, without publishing to a Conan remote. The `gluten-bolt-check`
+job in Build and Test requires every Gluten job to succeed.
 Native CTest runs with the shared build. Ten independent jobs reuse its native
 libraries and Spark 3.5 Maven outputs to run backend JVM, Delta, three Spark SQL
 groups, Extended SQL, Slow Hive, TPC and Spark 4.0/4.1 checks in parallel.
