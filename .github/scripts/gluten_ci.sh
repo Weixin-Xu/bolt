@@ -272,11 +272,18 @@ ci_maven_test() (
   export GLUTEN_TEST_ENABLE_SLOW_HIVE=false
   [[ "${stage}" != slow-hive ]] || export GLUTEN_TEST_ENABLE_SLOW_HIVE=true
   local command=("$@" -Dmaven.test.failure.ignore=false)
-  local common_command=("${command[@]}")
+  # The common reactor includes POM-only modules without ScalaTest dependencies.
+  # Use their declared test lifecycle instead of invoking every plugin directly.
+  local argument common_command=()
+  for argument in "${command[@]}"; do
+    [[ "${argument}" != surefire:test && "${argument}" != scalatest:test ]] || continue
+    common_command+=("${argument}")
+  done
+  common_command+=(test)
   if [[ "${module}" == reactor && "${CI_TEST_SHARDS:-1}" != 1 ]]; then
     # Explicit suites and wildcard discovery are additive in ScalaTest. Only the
     # common invocation keeps the original wildcard; SQL uses its shard list.
-    local argument filtered=()
+    local filtered=()
     for argument in "${command[@]}"; do
       [[ "${argument}" == -DwildcardSuites=* ]] || filtered+=("${argument}")
     done
