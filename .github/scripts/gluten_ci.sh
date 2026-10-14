@@ -50,6 +50,8 @@ ci_init() {
   GLUTEN_DIR="$(cd "${GLUTEN_DIR}" && pwd)"
   mkdir -p "${GLUTEN_REPORTS_DIR}"
   GLUTEN_REPORTS_DIR="$(cd "${GLUTEN_REPORTS_DIR}" && pwd)"
+  GLUTEN_MAVEN_REPO="${GLUTEN_MAVEN_REPO:-${HOME}/.m2/repository}"
+  export MAVEN_ARGS="${MAVEN_ARGS:-} -Dmaven.repo.local=${GLUTEN_MAVEN_REPO}"
   SPARK_VERSION=3.5.5
   SCALA_VERSION=2.12
   JDK_VERSION=17

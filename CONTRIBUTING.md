@@ -193,12 +193,14 @@ Image overrides must be available to every selected runner. The runner must
 reach the Bolt registry and Conan service. The workflow
 reuses `bolt-build-base` for Conan setup and `install-bolt-deps.sh`, installs a
 full JDK 17 with `setup-java`, and provisions the pinned Python test runtime.
+Maven builds and artifact transfer use the same local repository, defaulting to
+`$HOME/.m2/repository`. Set `GLUTEN_MAVEN_REPO` to reuse a different local cache.
 Spark binaries and SQL test resources come from Gluten's existing
 `.github/workflows/util/install-spark-resources.sh`; its SHA512 verification
 requires `shasum` in the CI image.
 
 Local execution requires Linux x86_64, a full JDK 17 with AWT, Python 3.10+,
-Conan 2.32.0, Maven, CMake 3.31, Ninja, mold, curl, jq, xmllint (libxml2-utils)
+Conan 2.32.0, Maven 3.9+, CMake 3.31, Ninja, mold, curl, jq, xmllint (libxml2-utils)
 and a C++ compiler. Provide a
 Spark 3.5.5 binary distribution with Python ZIPs and the matching source `sql/`
 test resources, plus PySpark 3.5.5, pandas 2.2.3 and PyArrow 20.0.0. Set
