@@ -139,7 +139,8 @@ jobs:
           ci_init
           exec > >(tee "${GLUTEN_REPORTS_DIR}/arrow-build.log") 2>&1
           cd "${GLUTEN_DIR}"
-          bash dev/build_bolt_arrow.sh
+          MAVEN_OPTS="${MAVEN_OPTS:-} -Dmaven.repo.local=${GLUTEN_MAVEN_REPO}" \
+            bash dev/build_bolt_arrow.sh
       - name: Run native CTest
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
