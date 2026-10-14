@@ -16,11 +16,6 @@ name: Gluten Bolt Backend
 
 on:
   workflow_call:
-    inputs:
-      reuse-bolt:
-        description: Consume the Spark Release package from this workflow run
-        type: boolean
-        default: false
   workflow_dispatch:
 
 permissions:
@@ -124,6 +119,8 @@ jobs:
     container:
       image: ${{ vars.BOLT_GLUTEN_CI_IMAGE || 'bolt-registry:5000/bolt-ci:20260921' }}
       options: --user root --init
+      volumes:
+        - /data/ccache-data:/data/ccache-data
     services:
       conanserver:
         # Each CI host builds its own registry images; digest overrides must be
@@ -132,6 +129,8 @@ jobs:
         volumes:
           - /data/conan-server-data:/var/conan/data
     env:
+      CCACHE_DIR: /data/ccache-data
+      CCACHE_MAX_SIZE: '100G'
       CI_NUM_THREADS: '16'
       IN_CI: '1'
       # Java's native path encoding follows the locale, not file.encoding.
@@ -167,12 +166,6 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends jq libxml2-utils
-      - name: Download the tested Spark Release package
-        if: ${{ inputs.reuse-bolt }}
-        uses: actions/download-artifact@v4
-        with:
-          name: bolt-spark-release-${{ github.sha }}
-          path: .ci/bolt-spark-release
       - name: Prepare the candidate Bolt package and build Gluten native backend
         run: |
           source .github/scripts/gluten_ci.sh
@@ -186,24 +179,18 @@ jobs:
           cmake --version
           conan profile show
           ci_conan_options
-          if [[ -f .ci/bolt-spark-release/bolt.tgz ]]; then
-            conan cache restore .ci/bolt-spark-release/bolt.tgz
-            cp .ci/bolt-spark-release/bolt-export.json "${GLUTEN_REPORTS_DIR}/bolt-export.json"
-            cp .ci/bolt-spark-release/bolt-build.json "${GLUTEN_REPORTS_DIR}/bolt-build.json"
-            echo "Reusing the tested Spark Release Bolt package: ${BOLT_BUILD_VERSION}"
-          else
-            printf -v profile_args '%q ' "${profile[@]}"
-            make release_spark_with_test BOLT_CONAN_CONFIGURE_ONLY=1 \
-              "BUILD_VERSION=${BOLT_BUILD_VERSION}" "CONAN_OVERRIDE=${options[*]}" \
-              "CONAN_HOST_PROFILE_ARGS=${profile_args}" \
-              "CONAN_BUILD_ARGS=--format=json --out-file=${GLUTEN_REPORTS_DIR}/bolt-build.json"
-            cmake --build --preset conan-release --target bolt_engine bolt_testutils_static \
-              --parallel "${CI_NUM_THREADS}"
-            conan export-pkg . --name=bolt "--version=${BOLT_BUILD_VERSION}" \
-              "${profile[@]}" -s build_type=Release "${options[@]}" \
-              -c bolt/*:tools.build:skip_test=False \
-              --format=json > "${GLUTEN_REPORTS_DIR}/bolt-export.json"
-          fi
+          printf -v profile_args '%q ' "${profile[@]}"
+          make release_spark BOLT_CONAN_CONFIGURE_ONLY=1 \
+            "BUILD_VERSION=${BOLT_BUILD_VERSION}" "CONAN_OVERRIDE=${options[*]}" \
+            "CONAN_HOST_PROFILE_ARGS=${profile_args}" \
+            "CONAN_BUILD_ARGS=--format=json --out-file=${GLUTEN_REPORTS_DIR}/bolt-build.json"
+          grep -q '^BOLT_BUILD_TESTING:BOOL=OFF$' _build/Release/CMakeCache.txt
+          grep -q '^BOLT_BUILD_TEST_UTILS:BOOL=ON$' _build/Release/CMakeCache.txt
+          cmake --build --preset conan-release --target bolt_engine bolt_testutils_static \
+            --parallel "${CI_NUM_THREADS}"
+          conan export-pkg . --name=bolt "--version=${BOLT_BUILD_VERSION}" \
+            "${profile[@]}" -s build_type=Release "${options[@]}" \
+            --format=json > "${GLUTEN_REPORTS_DIR}/bolt-export.json"
           conan list --graph "${GLUTEN_REPORTS_DIR}/bolt-build.json" --graph-binaries=Build \
             --format=json > "${GLUTEN_REPORTS_DIR}/bolt-built-dependencies.json"
           profile+=(-s build_type=Release)
