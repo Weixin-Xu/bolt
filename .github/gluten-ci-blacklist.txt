@@ -401,6 +401,7 @@
 [3.5/2.12]org.apache.spark.sql.GlutenJsonFunctionsSuite#json_tuple - do not truncate results
 [3.5/2.12]org.apache.spark.sql.GlutenJsonFunctionsSuite#json_tuple filter and group
 [3.5/2.12]org.apache.spark.sql.GlutenJsonFunctionsSuite#json_tuple select
+[3.5/2.12]org.apache.spark.sql.GlutenSQLQuerySuite#TABLE SAMPLE
 [3.5/2.12]org.apache.spark.sql.GlutenStatisticsCollectionSuite#SPARK-38140: describe column stats (min, max) for timestamp column: desc results should be consistent with the written value if writing and desc happen in the same time zone
 [3.5/2.12]org.apache.spark.sql.GlutenStatisticsCollectionSuite#SPARK-38140: describe column stats (min, max) for timestamp column: desc should show different results if writing in UTC and desc in other time zones
 [3.5/2.13]org.apache.spark.sql.GlutenBitmapExpressionsQuerySuite#bitmap_construct_agg routes to native
