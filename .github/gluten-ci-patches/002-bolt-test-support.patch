@@ -160,10 +160,10 @@ index 0000000000..ea59842e92
 +}
 diff --git a/gluten-ut/spark40/src/test/backends-bolt/org/apache/spark/sql/GlutenBoltBackendSmokeSuite.scala b/gluten-ut/spark40/src/test/backends-bolt/org/apache/spark/sql/GlutenBoltBackendSmokeSuite.scala
 new file mode 100644
-index 0000000000..4bcddec757
+index 000000000..cb77210d1
 --- /dev/null
 +++ b/gluten-ut/spark40/src/test/backends-bolt/org/apache/spark/sql/GlutenBoltBackendSmokeSuite.scala
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,94 @@
 +/*
 + * Licensed to the Apache Software Foundation (ASF) under one or more
 + * contributor license agreements.  See the NOTICE file distributed with
@@ -190,6 +190,8 @@ index 0000000000..4bcddec757
 +
 +/** Verifies that the Bolt Spark 4 test profile executes native operators. */
 +class GlutenBoltBackendSmokeSuite extends GlutenSQLTestsTrait {
++  // Keep this Bolt-only smoke coverage when CI adopts Velox's shared suite selection.
++  override protected def shouldRun(testName: String): Boolean = true
 +
 +  private def withParquetData(body: DataFrame => Unit): Unit = {
 +    assert(BackendTestUtils.isBoltBackendLoaded())
@@ -788,7 +790,7 @@ diff --git a/tools/gluten-it/sbin/gluten-it.sh b/tools/gluten-it/sbin/gluten-it.
  
  EMBEDDED_SPARK_HOME=$BASEDIR/../spark-home
 diff --git a/backends-bolt/pom.xml b/backends-bolt/pom.xml
-index e120f50bd4..c719a3fd99 100644
+index e120f50bd..99a49617c 100644
 --- a/backends-bolt/pom.xml
 +++ b/backends-bolt/pom.xml
 @@ -29,9 +29,11 @@
@@ -984,12 +986,25 @@ index e120f50bd4..c719a3fd99 100644
            <version>${iceberg.version}</version>
            <scope>provided</scope>
          </dependency>
+@@ -477,6 +630,12 @@
+     <profile>
+       <id>delta</id>
+       <dependencies>
++        <dependency>
++          <groupId>org.apache.spark</groupId>
++          <artifactId>spark-tags_${scala.binary.version}</artifactId>
++          <type>test-jar</type>
++          <scope>test</scope>
++        </dependency>
+         <dependency>
+           <groupId>org.apache.gluten</groupId>
+           <artifactId>gluten-delta</artifactId>
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/GlutenIcebergTestExtension.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/GlutenIcebergTestExtension.java
 new file mode 100644
-index 0000000000..b90e739c79
+index 000000000..465d4f73c
 --- /dev/null
 +++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/GlutenIcebergTestExtension.java
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,129 @@
 +/*
 + * Licensed to the Apache Software Foundation (ASF) under one or more
 + * contributor license agreements.  See the NOTICE file distributed with
@@ -1008,22 +1023,81 @@ index 0000000000..b90e739c79
 + */
 +package org.apache.gluten;
 +
++import org.apache.gluten.utils.GlutenTestBlacklist;
++
 +import org.apache.spark.sql.SparkSession;
++import org.junit.Assume;
 +import org.junit.jupiter.api.extension.AfterAllCallback;
 +import org.junit.jupiter.api.extension.BeforeAllCallback;
 +import org.junit.jupiter.api.extension.BeforeEachCallback;
++import org.junit.jupiter.api.extension.ConditionEvaluationResult;
++import org.junit.jupiter.api.extension.ExecutionCondition;
 +import org.junit.jupiter.api.extension.ExtensionContext;
++import org.junit.platform.engine.UniqueId;
++import org.junit.rules.TestRule;
++import org.junit.runner.Description;
++import org.junit.runners.model.Statement;
 +
++import java.util.Arrays;
 +import java.util.LinkedHashMap;
 +import java.util.Map;
++import java.util.stream.Collectors;
 +
 +import static org.assertj.core.api.Assertions.assertThat;
 +
 +/** Enables Gluten before the inherited Iceberg fixtures create their Spark sessions. */
 +public class GlutenIcebergTestExtension
-+    implements BeforeAllCallback, BeforeEachCallback, AfterAllCallback {
++    implements BeforeAllCallback,
++        BeforeEachCallback,
++        AfterAllCallback,
++        TestRule,
++        ExecutionCondition {
 +  private static final ExtensionContext.Namespace NAMESPACE =
 +      ExtensionContext.Namespace.create(GlutenIcebergTestExtension.class);
++
++  @Override
++  public Statement apply(Statement base, Description description) {
++    return new Statement() {
++      @Override
++      public void evaluate() throws Throwable {
++        Assume.assumeFalse(
++            "GLUTEN_TEST_BLACKLIST",
++            GlutenTestBlacklist.isExcluded(
++                description.getClassName(), description.getMethodName()));
++        base.evaluate();
++      }
++    };
++  }
++
++  @Override
++  public ConditionEvaluationResult evaluateExecutionCondition(ExtensionContext context) {
++    return new Blacklist().evaluateExecutionCondition(context);
++  }
++
++  /** Uses Surefire's exact JUnit 5 method/invocation names for versioned exclusions. */
++  public static class Blacklist implements ExecutionCondition {
++    @Override
++    public ConditionEvaluationResult evaluateExecutionCondition(ExtensionContext context) {
++      if (!context.getTestMethod().isPresent()) {
++        return ConditionEvaluationResult.enabled("Not a test method");
++      }
++      String testName =
++          context.getRequiredTestMethod().getName()
++              + "("
++              + Arrays.stream(context.getRequiredTestMethod().getParameterTypes())
++                  .map(Class::getSimpleName)
++                  .collect(Collectors.joining(", "))
++              + ")";
++      for (UniqueId.Segment segment : UniqueId.parse(context.getUniqueId()).getSegments()) {
++        if (segment.getType().equals("test-template-invocation")) {
++          testName += "[" + segment.getValue().substring(1) + "]";
++        }
++      }
++      return GlutenTestBlacklist.isExcluded(context.getRequiredTestClass().getName(), testName)
++          ? ConditionEvaluationResult.disabled("GLUTEN_TEST_BLACKLIST")
++          : ConditionEvaluationResult.enabled("Not blacklisted");
++    }
++  }
 +
 +  @Override
 +  public void beforeAll(ExtensionContext context) {
@@ -1379,18 +1453,20 @@ index 2eaaa6e5fe..f3d020a4a5 100644
 -}
 +    extends TestSystemFunctionPushDownInRowLevelOperations {}
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestDataFrameWrites.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestDataFrameWrites.java
-index 678cec58d9..a9ae2a26f0 100644
+index 678cec58d..bd9b712b6 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestDataFrameWrites.java
 +++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestDataFrameWrites.java
-@@ -16,6 +16,7 @@
+@@ -16,6 +16,9 @@
   */
  package org.apache.gluten.source;
- 
+
++import org.apache.gluten.GlutenIcebergTestExtension;
++
 +import org.apache.avro.generic.GenericData.Record;
  import org.apache.hadoop.conf.Configuration;
  import org.apache.iceberg.*;
  import org.apache.iceberg.avro.Avro;
-@@ -24,13 +25,12 @@ import org.apache.iceberg.hadoop.HadoopTables;
+@@ -24,13 +27,12 @@ import org.apache.iceberg.hadoop.HadoopTables;
  import org.apache.iceberg.io.FileAppender;
  import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
  import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -1405,17 +1481,35 @@ index 678cec58d9..a9ae2a26f0 100644
  import org.apache.iceberg.types.Types;
  import org.apache.spark.SparkException;
  import org.apache.spark.TaskContext;
-@@ -226,8 +226,7 @@ public class TestDataFrameWrites extends AvroDataTest {
+@@ -41,6 +43,8 @@ import org.apache.spark.sql.*;
+ import org.apache.spark.sql.catalyst.InternalRow;
+ import org.apache.spark.sql.catalyst.encoders.RowEncoder;
+ import org.junit.*;
++import org.junit.Rule;
++import org.junit.rules.TestRule;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+
+@@ -56,6 +60,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+ @RunWith(Parameterized.class)
+ public class TestDataFrameWrites extends AvroDataTest {
++  @Rule public final TestRule glutenBlacklist = new GlutenIcebergTestExtension();
++
+   private static final Configuration CONF = new Configuration();
+
+   private final String format;
+@@ -226,8 +232,7 @@ public class TestDataFrameWrites extends AvroDataTest {
    }
- 
+
    private Dataset<Row> createDataset(Iterable<Record> records, Schema schema) throws IOException {
 -    // this uses the SparkAvroReader to create a DataFrame from the list of records
 -    // it assumes that SparkAvroReader is correct
 +    // Use Iceberg's resolving reader to create Spark rows from the Avro records.
      File testFile = temp.newFile();
      Assert.assertTrue("Delete should succeed", testFile.delete());
- 
-@@ -242,7 +241,7 @@ public class TestDataFrameWrites extends AvroDataTest {
+
+@@ -242,7 +247,7 @@ public class TestDataFrameWrites extends AvroDataTest {
      List<InternalRow> rows = Lists.newArrayList();
      try (AvroIterable<InternalRow> reader =
          Avro.read(Files.localInput(testFile))
@@ -1423,20 +1517,23 @@ index 678cec58d9..a9ae2a26f0 100644
 +            .createResolvingReader(SparkPlannedAvroReader::create)
              .project(schema)
              .build()) {
- 
+
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestForwardCompatibility.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestForwardCompatibility.java
-index 3913ff4d61..b6bd64ce66 100644
+index 3913ff4d6..a6be66652 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestForwardCompatibility.java
 +++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestForwardCompatibility.java
-@@ -18,6 +18,7 @@ package org.apache.gluten.source;
- 
+@@ -16,8 +16,10 @@
+  */
+ package org.apache.gluten.source;
+
++import org.apache.gluten.GlutenIcebergTestExtension;
  import org.apache.gluten.TestConfUtil;
- 
+
 +import org.apache.avro.generic.GenericData;
  import org.apache.hadoop.conf.Configuration;
  import org.apache.iceberg.*;
  import org.apache.iceberg.hadoop.HadoopTables;
-@@ -25,7 +26,6 @@ import org.apache.iceberg.io.FileAppender;
+@@ -25,7 +27,6 @@ import org.apache.iceberg.io.FileAppender;
  import org.apache.iceberg.io.OutputFile;
  import org.apache.iceberg.parquet.Parquet;
  import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -1444,6 +1541,23 @@ index 3913ff4d61..b6bd64ce66 100644
  import org.apache.iceberg.spark.data.RandomData;
  import org.apache.iceberg.spark.data.TestHelpers;
  import org.apache.iceberg.spark.source.SimpleRecord;
+@@ -36,6 +37,7 @@ import org.apache.spark.sql.streaming.StreamingQuery;
+ import org.apache.spark.sql.streaming.StreamingQueryException;
+ import org.junit.*;
+ import org.junit.rules.TemporaryFolder;
++import org.junit.rules.TestRule;
+
+ import java.io.File;
+ import java.io.IOException;
+@@ -76,6 +78,8 @@ public class TestForwardCompatibility {
+
+   @Rule public TemporaryFolder temp = new TemporaryFolder();
+
++  @Rule public final TestRule glutenBlacklist = new GlutenIcebergTestExtension();
++
+   private static SparkSession spark = null;
+
+   @BeforeClass
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestGlutenDataFrameWriterV2.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestGlutenDataFrameWriterV2.java
 index b66015515d..ffc94d3102 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestGlutenDataFrameWriterV2.java
@@ -1496,21 +1610,54 @@ index 11c2ecfe71..536148f393 100644
 +@ExtendWith(GlutenIcebergTestExtension.class)
  public class TestGlutenDataSourceOptions extends TestDataSourceOptions {}
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestGlutenIcebergSourceHiveTables.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestGlutenIcebergSourceHiveTables.java
-index c3e921e324..57fb89ec36 100644
+index c3e921e32..0d9ea4786 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestGlutenIcebergSourceHiveTables.java
 +++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestGlutenIcebergSourceHiveTables.java
-@@ -16,7 +16,11 @@
+@@ -16,7 +16,43 @@
   */
  package org.apache.gluten.source;
- 
-+import org.apache.gluten.GlutenIcebergTestExtension;
-+
+
++import org.apache.iceberg.PartitionSpec;
++import org.apache.iceberg.Schema;
++import org.apache.iceberg.Table;
++import org.apache.iceberg.catalog.Namespace;
++import org.apache.iceberg.catalog.TableIdentifier;
  import org.apache.iceberg.spark.source.TestIcebergSourceHiveTables;
-+import org.junit.jupiter.api.extension.ExtendWith;
- 
++import org.junit.After;
++import org.junit.BeforeClass;
++
++import java.io.IOException;
++import java.util.Map;
+
  // Fallback all the table scan because source table is metadata table with format avro.
-+@ExtendWith(GlutenIcebergTestExtension.class)
- public class TestGlutenIcebergSourceHiveTables extends TestIcebergSourceHiveTables {}
+-public class TestGlutenIcebergSourceHiveTables extends TestIcebergSourceHiveTables {}
++public class TestGlutenIcebergSourceHiveTables extends TestIcebergSourceHiveTables {
++
++  private static TableIdentifier currentIdentifier;
++
++  // The BeforeAll does not take effect because junit 4 is used in Gluten
++  @BeforeClass
++  public static void start() {
++    Namespace db = Namespace.of("db");
++    if (!catalog.namespaceExists(db)) {
++      catalog.createNamespace(db);
++    }
++  }
++
++  @After
++  public void dropTable() throws IOException {
++    if (currentIdentifier != null && catalog.tableExists(currentIdentifier)) {
++      this.dropTable(currentIdentifier);
++    }
++    currentIdentifier = null;
++  }
++
++  public Table createTable(
++      TableIdentifier ident, Schema schema, PartitionSpec spec, Map<String, String> properties) {
++    currentIdentifier = ident;
++    return catalog.createTable(ident, schema, spec, properties);
++  }
++}
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestGlutenIdentityPartitionData.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestGlutenIdentityPartitionData.java
 index 506f8a5226..993552adad 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestGlutenIdentityPartitionData.java
@@ -1624,18 +1771,21 @@ index 09a6583320..2a1fa46dfc 100644
 +@ExtendWith(GlutenIcebergTestExtension.class)
 +public class TestGlutenSparkStagedScan extends TestSparkStagedScan {}
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestParquetScan.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestParquetScan.java
-index ef1e3becc0..6aaf6cc60a 100644
+index ef1e3becc..54eb81fbb 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestParquetScan.java
 +++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestParquetScan.java
-@@ -18,6 +18,7 @@ package org.apache.gluten.source;
- 
+@@ -16,8 +16,10 @@
+  */
+ package org.apache.gluten.source;
+
++import org.apache.gluten.GlutenIcebergTestExtension;
  import org.apache.gluten.TestConfUtil;
- 
+
 +import org.apache.avro.generic.GenericData;
  import org.apache.hadoop.conf.Configuration;
  import org.apache.iceberg.*;
  import org.apache.iceberg.hadoop.HadoopTables;
-@@ -25,7 +26,6 @@ import org.apache.iceberg.io.FileAppender;
+@@ -25,7 +27,6 @@ import org.apache.iceberg.io.FileAppender;
  import org.apache.iceberg.parquet.Parquet;
  import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
  import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -1643,11 +1793,38 @@ index ef1e3becc0..6aaf6cc60a 100644
  import org.apache.iceberg.spark.data.AvroDataTest;
  import org.apache.iceberg.spark.data.RandomData;
  import org.apache.iceberg.types.TypeUtil;
+@@ -34,7 +35,9 @@ import org.apache.spark.sql.Dataset;
+ import org.apache.spark.sql.Row;
+ import org.apache.spark.sql.SparkSession;
+ import org.junit.*;
++import org.junit.Rule;
+ import org.junit.rules.TemporaryFolder;
++import org.junit.rules.TestRule;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+
+@@ -53,6 +56,8 @@ import static org.assertj.core.api.Assertions.assertThat;
+ // UUID and FixedType is not supported.
+ @RunWith(Parameterized.class)
+ public class TestParquetScan extends AvroDataTest {
++  @Rule public final TestRule glutenBlacklist = new GlutenIcebergTestExtension();
++
+   private static final Configuration CONF = new Configuration();
+
+   private static SparkSession spark = null;
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestPartitionPruning.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestPartitionPruning.java
-index ceb5799db7..d8b2af3424 100644
+index ceb5799db..87615dbff 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestPartitionPruning.java
 +++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestPartitionPruning.java
-@@ -31,7 +31,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.gluten.source;
+
++import org.apache.gluten.GlutenIcebergTestExtension;
+ import org.apache.gluten.TestConfUtil;
+
+ import org.apache.hadoop.conf.Configuration;
+@@ -31,7 +32,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  import org.apache.iceberg.relocated.com.google.common.collect.Sets;
  import org.apache.iceberg.spark.SparkReadOptions;
  import org.apache.iceberg.spark.SparkSchemaUtil;
@@ -1656,10 +1833,28 @@ index ceb5799db7..d8b2af3424 100644
  import org.apache.iceberg.transforms.Transforms;
  import org.apache.iceberg.types.Types;
  import org.apache.spark.api.java.JavaRDD;
-@@ -140,18 +140,18 @@ public class TestPartitionPruning {
+@@ -44,7 +45,9 @@ import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
+ import org.apache.spark.sql.types.DataTypes;
+ import org.apache.spark.unsafe.types.UTF8String;
+ import org.junit.*;
++import org.junit.Rule;
+ import org.junit.rules.TemporaryFolder;
++import org.junit.rules.TestRule;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+
+@@ -65,6 +68,7 @@ import static org.apache.iceberg.PlanningMode.LOCAL;
+ // TODO: remove the file format parquet to make the tests pass, file system match issue
+ @RunWith(Parameterized.class)
+ public class TestPartitionPruning {
++  @Rule public final TestRule glutenBlacklist = new GlutenIcebergTestExtension();
+
+   private static final Configuration CONF = new Configuration();
+   private static final HadoopTables TABLES = new HadoopTables(CONF);
+@@ -140,18 +144,18 @@ public class TestPartitionPruning {
            Types.NestedField.optional(4, "message", Types.StringType.get()),
            Types.NestedField.optional(5, "timestamp", Types.TimestampType.withZone()));
- 
+
 -  private static final List<LogMessage> LOGS =
 +  private static final List<GlutenLogMessage> LOGS =
        ImmutableList.of(
@@ -1683,7 +1878,7 @@ index ceb5799db7..d8b2af3424 100644
 +          GlutenLogMessage.debug("2020-02-04", "debug event 4", getInstant("2020-02-04T01:00:00")),
 +          GlutenLogMessage.warn("2020-02-04", "warn event 1", getInstant("2020-02-04T02:00:00")),
 +          GlutenLogMessage.debug("2020-02-04", "debug event 5", getInstant("2020-02-04T03:00:00")));
- 
+
    private static Instant getInstant(String timestampWithoutZone) {
      Long epochMicros =
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestPartitionValues.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestPartitionValues.java
@@ -1960,19 +2155,41 @@ index 0000000000..6119d0df3b
 +  }
 +}
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/SparkTestBase.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/SparkTestBase.java
-index 9d82ec7b4f..617c935f0c 100644
+index 9d82ec7b4..fc4f1a7e1 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/SparkTestBase.java
 +++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/SparkTestBase.java
-@@ -55,7 +55,7 @@ import java.util.concurrent.TimeoutException;
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.iceberg.spark;
+
++import org.apache.gluten.GlutenIcebergTestExtension;
+ import org.apache.gluten.TestConfUtil;
+ import org.apache.gluten.config.GlutenConfig;
+
+@@ -41,6 +42,8 @@ import org.apache.spark.sql.util.QueryExecutionListener;
+ import org.junit.AfterClass;
+ import org.junit.Assert;
+ import org.junit.BeforeClass;
++import org.junit.Rule;
++import org.junit.rules.TestRule;
+
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
+@@ -55,11 +58,12 @@ import java.util.concurrent.TimeoutException;
  import java.util.concurrent.atomic.AtomicReference;
- 
+
  import scala.Option;
 -import scala.collection.JavaConversions;
 +import scala.collection.JavaConverters;
- 
+
  import static org.apache.hadoop.hive.conf.HiveConf.ConfVars.METASTOREURIS;
- 
-@@ -290,7 +290,7 @@ public abstract class SparkTestBase extends SparkTestHelperBase {
+
+ public abstract class SparkTestBase extends SparkTestHelperBase {
++  @Rule public final TestRule glutenBlacklist = new GlutenIcebergTestExtension();
+
+   protected static TestHiveMetastore metastore = null;
+   protected static HiveConf hiveConf = null;
+@@ -290,7 +294,7 @@ public abstract class SparkTestBase extends SparkTestHelperBase {
          () -> {
            Option<String> msg =
                QueryTest.getErrorMessageInCheckAnswer(
@@ -2431,25 +2648,55 @@ index 2a7ed0c19a..ddd19a5f71 100644
      // Percentage of number of values that are null for optional fields
      private final float nullPercentage;
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/data/TestHelpers.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/data/TestHelpers.java
-index dcc7d91d7d..e2812f3c8f 100644
+index dcc7d91d7..c536e9f00 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/data/TestHelpers.java
 +++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/data/TestHelpers.java
-@@ -16,13 +16,13 @@
+@@ -16,16 +16,16 @@
   */
  package org.apache.iceberg.spark.data;
- 
+
 +import org.apache.avro.generic.GenericData;
 +import org.apache.avro.generic.GenericData.Record;
  import org.apache.iceberg.*;
  import org.apache.iceberg.io.CloseableIterable;
  import org.apache.iceberg.relocated.com.google.common.collect.Lists;
- import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+-import org.apache.iceberg.relocated.com.google.common.collect.Sets;
  import org.apache.iceberg.relocated.com.google.common.collect.Streams;
 -import org.apache.iceberg.shaded.org.apache.avro.generic.GenericData;
 -import org.apache.iceberg.shaded.org.apache.avro.generic.GenericData.Record;
  import org.apache.iceberg.spark.SparkSchemaUtil;
  import org.apache.iceberg.types.Type;
  import org.apache.iceberg.types.Types;
++import org.apache.iceberg.util.DeleteFileSet;
+ import org.apache.orc.storage.serde2.io.DateWritable;
+ import org.apache.spark.sql.Column;
+ import org.apache.spark.sql.Dataset;
+@@ -766,7 +766,7 @@ public class TestHelpers {
+   }
+
+   public static Set<DeleteFile> deleteFiles(Table table) {
+-    Set<DeleteFile> deleteFiles = Sets.newHashSet();
++    DeleteFileSet deleteFiles = DeleteFileSet.create();
+
+     for (FileScanTask task : table.newScan().planFiles()) {
+       deleteFiles.addAll(task.deletes());
+@@ -775,6 +775,16 @@ public class TestHelpers {
+     return deleteFiles;
+   }
+
++  public static Set<DeleteFile> deleteFiles(Table table, Snapshot snapshot) {
++    DeleteFileSet deleteFiles = DeleteFileSet.create();
++
++    for (FileScanTask task : table.newScan().useSnapshot(snapshot.snapshotId()).planFiles()) {
++      deleteFiles.addAll(task.deletes());
++    }
++
++    return deleteFiles;
++  }
++
+   public static Set<String> reachableManifestPaths(Table table) {
+     return StreamSupport.stream(table.snapshots().spliterator(), false)
+         .flatMap(s -> s.allManifests(table.io()).stream())
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/LogMessage.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/GlutenLogMessage.java
 similarity index 56%
 rename from backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/LogMessage.java
@@ -2554,12 +2801,12 @@ index b05fd3b502..5709df501f 100644
  import org.apache.iceberg.spark.actions.SparkActions;
  import org.apache.iceberg.spark.data.TestHelpers;
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/TestSparkReadProjection.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/TestSparkReadProjection.java
-index da6e83f6f6..4021b2d01b 100644
+index da6e83f6f..5f5be0ae0 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/TestSparkReadProjection.java
 +++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/TestSparkReadProjection.java
 @@ -19,6 +19,8 @@ package org.apache.iceberg.spark.source;
  import org.apache.gluten.TestConfUtil;
- 
+
  import org.apache.iceberg.*;
 +import org.apache.iceberg.Parameter;
 +import org.apache.iceberg.Parameters;
@@ -2577,18 +2824,20 @@ index da6e83f6f6..4021b2d01b 100644
 -import org.junit.runners.Parameterized;
 +import org.junit.jupiter.api.AfterAll;
 +import org.junit.jupiter.api.BeforeAll;
- 
+
  import java.io.File;
  import java.io.IOException;
-@@ -51,34 +51,28 @@ import static org.apache.iceberg.PlanningMode.LOCAL;
+@@ -51,34 +51,30 @@ import static org.apache.iceberg.PlanningMode.LOCAL;
  import static org.apache.iceberg.types.Types.NestedField.optional;
  import static org.apache.iceberg.types.Types.NestedField.required;
- 
+
 -@RunWith(Parameterized.class)
++@org.junit.jupiter.api.extension.ExtendWith(
++    org.apache.gluten.GlutenIcebergTestExtension.Blacklist.class)
  public class TestSparkReadProjection extends TestReadProjection {
- 
+
    private static SparkSession spark = null;
- 
+
 -  @Parameterized.Parameters(name = "format = {0}, vectorized = {1}, planningMode = {2}")
 +  @Parameters(name = "format = {0}, vectorized = {1}, planningMode = {2}")
    public static Object[][] parameters() {
@@ -2605,13 +2854,13 @@ index da6e83f6f6..4021b2d01b 100644
 +      {FileFormat.ORC, true, LOCAL}
      };
    }
- 
+
 -  private final FileFormat format;
 -  private final boolean vectorized;
 -  private final PlanningMode planningMode;
 +  @Parameter(index = 1)
 +  private boolean vectorized;
- 
+
 -  public TestSparkReadProjection(String format, boolean vectorized, PlanningMode planningMode) {
 -    super(format);
 -    this.format = FileFormat.fromString(format);
@@ -2620,22 +2869,22 @@ index da6e83f6f6..4021b2d01b 100644
 -  }
 +  @Parameter(index = 2)
 +  private PlanningMode planningMode;
- 
+
 -  @BeforeClass
 +  @BeforeAll
    public static void startSpark() {
      TestSparkReadProjection.spark =
          SparkSession.builder().master("local[2]").config(TestConfUtil.GLUTEN_CONF).getOrCreate();
-@@ -95,7 +89,7 @@ public class TestSparkReadProjection extends TestReadProjection {
+@@ -95,7 +91,7 @@ public class TestSparkReadProjection extends TestReadProjection {
          (key, value) -> spark.conf().set("spark.sql.catalog.spark_catalog." + key, value));
    }
- 
+
 -  @AfterClass
 +  @AfterAll
    public static void stopSpark() {
      SparkSession currentSpark = TestSparkReadProjection.spark;
      TestSparkReadProjection.spark = null;
-@@ -105,7 +99,7 @@ public class TestSparkReadProjection extends TestReadProjection {
+@@ -105,7 +101,7 @@ public class TestSparkReadProjection extends TestReadProjection {
    @Override
    protected Record writeAndRead(String desc, Schema writeSchema, Schema readSchema, Record record)
        throws IOException {
@@ -2644,18 +2893,18 @@ index da6e83f6f6..4021b2d01b 100644
      File location = new File(parent, "test");
      File dataFolder = new File(location, "data");
      Assert.assertTrue("mkdirs should succeed", dataFolder.mkdirs());
-@@ -150,8 +144,7 @@ public class TestSparkReadProjection extends TestReadProjection {
+@@ -150,8 +146,7 @@ public class TestSparkReadProjection extends TestReadProjection {
        Schema expectedSchema = reassignIds(readSchema, idMapping);
- 
+
        // Set the schema to the expected schema directly to simulate the table schema evolving
 -      TestTables.replaceMetadata(
 -          desc, TestTables.readMetadata(desc).updateSchema(expectedSchema, 100));
 +      TestTables.replaceMetadata(desc, TestTables.readMetadata(desc).updateSchema(expectedSchema));
- 
+
        Dataset<Row> df =
            spark
 diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/TestSparkReaderDeletes.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/TestSparkReaderDeletes.java
-index d58f603298..86e855c0f8 100644
+index d58f60329..6a9b207cf 100644
 --- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/TestSparkReaderDeletes.java
 +++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/iceberg/spark/source/TestSparkReaderDeletes.java
 @@ -37,8 +37,6 @@ import org.apache.iceberg.parquet.ParquetSchemaUtil;
@@ -2676,18 +2925,26 @@ index d58f603298..86e855c0f8 100644
  import org.apache.spark.sql.Dataset;
  import org.apache.spark.sql.Row;
  import org.apache.spark.sql.SparkSession;
-@@ -77,19 +77,19 @@ public class TestSparkReaderDeletes extends DeleteReadTests {
+@@ -71,25 +71,27 @@ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assumptions.assumeThat;
+
+ @ExtendWith(ParameterizedTestExtension.class)
++@org.junit.jupiter.api.extension.ExtendWith(
++    org.apache.gluten.GlutenIcebergTestExtension.Blacklist.class)
+ public class TestSparkReaderDeletes extends DeleteReadTests {
+
+   private static TestHiveMetastore metastore = null;
    protected static SparkSession spark = null;
    protected static HiveCatalog catalog = null;
- 
+
 -  @Parameter(index = 1)
 +  @Parameter(index = 2)
    private boolean vectorized;
- 
+
 -  @Parameter(index = 2)
 +  @Parameter(index = 3)
    private PlanningMode planningMode;
- 
+
 -  @Parameters(name = "format = {0}, vectorized = {1}, planningMode = {2}")
 +  @Parameters(name = "format = {0}, formatVersion = {1}, vectorized = {2}, planningMode = {3}")
    public static Object[][] parameters() {
@@ -2702,9 +2959,9 @@ index d58f603298..86e855c0f8 100644
 +      new Object[] {FileFormat.AVRO, 2, false, PlanningMode.LOCAL}
      };
    }
- 
-@@ -299,7 +299,7 @@ public class TestSparkReaderDeletes extends DeleteReadTests {
- 
+
+@@ -299,7 +301,7 @@ public class TestSparkReaderDeletes extends DeleteReadTests {
+
      for (CombinedScanTask task : tasks) {
        try (EqualityDeleteRowReader reader =
 -          new EqualityDeleteRowReader(task, table, null, table.schema(), false)) {
@@ -2712,13 +2969,13 @@ index d58f603298..86e855c0f8 100644
          while (reader.next()) {
            actualRowSet.add(
                new InternalRowWrapper(
-@@ -557,7 +557,7 @@ public class TestSparkReaderDeletes extends DeleteReadTests {
- 
+@@ -557,7 +559,7 @@ public class TestSparkReaderDeletes extends DeleteReadTests {
+
    @TestTemplate
    public void testPosDeletesOnParquetFileWithMultipleRowGroups() throws IOException {
 -    assumeThat(format).isEqualTo("parquet");
 +    assumeThat(format).isEqualTo(FileFormat.PARQUET);
- 
+
      String tblName = "test3";
      Table tbl = createTable(tblName, SCHEMA, PartitionSpec.unpartitioned());
 diff --git a/backends-bolt/src/test/scala/org/apache/gluten/execution/BoltExplodeExpressionSuite.scala b/backends-bolt/src/test/scala/org/apache/gluten/execution/BoltExplodeExpressionSuite.scala
@@ -2834,3 +3091,566 @@ diff --git a/gluten-ut/spark35/src/test/scala/org/apache/gluten/utils/bolt/BoltT
    override def getSQLQueryTestSettings: SQLQueryTestSettings = BoltSQLQueryTestSettings
  }
  // scalastyle:on line.size.limit
+diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestStructuredStreaming.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestStructuredStreaming.java
+index 1fc2b3f96..4a8b54f2c 100644
+--- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestStructuredStreaming.java
++++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestStructuredStreaming.java
+@@ -16,9 +16,11 @@
+  */
+ package org.apache.gluten.source;
+
++import org.apache.gluten.GlutenIcebergTestExtension;
+ import org.apache.gluten.TestConfUtil;
+
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.Path;
+ import org.apache.iceberg.PartitionSpec;
+ import org.apache.iceberg.Schema;
+ import org.apache.iceberg.Table;
+@@ -34,6 +36,7 @@ import org.apache.spark.sql.streaming.StreamingQuery;
+ import org.apache.spark.sql.streaming.StreamingQueryException;
+ import org.junit.*;
+ import org.junit.rules.TemporaryFolder;
++import org.junit.rules.TestRule;
+
+ import java.io.File;
+ import java.util.List;
+@@ -54,6 +57,8 @@ public class TestStructuredStreaming {
+
+   @Rule public TemporaryFolder temp = new TemporaryFolder();
+
++  @Rule public final TestRule glutenBlacklist = new GlutenIcebergTestExtension();
++
+   @BeforeClass
+   public static void startSpark() {
+     TestStructuredStreaming.spark =
+@@ -111,8 +116,10 @@ public class TestStructuredStreaming {
+       query.stop();
+
+       // remove the last commit to force Spark to reprocess batch #1
+-      File lastCommitFile = new File(checkpoint + "/commits/1");
+-      Assert.assertTrue("The commit file must be deleted", lastCommitFile.delete());
++      Path lastCommitFile = new Path(new File(checkpoint, "commits/1").toURI());
++      Assert.assertTrue(
++          "The commit file and its checksum must be deleted",
++          lastCommitFile.getFileSystem(CONF).delete(lastCommitFile, false));
+
+       // restart the query from the checkpoint
+       StreamingQuery restartedQuery = streamWriter.start();
+@@ -171,8 +178,10 @@ public class TestStructuredStreaming {
+       query.stop();
+
+       // remove the last commit to force Spark to reprocess batch #1
+-      File lastCommitFile = new File(checkpoint + "/commits/1");
+-      Assert.assertTrue("The commit file must be deleted", lastCommitFile.delete());
++      Path lastCommitFile = new Path(new File(checkpoint, "commits/1").toURI());
++      Assert.assertTrue(
++          "The commit file and its checksum must be deleted",
++          lastCommitFile.getFileSystem(CONF).delete(lastCommitFile, false));
+
+       // restart the query from the checkpoint
+       StreamingQuery restartedQuery = streamWriter.start();
+@@ -231,8 +240,10 @@ public class TestStructuredStreaming {
+       query.stop();
+
+       // remove the last commit to force Spark to reprocess batch #1
+-      File lastCommitFile = new File(checkpoint + "/commits/1");
+-      Assert.assertTrue("The commit file must be deleted", lastCommitFile.delete());
++      Path lastCommitFile = new Path(new File(checkpoint, "commits/1").toURI());
++      Assert.assertTrue(
++          "The commit file and its checksum must be deleted",
++          lastCommitFile.getFileSystem(CONF).delete(lastCommitFile, false));
+
+       // restart the query from the checkpoint
+       StreamingQuery restartedQuery = streamWriter.start();
+diff --git a/backends-bolt/src/test/scala/org/apache/gluten/execution/BoltHashJoinSuite.scala b/backends-bolt/src/test/scala/org/apache/gluten/execution/BoltHashJoinSuite.scala
+index 1c0990366..ccf431fc2 100644
+--- a/backends-bolt/src/test/scala/org/apache/gluten/execution/BoltHashJoinSuite.scala
++++ b/backends-bolt/src/test/scala/org/apache/gluten/execution/BoltHashJoinSuite.scala
+@@ -92,10 +92,10 @@ class BoltHashJoinSuite extends BoltWholeStageTransformerSuite {
+
+       // The computing is combined into one single whole stage transformer.
+       val wholeStages = plan.collect { case wst: WholeStageTransformer => wst }
+-      if (SparkShimLoader.getSparkVersion.startsWith("3.5.")) {
+-        assert(wholeStages.length == 5)
+-      } else {
++      if (SparkShimLoader.getSparkVersion.startsWith("3.4.")) {
+         assert(wholeStages.length == 3)
++      } else {
++        assert(wholeStages.length == 5)
+       }
+
+       // Join should be in `TransformContext`
+diff --git a/backends-bolt/src/test/scala/org/apache/gluten/execution/MiscOperatorSuite.scala b/backends-bolt/src/test/scala/org/apache/gluten/execution/MiscOperatorSuite.scala
+index d48e27e77..d8c7f340b 100644
+--- a/backends-bolt/src/test/scala/org/apache/gluten/execution/MiscOperatorSuite.scala
++++ b/backends-bolt/src/test/scala/org/apache/gluten/execution/MiscOperatorSuite.scala
+@@ -179,7 +179,7 @@ class MiscOperatorSuite extends BoltWholeStageTransformerSuite with AdaptiveSpar
+   test("and pushdown") {
+     val df = runQueryAndCompare(
+       "select l_orderkey from lineitem where l_orderkey > 2 " +
+-        "and l_orderkey = 1") { _ => }
++        "and l_orderkey < 2") { _ => }
+     assert(df.isEmpty)
+     checkLengthAndPlan(df, 0)
+   }
+@@ -803,7 +803,11 @@ class MiscOperatorSuite extends BoltWholeStageTransformerSuite with AdaptiveSpar
+     val df = sql("SELECT 1")
+     checkAnswer(df, Row(1))
+     val plan = df.queryExecution.executedPlan
+-    assert(plan.find(_.isInstanceOf[RDDScanExec]).isDefined)
++    if (isSparkVersionGE("4.1")) {
++      assert(plan.find(_.getClass.getSimpleName == "OneRowRelationExec").isDefined)
++    } else {
++      assert(plan.find(_.isInstanceOf[RDDScanExec]).isDefined)
++    }
+     assert(plan.find(_.isInstanceOf[ProjectExecTransformer]).isDefined)
+     assert(plan.find(_.isInstanceOf[RowToBoltColumnarExec]).isDefined)
+   }
+diff --git a/backends-bolt/src/test/scala/org/apache/gluten/functions/ScalarFunctionsValidateSuite.scala b/backends-bolt/src/test/scala/org/apache/gluten/functions/ScalarFunctionsValidateSuite.scala
+index 61c79e0c8..9411a9589 100644
+--- a/backends-bolt/src/test/scala/org/apache/gluten/functions/ScalarFunctionsValidateSuite.scala
++++ b/backends-bolt/src/test/scala/org/apache/gluten/functions/ScalarFunctionsValidateSuite.scala
+@@ -590,7 +590,7 @@ class ScalarFunctionsValidateSuite extends FunctionsValidateSuite {
+     }
+   }
+
+-  test("version") {
++  testWithMaxSparkVersion("version", "3.5") {
+     runQueryAndCompare("""SELECT version() from lineitem limit 10""".stripMargin) {
+       checkGlutenPlan[ProjectExecTransformer]
+     }
+diff --git a/backends-bolt/src/test/scala/org/apache/gluten/functions/ArithmeticAnsiValidateSuite.scala b/backends-bolt/src/test/scala/org/apache/gluten/functions/ArithmeticAnsiValidateSuite.scala
+index 02092418c..fa14207b5 100644
+--- a/backends-bolt/src/test/scala/org/apache/gluten/functions/ArithmeticAnsiValidateSuite.scala
++++ b/backends-bolt/src/test/scala/org/apache/gluten/functions/ArithmeticAnsiValidateSuite.scala
+@@ -33,13 +33,30 @@ class ArithmeticAnsiValidateSuite extends FunctionsValidateSuite {
+       .set(SQLConf.ANSI_ENABLED.key, "true")
+   }
+
++  // Use a table input, as in Velox, so overflow is evaluated by the native engine.
++  private def checkOverflow(expr: String): Unit = {
++    withTempPath {
++      path =>
++        sql("SELECT 2147483647 AS a, 1 AS b, 2 AS c").write.parquet(path.getCanonicalPath)
++        withTempView("overflow_tab") {
++          spark.read.parquet(path.getCanonicalPath).createOrReplaceTempView("overflow_tab")
++          val query = s"SELECT $expr FROM overflow_tab"
++          val error = intercept[SparkException](sql(query).collect())
++          assert(error.getMessage.contains("Arithmetic overflow"), error.getMessage)
++          withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
++            runQueryAndCompare(query) {
++              checkGlutenPlan[ProjectExecTransformer]
++            }
++          }
++        }
++    }
++  }
++
+   test("add") {
+     runQueryAndCompare("SELECT int_field1 + 100 FROM datatab WHERE int_field1 IS NOT NULL") {
+       checkGlutenPlan[ProjectExecTransformer]
+     }
+-    intercept[ArithmeticException] {
+-      sql("SELECT 2147483647 + 1").collect()
+-    }
++    checkOverflow("a + b")
+   }
+
+   test("subtract") {
+@@ -52,9 +69,7 @@ class ArithmeticAnsiValidateSuite extends FunctionsValidateSuite {
+     runQueryAndCompare("SELECT int_field1 * 2 FROM datatab WHERE int_field1 IS NOT NULL") {
+       checkGlutenPlan[ProjectExecTransformer]
+     }
+-    intercept[ArithmeticException] {
+-      sql("SELECT 2147483647 * 2").collect()
+-    }
++    checkOverflow("a * c")
+   }
+
+   test("divide") {
+diff --git a/backends-bolt/src/test/scala/org/apache/gluten/benchmarks/NativeBenchmarkPlanGenerator.scala b/backends-bolt/src/test/scala/org/apache/gluten/benchmarks/NativeBenchmarkPlanGenerator.scala
+index 6fef8d5aa..4baa94567 100644
+--- a/backends-bolt/src/test/scala/org/apache/gluten/benchmarks/NativeBenchmarkPlanGenerator.scala
++++ b/backends-bolt/src/test/scala/org/apache/gluten/benchmarks/NativeBenchmarkPlanGenerator.scala
+@@ -84,7 +84,7 @@ class NativeBenchmarkPlanGenerator extends BoltWholeStageTransformerSuite {
+       executedPlan.execute()
+
+       val finalPlan = executedPlan.asInstanceOf[AdaptiveSparkPlanExec].executedPlan
+-      val lastStageTransformer = finalPlan.find(_.isInstanceOf[WholeStageTransformer])
++      val lastStageTransformer = stripAQEPlan(finalPlan).find(_.isInstanceOf[WholeStageTransformer])
+       assert(lastStageTransformer.nonEmpty)
+       val planJson = lastStageTransformer.get.asInstanceOf[WholeStageTransformer].substraitPlanJson
+       assert(planJson.nonEmpty)
+diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestFilteredScan.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestFilteredScan.java
+index 517586242..d1a1313b5 100644
+--- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestFilteredScan.java
++++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestFilteredScan.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.gluten.source;
+
++import org.apache.gluten.GlutenIcebergTestExtension;
+ import org.apache.gluten.TestConfUtil;
+
+ import org.apache.hadoop.conf.Configuration;
+@@ -70,6 +71,7 @@ import org.junit.BeforeClass;
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.rules.TemporaryFolder;
++import org.junit.rules.TestRule;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+
+@@ -108,6 +110,8 @@ import static org.assertj.core.api.Assertions.assertThat;
+ // Stack trace:
+ @RunWith(Parameterized.class)
+ public class TestFilteredScan {
++  @Rule public final TestRule glutenBlacklist = new GlutenIcebergTestExtension();
++
+   private static final Configuration CONF = new Configuration();
+   private static final HadoopTables TABLES = new HadoopTables(CONF);
+
+diff --git a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestSparkReaderWithBloomFilter.java b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestSparkReaderWithBloomFilter.java
+index 7d0b42000..26a7f564a 100644
+--- a/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestSparkReaderWithBloomFilter.java
++++ b/backends-bolt/src-iceberg-spark34/test/java/org/apache/gluten/source/TestSparkReaderWithBloomFilter.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.gluten.source;
+
++import org.apache.gluten.GlutenIcebergTestExtension;
+ import org.apache.gluten.TestConfUtil;
+
+ import org.apache.hadoop.hive.conf.HiveConf;
+@@ -39,7 +40,9 @@ import org.apache.iceberg.util.PropertyUtil;
+ import org.apache.spark.sql.Dataset;
+ import org.apache.spark.sql.SparkSession;
+ import org.junit.*;
++import org.junit.Rule;
+ import org.junit.rules.TemporaryFolder;
++import org.junit.rules.TestRule;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+
+@@ -55,6 +58,7 @@ import static org.apache.iceberg.TableProperties.*;
+
+ @RunWith(Parameterized.class)
+ public class TestSparkReaderWithBloomFilter {
++  @Rule public final TestRule glutenBlacklist = new GlutenIcebergTestExtension();
+
+   protected String tableName = null;
+   protected Table table = null;
+diff --git a/backends-bolt/src-hudi/test/scala/org/apache/gluten/execution/BoltTPCHHudiSuite.scala b/backends-bolt/src-hudi/test/scala/org/apache/gluten/execution/BoltTPCHHudiSuite.scala
+index 74b6e2fc8..4e3c0eedc 100644
+--- a/backends-bolt/src-hudi/test/scala/org/apache/gluten/execution/BoltTPCHHudiSuite.scala
++++ b/backends-bolt/src-hudi/test/scala/org/apache/gluten/execution/BoltTPCHHudiSuite.scala
+@@ -20,18 +20,39 @@ import org.apache.spark.SparkConf
+
+ import java.io.File
+
+-class BoltTPCHHudiSuite extends BoltTPCHSuite {
+-  protected val tpchBasePath: String =
+-    getClass.getResource("/").getPath + "../../../src/test/resources"
++class BoltTPCHHudiSuite extends WholeStageTransformerSuite {
++  override protected val resourcePath: String = "/tpch-data-parquet"
++  override protected val fileFormat: String = "parquet"
+
+-  override protected val resourcePath: String =
+-    getClass.getResource("/tpch-data-parquet").getFile
++  private val tpchQueries: String =
++    getClass.getResource("/").getPath +
++      "../../../../tools/gluten-it/common/src/main/resources/tpch-queries"
+
+-  override protected val queriesResults: String =
+-    new File(tpchBasePath, "queries-output").getCanonicalPath
++  override def beforeAll(): Unit = {
++    super.beforeAll()
++    createTPCHNotNullTables()
++  }
++
++  (1 to 22).foreach {
++    query =>
++      test(s"TPC-H q$query") {
++        compareTPCHQueryAgainstVanillaSpark(
++          query,
++          tpchQueries,
++          _ => (),
++          noFallBack = true,
++          compareResult = true)
++      }
++  }
+
+   override protected def sparkConf: SparkConf = {
+     super.sparkConf
++      .set("spark.shuffle.manager", "org.apache.spark.shuffle.sort.ColumnarShuffleManager")
++      .set("spark.sql.files.maxPartitionBytes", "1g")
++      .set("spark.sql.shuffle.partitions", "1")
++      .set("spark.memory.offHeap.size", "2g")
++      .set("spark.unsafe.exceptionOnMemoryLeak", "true")
++      .set("spark.sql.autoBroadcastJoinThreshold", "-1")
+       .set("spark.executor.memory", "4g")
+       .set("spark.sql.extensions", "org.apache.spark.sql.hudi.HoodieSparkSessionExtension")
+       .set("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.hudi.catalog.HoodieCatalog")
+diff --git a/gluten-ut/common/src/test/scala/org/apache/gluten/utils/BackendTestSettings.scala b/gluten-ut/common/src/test/scala/org/apache/gluten/utils/BackendTestSettings.scala
+index 551d9f38b..7a99fb0b1 100644
+--- a/gluten-ut/common/src/test/scala/org/apache/gluten/utils/BackendTestSettings.scala
++++ b/gluten-ut/common/src/test/scala/org/apache/gluten/utils/BackendTestSettings.scala
+@@ -212,8 +212,14 @@ object BackendTestSettings {
+         .newInstance()
+         .asInstanceOf[BackendTestSettings]
+     } else if (BackendTestUtils.isBoltBackendLoaded()) {
++      // CI can compare backends over the same suite/case and SQL resource selection.
++      val settingsClass = if (sys.env.get("GLUTEN_BOLT_USE_VELOX_TEST_SETTINGS").contains("true")) {
++        "org.apache.gluten.utils.velox.VeloxTestSettings"
++      } else {
++        "org.apache.gluten.utils.bolt.BoltTestSettings"
++      }
+       Class
+-        .forName("org.apache.gluten.utils.bolt.BoltTestSettings")
++        .forName(settingsClass)
+         .getDeclaredConstructor()
+         .newInstance()
+         .asInstanceOf[BackendTestSettings]
+diff --git a/.github/workflows/util/install-spark-resources.sh b/.github/workflows/util/install-spark-resources.sh
+index 84d01bdfb..c6959416e 100755
+--- a/.github/workflows/util/install-spark-resources.sh
++++ b/.github/workflows/util/install-spark-resources.sh
+@@ -114,13 +114,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+       # Spark-4.0, scala 2.12 // using 2.12 as a hack as 4.0 does not have 2.13 suffix
+       cd ${INSTALL_DIR} && \
+       install_spark "4.0.2" "3" "2.12"
+-      mv /opt/shims/spark40/spark_home/assembly/target/scala-2.12 /opt/shims/spark40/spark_home/assembly/target/scala-2.13
++      mv "${INSTALL_DIR}/shims/spark40/spark_home/assembly/target/scala-2.12" "${INSTALL_DIR}/shims/spark40/spark_home/assembly/target/scala-2.13"
+       ;;
+   4.1)
+       # Spark-4.x, scala 2.12 // using 2.12 as a hack as 4.0 does not have 2.13 suffix
+       cd ${INSTALL_DIR} && \
+       install_spark "4.1.1" "3" "2.12"
+-      mv /opt/shims/spark41/spark_home/assembly/target/scala-2.12 /opt/shims/spark41/spark_home/assembly/target/scala-2.13
++      mv "${INSTALL_DIR}/shims/spark41/spark_home/assembly/target/scala-2.12" "${INSTALL_DIR}/shims/spark41/spark_home/assembly/target/scala-2.13"
+       ;;
+   4.2)
+       # Spark-4.x, scala 2.12 // using 2.12 as a hack as 4.2 does not have a 2.13 suffix
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeleteSQLSuite.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeleteSQLSuite.scala
+new file mode 120000
+index 000000000..ed79b8df3
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeleteSQLSuite.scala
+@@ -0,0 +1 @@
++../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/DeleteSQLSuite.scala
+\ No newline at end of file
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeleteSuiteBase.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeleteSuiteBase.scala
+new file mode 120000
+index 000000000..6e6b16635
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeleteSuiteBase.scala
+@@ -0,0 +1 @@
++../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/DeleteSuiteBase.scala
+\ No newline at end of file
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeletionVectorsTestUtils.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeletionVectorsTestUtils.scala
+new file mode 120000
+index 000000000..2f9b080b0
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeletionVectorsTestUtils.scala
+@@ -0,0 +1 @@
++../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/DeletionVectorsTestUtils.scala
+\ No newline at end of file
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaColumnMappingTestUtils.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaColumnMappingTestUtils.scala
+new file mode 120000
+index 000000000..1689561b4
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaColumnMappingTestUtils.scala
+@@ -0,0 +1 @@
++../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaColumnMappingTestUtils.scala
+\ No newline at end of file
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaExcludedBySparkVersionTestMixinShims.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaExcludedBySparkVersionTestMixinShims.scala
+new file mode 120000
+index 000000000..e25bb2085
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaExcludedBySparkVersionTestMixinShims.scala
+@@ -0,0 +1 @@
++../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaExcludedBySparkVersionTestMixinShims.scala
+\ No newline at end of file
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaTestUtils.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaTestUtils.scala
+new file mode 120000
+index 000000000..6eba321cd
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaTestUtils.scala
+@@ -0,0 +1 @@
++../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/DeltaTestUtils.scala
+\ No newline at end of file
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaColumnMappingSelectedTestMixin.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaColumnMappingSelectedTestMixin.scala
+new file mode 120000
+index 000000000..469da2630
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaColumnMappingSelectedTestMixin.scala
+@@ -0,0 +1 @@
++../../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaColumnMappingSelectedTestMixin.scala
+\ No newline at end of file
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaExcludedTestMixin.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaExcludedTestMixin.scala
+new file mode 120000
+index 000000000..c533a89b8
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaExcludedTestMixin.scala
+@@ -0,0 +1 @@
++../../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaExcludedTestMixin.scala
+\ No newline at end of file
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaSQLCommandTest.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaSQLCommandTest.scala
+new file mode 120000
+index 000000000..e93bd800f
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaSQLCommandTest.scala
+@@ -0,0 +1 @@
++../../../../../../../../../src-delta33/test/scala/org/apache/spark/sql/delta/test/DeltaSQLCommandTest.scala
+\ No newline at end of file
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaSQLTestUtils.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaSQLTestUtils.scala
+new file mode 120000
+index 000000000..ea39762ee
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaSQLTestUtils.scala
+@@ -0,0 +1 @@
++../../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaSQLTestUtils.scala
+\ No newline at end of file
+diff --git a/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaTestImplicits.scala b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaTestImplicits.scala
+new file mode 120000
+index 000000000..8baae50fe
+--- /dev/null
++++ b/backends-bolt/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaTestImplicits.scala
+@@ -0,0 +1 @@
++../../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaTestImplicits.scala
+\ No newline at end of file
+diff --git a/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala b/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
+index 51a565be0..bc9a99472 100644
+--- a/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
++++ b/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
+@@ -119,13 +119,11 @@ class GlutenFallbackSuite extends GlutenSQLTestsTrait with AdaptiveSparkPlanHelp
+
+       val id = runExecution("SELECT * FROM t1 FULL OUTER JOIN t2")
+       val execution = glutenStore.execution(id)
+-      if (BackendTestUtils.isVeloxBackendLoaded()) {
++      if (BackendTestUtils.isVeloxBackendLoaded() || BackendTestUtils.isBoltBackendLoaded()) {
+         assert(execution.get.numFallbackNodes == 1)
+         assert(
+           execution.get.fallbackNodeToReason.head._2
+             .contains("FullOuter join is not supported with BroadcastNestedLoopJoin"))
+-      } else if (BackendTestUtils.isBoltBackendLoaded()) {
+-        assert(execution.get.numFallbackNodes == 0)
+       } else {
+         assert(execution.get.numFallbackNodes == 2)
+       }
+@@ -226,7 +224,7 @@ class GlutenFallbackSuite extends GlutenSQLTestsTrait with AdaptiveSparkPlanHelp
+             events.count(
+               _.fallbackNodeToReason.values.toSet.exists(_.contains(
+                 "Could not find a valid substrait mapping name for max"
+-              ))) == (if (BackendTestUtils.isBoltBackendLoaded()) 2 else 3))
++              ))) == 3)
+         } finally {
+           spark.sparkContext.removeSparkListener(listener)
+         }
+diff --git a/gluten-ut/spark35/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala b/gluten-ut/spark35/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
+index 51a565be0..bc9a99472 100644
+--- a/gluten-ut/spark35/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
++++ b/gluten-ut/spark35/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
+@@ -119,13 +119,11 @@ class GlutenFallbackSuite extends GlutenSQLTestsTrait with AdaptiveSparkPlanHelp
+
+       val id = runExecution("SELECT * FROM t1 FULL OUTER JOIN t2")
+       val execution = glutenStore.execution(id)
+-      if (BackendTestUtils.isVeloxBackendLoaded()) {
++      if (BackendTestUtils.isVeloxBackendLoaded() || BackendTestUtils.isBoltBackendLoaded()) {
+         assert(execution.get.numFallbackNodes == 1)
+         assert(
+           execution.get.fallbackNodeToReason.head._2
+             .contains("FullOuter join is not supported with BroadcastNestedLoopJoin"))
+-      } else if (BackendTestUtils.isBoltBackendLoaded()) {
+-        assert(execution.get.numFallbackNodes == 0)
+       } else {
+         assert(execution.get.numFallbackNodes == 2)
+       }
+@@ -226,7 +224,7 @@ class GlutenFallbackSuite extends GlutenSQLTestsTrait with AdaptiveSparkPlanHelp
+             events.count(
+               _.fallbackNodeToReason.values.toSet.exists(_.contains(
+                 "Could not find a valid substrait mapping name for max"
+-              ))) == (if (BackendTestUtils.isBoltBackendLoaded()) 2 else 3))
++              ))) == 3)
+         } finally {
+           spark.sparkContext.removeSparkListener(listener)
+         }
+diff --git a/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala b/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
+index f4e6e8203..bc9a99472 100644
+--- a/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
++++ b/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
+@@ -119,7 +119,7 @@ class GlutenFallbackSuite extends GlutenSQLTestsTrait with AdaptiveSparkPlanHelp
+
+       val id = runExecution("SELECT * FROM t1 FULL OUTER JOIN t2")
+       val execution = glutenStore.execution(id)
+-      if (BackendTestUtils.isVeloxBackendLoaded()) {
++      if (BackendTestUtils.isVeloxBackendLoaded() || BackendTestUtils.isBoltBackendLoaded()) {
+         assert(execution.get.numFallbackNodes == 1)
+         assert(
+           execution.get.fallbackNodeToReason.head._2
+diff --git a/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala b/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
+index f4e6e8203..bc9a99472 100644
+--- a/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
++++ b/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
+@@ -119,7 +119,7 @@ class GlutenFallbackSuite extends GlutenSQLTestsTrait with AdaptiveSparkPlanHelp
+
+       val id = runExecution("SELECT * FROM t1 FULL OUTER JOIN t2")
+       val execution = glutenStore.execution(id)
+-      if (BackendTestUtils.isVeloxBackendLoaded()) {
++      if (BackendTestUtils.isVeloxBackendLoaded() || BackendTestUtils.isBoltBackendLoaded()) {
+         assert(execution.get.numFallbackNodes == 1)
+         assert(
+           execution.get.fallbackNodeToReason.head._2
+diff --git a/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/GlutenSQLQuerySuite.scala b/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/GlutenSQLQuerySuite.scala
+index c75569af2..b578a9e95 100644
+--- a/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/GlutenSQLQuerySuite.scala
++++ b/gluten-ut/spark40/src/test/scala/org/apache/spark/sql/GlutenSQLQuerySuite.scala
+@@ -163,6 +163,8 @@ class GlutenSQLQuerySuite extends SQLQuerySuite with GlutenSQLTestsTrait {
+         // Remove the backend keyword in c2r/r2c.
+         .map(_.replaceAll("[A-Za-z]*ColumnarToRow", "ColumnarToRow"))
+         .map(_.replaceAll("RowTo[A-Za-z]*Columnar", "RowToColumnar"))
++        // Bolt disables whole-stage numbering; it is unrelated to parameter binding.
++        .map(_.replace("^(-1)", "^(1)"))
+         === Array(plan.stripMargin)
+     )
+
+diff --git a/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/GlutenSQLQuerySuite.scala b/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/GlutenSQLQuerySuite.scala
+index ced5ca4b1..1b2b3bff3 100644
+--- a/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/GlutenSQLQuerySuite.scala
++++ b/gluten-ut/spark41/src/test/scala/org/apache/spark/sql/GlutenSQLQuerySuite.scala
+@@ -163,6 +163,8 @@ class GlutenSQLQuerySuite extends SQLQuerySuite with GlutenSQLTestsTrait {
+         // Remove the backend keyword in c2r/r2c.
+         .map(_.replaceAll("[A-Za-z]*ColumnarToRow", "ColumnarToRow"))
+         .map(_.replaceAll("RowTo[A-Za-z]*Columnar", "RowToColumnar"))
++        // Bolt disables whole-stage numbering; it is unrelated to parameter binding.
++        .map(_.replace("^(-1)", "^(1)"))
+         === Array(plan.stripMargin)
+     )
+
+diff --git a/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/hive/execution/GlutenHiveQuerySuite.scala b/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/hive/execution/GlutenHiveQuerySuite.scala
+index f547953c5..d2fe60d44 100644
+--- a/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/hive/execution/GlutenHiveQuerySuite.scala
++++ b/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/hive/execution/GlutenHiveQuerySuite.scala
+@@ -59,7 +59,8 @@ class GlutenHiveQuerySuite
+       sql("""CREATE TABLE t1(a string, b string)
+             |ROW FORMAT SERDE 'org.apache.hive.hcatalog.data.JsonSerDe'""".stripMargin)
+       sql(s"""LOAD DATA LOCAL INPATH "$testData" INTO TABLE t1""")
+-      sql("select * from src join t1 on src.key = t1.a")
++      // Keep the join self-contained; TestHive's src loader cannot read resources inside a JAR.
++      sql("select * from range(500) src join t1 on src.id = t1.a")
+     }
+     assert(
+       sql("list jars")
+diff --git a/backends-bolt/src-delta33/test/scala/org/apache/spark/sql/delta/test/DeltaSQLCommandTest.scala b/backends-bolt/src-delta33/test/scala/org/apache/spark/sql/delta/test/DeltaSQLCommandTest.scala
+index 3d94d2bde..3c775867f 100644
+--- a/backends-bolt/src-delta33/test/scala/org/apache/spark/sql/delta/test/DeltaSQLCommandTest.scala
++++ b/backends-bolt/src-delta33/test/scala/org/apache/spark/sql/delta/test/DeltaSQLCommandTest.scala
+@@ -45,6 +45,7 @@ trait DeltaSQLCommandTest extends SharedSparkSession {
+       .set("spark.default.parallelism", "1")
+       .set("spark.memory.offHeap.enabled", "true")
+       .set("spark.sql.shuffle.partitions", "1")
++      .set("spark.databricks.delta.snapshotPartitions", "2")
+       .set("spark.memory.offHeap.size", "2g")
+       .set("spark.unsafe.exceptionOnMemoryLeak", "true")
+   }

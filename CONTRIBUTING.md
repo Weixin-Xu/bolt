@@ -167,15 +167,34 @@ HDFS and use Bolt's existing compiler cache. Gluten shares its native build and
 newly built dependencies with all downstream test jobs through short-lived
 Actions artifacts, without publishing to a Conan remote. The `gluten-bolt-check`
 job in Build and Test requires every Gluten job to succeed.
-Native CTest runs with the shared build. Ten independent jobs reuse its native
-libraries and Spark 3.5 Maven outputs to run backend JVM, Delta, three Spark SQL
-groups, Extended SQL, Slow Hive, TPC and Spark 4.0/4.1 checks in parallel.
-Each job restores its own workspace and verifies the native library hashes;
-Spark 4 jobs compile their JVM modules separately. Reports are uploaded per job.
-Runtime coverage is Spark 3.5 / Scala 2.12 plus selected Spark 4.0/4.1 suites;
-Spark 3.4 is compilation-only. This does not yet cover the full Velox test
-matrix: Spark 3.5 / Scala 2.13, all storage profiles and the full Spark 4 SQL
-groups are not enabled, and Spark UT selection still uses BoltTestSettings.
+Native CTest runs with the shared build. JVM compilation runs once per
+Spark/Scala/storage configuration; parallel test jobs restore the matching
+outputs, verify the native library hashes and invoke test runners directly. Spark 3.4 Iceberg JUnit fixtures
+run separately from Scala backend tests because their ORC dependencies conflict;
+Scala tests reuse the regular profile already built for Extended SQL/Slow Hive.
+Reports are uploaded per job.
+The regular x86 test scope follows Gluten's `velox_backend_x86.yml`:
+
+| Spark / Scala | Storage profiles | Spark SQL groups |
+| --- | --- | --- |
+| 3.4 / 2.12 | Iceberg (including Java tests), Delta, Hudi, Paimon | Three regular groups, Extended SQL, Slow Hive |
+| 3.5 / 2.12 | Iceberg, Delta, Hudi, Paimon | Three regular groups, Extended SQL, Slow Hive |
+| 3.5 / 2.13 | Iceberg, Delta | Three regular groups |
+| 4.0 / 2.13 | Delta, Paimon (Paimon excluded from Slow Hive) | Three regular groups, Extended SQL, Slow Hive |
+| 4.1 / 2.13 | Delta (regular groups only) | Three regular groups, Extended SQL, Slow Hive |
+
+These 23 SQL groups use Velox's suite/case selection and SQL-query golden resources via
+`GLUTEN_BOLT_USE_VELOX_TEST_SETTINGS=true`. Large regular groups run in
+three suite shards; Extended SQL uses one shard for the golden-query suite and
+three for the remaining suites. Shards retain the original tags and run common reactor tests
+once per group. Local commands default to an unsplit group; set `CI_TEST_SHARD`
+and `CI_TEST_SHARDS` to reproduce a CI shard. Backend JVM tests run for all five
+Spark/Scala combinations. Isolated Delta suites run for Spark 3.5, 4.0 and 4.1;
+Spark 3.4's Delta 2.4 coverage is in the backend JVM suites. TPC-H/TPC-DS
+comparison runs on Spark 3.5. Backend tests are excluded from the SQL reactor runs
+to avoid duplication. Additional OS/JDK/ARM, ANSI and fault-injection matrices
+are outside this workflow's scope. Test selection parity does not imply that
+Bolt passes every selected test; temporary exact exclusions remain explicit.
 Temporary source compatibility fixes live in
 `.github/gluten-ci-patches/` and are applied explicitly to the resolved Apache
 main. Already-applied patches are accepted; incompatible patches fail the job.
@@ -219,6 +238,8 @@ export CONAN_HOME="$PWD/.ci/conan"
 ./scripts/install-bolt-deps.sh
 python3 scripts/configure-conan-profile.py \
   --compiler clang --libcxx libstdc++11 --linker mold --lto none
+export CI_BUILD=spark35
+export GLUTEN_BOLT_USE_VELOX_TEST_SETTINGS=true
 source .github/scripts/gluten_ci.sh
 ci_apply_patches
 ci_init
@@ -226,15 +247,16 @@ ci_spark_environment
 # Run one backend suite against the native backend built from this checkout.
 CI_SUITES=org.apache.gluten.execution.BoltLiteralSuite \
   ci_maven_test jvm backends-bolt "${MVN[@]}" test \
-    "-DargLine=-Dspark.test.home=${SPARK_HOME}"
+    "-DargLine=-Xmx4g -Dspark.test.home=${SPARK_HOME}"
 ```
 
-Build and test commands are in the `build` and `integration` jobs' `run`
+Build and test commands are in the `build`, `jvm-build` and `integration` jobs' `run`
 blocks in `.github/workflows/gluten-bolt.yml`; execute them in order for a
 complete local run. The build block configures Release and exports the
 candidate Bolt package into the selected Conan home. The example above runs
 one suite after that build. Set `CI_NUM_THREADS` for local build parallelism.
-Reports and failure logs go to `.ci/gluten-bolt/`.
+Reports and failure logs go to `.ci/gluten-bolt/`. Test JVMs use a 4 GiB heap so
+heap-dependent Spark tests behave consistently across local and CI hosts.
 The shell helper handles runtime activation, logging and fresh report capture.
 Maven test stages also require valid fresh XML reports with executed tests;
 missing, malformed, empty or entirely skipped reports cannot pass a stage.
@@ -246,9 +268,12 @@ Gluten consumes the exported candidate Bolt package and native libraries.
 `ci_init` exports its path as `GLUTEN_TEST_BLACKLIST`; a Gluten test-layer patch
 registers matching cases as ignored before executing their bodies. Unlisted
 failures, compilation errors, suite aborts and crashes remain fatal to Maven.
-Unset `GLUTEN_TEST_BLACKLIST` after `ci_init` to retest excluded cases. Spark 4
-stages run without the Spark 3.5 blacklist. Remove entries only after verifying
-the corresponding fixes.
+Entries use `[Spark/Scala]suite#exact testcase`, for example the version prefix
+`[3.5/2.12]`; exclusions apply only to that Spark minor and Scala binary version.
+The blacklist covers ScalaTest and the Bolt Iceberg JUnit fixtures, including
+exact parameterized invocations. Unset
+`GLUTEN_TEST_BLACKLIST` after `ci_init` to retest excluded cases. Remove entries
+only after verifying the corresponding fixes.
 
 ### Working with IDE
 

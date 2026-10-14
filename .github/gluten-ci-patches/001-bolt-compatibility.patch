@@ -132,3 +132,28 @@ index 0000000000..20ac226388
 ++ #include <memory>
 ++ #include <thrift/TNonCopyable.h>
 ++
+diff --git a/backends-bolt/src/main/scala/org/apache/spark/api/python/ColumnarArrowEvalPythonExec.scala b/backends-bolt/src/main/scala/org/apache/spark/api/python/ColumnarArrowEvalPythonExec.scala
+index 312d3fd5d..8a89614bd 100644
+--- a/backends-bolt/src/main/scala/org/apache/spark/api/python/ColumnarArrowEvalPythonExec.scala
++++ b/backends-bolt/src/main/scala/org/apache/spark/api/python/ColumnarArrowEvalPythonExec.scala
+@@ -156,13 +156,16 @@ class ColumnarArrowPythonRunner(
+       }
+
+       def writeNextInputToStream(dataOut: DataOutputStream): Boolean = {
+-        writeToStreamHelper(dataOut)
++        // Spark 4 stops calling the incremental writer once the input is exhausted.
++        if (!inputIterator.hasNext) {
++          false
++        } else {
++          writeToStreamHelper(dataOut)
++        }
+       }
+
+       def writeToStreamHelper(dataOut: DataOutputStream): Boolean = {
+-        if (!inputIterator.hasNext) {
+-          return false
+-        }
++        // Spark 3's one-shot writer must send a schema and EOS even for empty partitions.
+         var numRows: Long = 0
+         val arrowSchema = SparkSchemaUtil.toArrowSchema(schema, timeZoneId)
+         val allocator = ArrowBufferAllocators.contextInstance()
