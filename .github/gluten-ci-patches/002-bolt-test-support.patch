@@ -3358,6 +3358,31 @@ index 000000000..8baae50fe
 @@ -0,0 +1 @@
 +../../../../../../../../../../backends-velox/src-delta40/test/scala/org/apache/spark/sql/delta/test/DeltaTestImplicits.scala
 \ No newline at end of file
+diff --git a/gluten-ut/pom.xml b/gluten-ut/pom.xml
+index 45360c63c..046af3887 100644
+--- a/gluten-ut/pom.xml
++++ b/gluten-ut/pom.xml
+@@ -200,6 +200,20 @@
+   </build>
+
+   <profiles>
++    <profile>
++      <id>iceberg</id>
++      <activation>
++        <activeByDefault>false</activeByDefault>
++      </activation>
++      <dependencies>
++        <dependency>
++          <groupId>org.apache.iceberg</groupId>
++          <artifactId>iceberg-spark-runtime-${sparkbundle.version}_${scala.binary.version}</artifactId>
++          <version>${iceberg.version}</version>
++          <scope>test</scope>
++        </dependency>
++      </dependencies>
++    </profile>
+     <profile>
+       <id>spark-3.4</id>
+       <modules>
 diff --git a/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala b/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
 index 51a565be0..bc9a99472 100644
 --- a/gluten-ut/spark34/src/test/scala/org/apache/spark/sql/gluten/GlutenFallbackSuite.scala
