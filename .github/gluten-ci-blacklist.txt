@@ -1393,3 +1393,10 @@
 [4.1/2.13]org.apache.spark.sql.gluten.GlutenRowBasedChecksumSuite#Gluten row-based checksum detects data change
 [4.1/2.13]org.apache.spark.sql.hive.execution.GlutenHiveSQLQuerySuite#Gluten - orc.force.positional.evolution maps Hive ORC columns by position
 [4.1/2.13]org.apache.spark.sql.GlutenSQLQuerySuite#TABLE SAMPLE
+
+# Spark 4.x coverage of existing V2 nested-update and ORC positional gaps.
+[4.0/2.13]org.apache.spark.sql.connector.GlutenDeltaBasedUpdateAsDeleteAndInsertTableSuite#update char/varchar columns
+[4.0/2.13]org.apache.spark.sql.connector.GlutenDeltaBasedUpdateAsDeleteAndInsertTableSuite#update nested struct fields
+[4.0/2.13]org.apache.spark.sql.hive.execution.GlutenHiveSQLQuerySuite#Gluten - orc.force.positional.evolution maps Hive ORC columns by position
+[4.1/2.13]org.apache.spark.sql.connector.GlutenDeltaBasedUpdateAsDeleteAndInsertTableSuite#update char/varchar columns
+[4.1/2.13]org.apache.spark.sql.connector.GlutenDeltaBasedUpdateAsDeleteAndInsertTableSuite#update nested struct fields
