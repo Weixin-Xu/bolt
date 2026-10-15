@@ -27,22 +27,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  build:
     outputs:
       gluten_sha: ${{ steps.inputs.outputs.gluten_sha }}
-    steps:
-      - name: Resolve Apache Gluten main for all jobs
-        id: inputs
-        shell: bash
-        run: |
-          read -r sha ref < <(git ls-remote --exit-code https://github.com/apache/gluten.git refs/heads/main)
-          [[ "${sha}" =~ ^[0-9a-f]{40}$ && "${ref}" == refs/heads/main ]]
-          echo "gluten_sha=${sha}" >> "${GITHUB_OUTPUT}"
-
-  build:
-    needs: prepare
     runs-on: ${{ fromJSON(vars.BOLT_GLUTEN_CI_RUNNER || '["self-hosted", "medium"]') }}
     timeout-minutes: 1440
     container:
@@ -69,6 +56,12 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Resolve Apache Gluten main for all jobs
+        id: inputs
+        run: |
+          read -r sha ref < <(git ls-remote --exit-code https://github.com/apache/gluten.git refs/heads/main)
+          [[ "${sha}" =~ ^[0-9a-f]{40}$ && "${ref}" == refs/heads/main ]]
+          echo "gluten_sha=${sha}" >> "${GITHUB_OUTPUT}"
       - name: Checkout the tested Bolt merge commit
         uses: actions/checkout@v6
         with:
@@ -78,7 +71,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: apache/gluten
-          ref: ${{ needs.prepare.outputs.gluten_sha }}
+          ref: ${{ steps.inputs.outputs.gluten_sha }}
           path: gluten
           persist-credentials: false
       - name: Apply declared Gluten compatibility patches
@@ -213,7 +206,7 @@ jobs:
 
   test:
     name: JVM and Spark tests (${{ matrix.build }})
-    needs: [prepare, build]
+    needs: build
     runs-on: ${{ fromJSON(vars.BOLT_GLUTEN_CI_RUNNER || '["self-hosted", "medium"]') }}
     timeout-minutes: 360
     strategy:
@@ -257,7 +250,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: apache/gluten
-          ref: ${{ needs.prepare.outputs.gluten_sha }}
+          ref: ${{ needs.build.outputs.gluten_sha }}
           path: gluten
           persist-credentials: false
       - name: Apply declared Gluten compatibility patches
