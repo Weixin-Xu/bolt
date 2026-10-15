@@ -168,15 +168,15 @@ newly built dependencies with all downstream test jobs through short-lived
 Actions artifacts, without publishing to a Conan remote. The `gluten-bolt-check`
 job in Build and Test requires every Gluten job to succeed.
 Native CTest runs with the shared build. JVM compilation runs once per
-Spark/Scala/storage configuration; parallel test jobs restore the matching
-outputs, verify the native library hashes and invoke test runners directly.
+Spark/Scala/storage configuration. Each job verifies the native library hashes,
+then tests its own JVM build without transferring it between jobs.
 Native Iceberg connector tests are skipped because Bolt does not implement that
 connector. The inherited Java fixtures are still compiled; Iceberg helper and
 ordinary backend Java UTs run separately from Scala tests because their ORC
-dependencies conflict. Scala tests reuse the regular profile already built for
+dependencies conflict. Scala tests use the regular Spark 3.4 profile for
 Extended SQL/Slow Hive and retain the Iceberg fallback test that checks ordinary
 Parquet scans remain offloaded when native Iceberg reads are disabled.
-Reports are uploaded per job.
+Reports and logs are retained separately for each test group and uploaded per profile.
 The regular x86 test scope follows Gluten's `velox_backend_x86.yml`:
 
 | Spark / Scala | Storage profiles | Spark SQL groups |
@@ -188,12 +188,13 @@ The regular x86 test scope follows Gluten's `velox_backend_x86.yml`:
 | 4.1 / 2.13 | Delta (regular groups only) | Three regular groups, Extended SQL, Slow Hive |
 
 These 23 SQL groups use Velox's suite/case selection and SQL-query golden resources via
-`GLUTEN_BOLT_USE_VELOX_TEST_SETTINGS=true`. Large regular groups run in
-three suite shards; Extended SQL uses one shard for the golden-query suite and
-three for the remaining suites. Shards retain the original tags and run common reactor tests
-once per group. Local commands default to an unsplit group; set `CI_TEST_SHARD`
-and `CI_TEST_SHARDS` to reproduce a CI shard. Backend JVM tests run for all five
-Spark/Scala combinations. Isolated Delta suites run for Spark 3.5, 4.0 and 4.1;
+`GLUTEN_BOLT_USE_VELOX_TEST_SETTINGS=true`. The workflow has ten jobs: one resolves
+Apache main, one builds the shared native backend, and eight compile and test the
+Spark/Scala/storage profiles above. Each profile reuses its JVM build in the same
+job and runs its SQL groups sequentially. There are no JVM artifact transfers or
+SQL suite shards; fewer jobs trade some parallelism for less setup and network
+traffic. Backend JVM tests run for all five Spark/Scala combinations. Isolated
+Delta suites run for Spark 3.5, 4.0 and 4.1;
 Spark 3.4's Delta 2.4 coverage is in the backend JVM suites. TPC-H/TPC-DS
 comparison runs on Spark 3.5. Backend tests are excluded from the SQL reactor runs
 to avoid duplication. Additional OS/JDK/ARM, ANSI and fault-injection matrices
@@ -216,16 +217,19 @@ Image overrides must be available to every selected runner. The runner must
 reach the Bolt registry and Conan service. The workflow
 reuses `bolt-build-base` for Conan setup and `install-bolt-deps.sh`, installs a
 full JDK 17 with `setup-java`, and provisions the pinned Python test runtime.
-Maven builds and artifact transfer use the same local repository, defaulting to
+Maven builds and tests use the same local repository, defaulting to
 `$HOME/.m2/repository`. Set `GLUTEN_MAVEN_REPO` to reuse a different local cache.
+Only the native build is transferred between jobs using GitHub Actions artifacts;
+Bolt and Gluten Conan packages are not uploaded to a Conan remote. Downloads are
+retried and checked against GitHub's SHA256 digest before extraction.
 Spark binaries and SQL test resources come from Gluten's existing
 `.github/workflows/util/install-spark-resources.sh`; its SHA512 verification
 requires `shasum` in the CI image.
 
 Local execution requires Linux x86_64, a full JDK 17 with AWT, Python 3.10+,
-Conan 2.32.0, Maven 3.9+, CMake 3.31, Ninja, mold, curl, jq, xmllint (libxml2-utils)
-and a C++ compiler. Provide a
-Spark 3.5.5 binary distribution with Python ZIPs and the matching source `sql/`
+Conan 2.32.0, Maven 3.9+, CMake 3.31, Ninja, mold, curl, jq,
+xmllint (libxml2-utils), unzip, and a C++ compiler. Provide a Spark 3.5.5 binary
+distribution with Python ZIPs and the matching source `sql/`
 test resources, plus PySpark 3.5.5, pandas 2.2.3 and PyArrow 20.0.0. Set
 `BOLT_GLUTEN_SPARK_HOME` to the binary directory; its `sql/` can be a symlink
 to the source tree. The container default is `/opt/shims/spark35/spark_home`.
@@ -254,9 +258,9 @@ CI_SUITES=org.apache.gluten.execution.BoltLiteralSuite \
     "-DargLine=-Xmx4g -Dspark.test.home=${SPARK_HOME}"
 ```
 
-Build and test commands are in the `build`, `jvm-build` and `integration` jobs' `run`
-blocks in `.github/workflows/gluten-bolt.yml`; execute them in order for a
-complete local run. The build block configures Release and exports the
+Build and test commands are in the `build` and `test` jobs' `run` blocks in
+`.github/workflows/gluten-bolt.yml`; execute them in order for a complete local
+run. The build block configures Release and exports the
 candidate Bolt package into the selected Conan home. The example above runs
 one suite after that build. Set `CI_NUM_THREADS` for local build parallelism.
 Reports and failure logs go to `.ci/gluten-bolt/`. Test JVMs use a 4 GiB heap so
