@@ -119,6 +119,33 @@ ci_verify_bolt_package() {
   ' "${GLUTEN_REPORTS_DIR}/gluten-install.json"
 }
 
+# Verify the complete archive before extraction. A stopped artifact stream can
+# otherwise leave missing or truncated files while its action reports success.
+ci_download_artifact() (
+  local metadata url digest archive attempt
+  local api="${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts"
+  local auth=(-H "Authorization: Bearer ${GITHUB_TOKEN:?}")
+  metadata="$(curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --max-time 60 \
+    "${auth[@]}" --get --data-urlencode "name=$1" "${api}")" || return
+  url="$(jq -er '.artifacts | select(length == 1) | .[0].archive_download_url' <<< "${metadata}")" || return
+  digest="$(jq -er '.artifacts[0].digest' <<< "${metadata}")" || return
+  [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  mkdir -p "${GLUTEN_REPORTS_DIR}" || return
+  archive="$(mktemp "${RUNNER_TEMP:-/tmp}/gluten-artifact-XXXXXX.zip")" || return
+  trap 'rm -f "${archive}"' EXIT
+  for attempt in 1 2 3; do
+    if curl -fsSL --connect-timeout 30 --max-time 1800 \
+      "${auth[@]}" --output "${archive}" "${url}" \
+      && printf '%s  %s\n' "${digest#sha256:}" "${archive}" | sha256sum -c - \
+      && unzip -tqq "${archive}"; then
+      unzip -oq "${archive}" -d "${GLUTEN_REPORTS_DIR}"
+      return
+    fi
+    echo "Artifact $1 failed integrity validation (attempt ${attempt}/3)" >&2
+  done
+  return 1
+)
+
 ci_restore_native() {
   export BOLT_BUILD_VERSION="ci-$(git -C "${BOLT_ROOT}" rev-parse HEAD)"
   local gluten_build_version="ci-$(git -C "${GLUTEN_DIR}" rev-parse HEAD)"
@@ -141,30 +168,6 @@ ci_restore_native() {
   if grep -q 'not found' "${GLUTEN_REPORTS_DIR}/native-linkage.log"; then return 1; fi
   rm "${GLUTEN_REPORTS_DIR}/bolt.tgz" "${GLUTEN_REPORTS_DIR}/arrow.tgz" \
     "${GLUTEN_REPORTS_DIR}/native.tgz"
-}
-
-ci_pack_jvm() (
-  (cd "${GLUTEN_DIR}/backends-bolt/target/scala-${SCALA_VERSION}/classes/linux/amd64" \
-    && sha256sum -c "${GLUTEN_REPORTS_DIR}/native.sha256")
-  tar -C "${GLUTEN_MAVEN_REPO}" -I 'gzip -1' -cf "${GLUTEN_REPORTS_DIR}/jvm-maven.tgz" \
-    org/apache/gluten
-  cd "${GLUTEN_DIR}"
-  targets=()
-  while IFS= read -r pom; do
-    target="${pom%pom.xml}target"
-    [[ ! -d "${target}" ]] || targets+=("${target}")
-  done < <(git ls-files '**/pom.xml' pom.xml)
-  # Installed backend jars are already in the Maven archive; retain nested test resources.
-  tar --no-wildcards-match-slash --exclude='backends-bolt/target/*.jar' -I 'gzip -1' \
-    -cf "${GLUTEN_REPORTS_DIR}/jvm-tests.tgz" "${targets[@]}"
-)
-
-ci_restore_jvm() {
-  tar -C "${GLUTEN_MAVEN_REPO}" -xzf "${GLUTEN_REPORTS_DIR}/jvm-maven.tgz"
-  tar -C "${GLUTEN_DIR}" -xzf "${GLUTEN_REPORTS_DIR}/jvm-tests.tgz"
-  rm "${GLUTEN_REPORTS_DIR}/jvm-maven.tgz" "${GLUTEN_REPORTS_DIR}/jvm-tests.tgz"
-  (cd "${GLUTEN_DIR}/backends-bolt/target/scala-${SCALA_VERSION}/classes/linux/amd64" \
-    && sha256sum -c "${GLUTEN_REPORTS_DIR}/native.sha256")
 }
 
 ci_run() {
@@ -204,59 +207,6 @@ ci_spark_environment() {
   export PYTHONPATH="${zipped}${PYTHONPATH:+:${PYTHONPATH}}"
 }
 
-# Select whole suites for independent jobs; ScalaTest remains sequential within a JVM.
-ci_select_sql_shard() {
-  local prefixes="${1:-}" shard="${CI_TEST_SHARD:-1}" shards="${CI_TEST_SHARDS:-1}"
-  [[ "${shard}" =~ ^[1-9][0-9]*$ && "${shards}" =~ ^[1-9][0-9]*$ ]]
-  ((shard <= shards))
-  [[ "${shards}" != 1 ]] || return 0
-  local output="${GLUTEN_REPORTS_DIR}/${CI_TEST_STAGE}/shard-${shard}"
-  local classes="${GLUTEN_DIR}/gluten-ut/${SPARK_MODULE}/target/scala-${SCALA_VERSION}"
-  mkdir -p "${output}"
-  (cd "${GLUTEN_DIR}" && ci_run "${output}/discovery.log" ci_runtime \
-    "${MVN[@]}" dependency:build-classpath -Pspark-ut \
-    -pl "backends-bolt,gluten-ut/${SPARK_MODULE}" -DincludeScope=test \
-    "-Dmdep.outputFile=${output}/test-classpath.txt")
-  "${JAVA_HOME}/bin/java" --class-path \
-    "${classes}/test-classes:${classes}/classes:$(cat "${output}/test-classpath.txt")" \
-    "${BOLT_ROOT}/.github/scripts/DiscoverGlutenSuites.java" \
-    "${output}/discovered-suites.txt" "${classes}/test-classes"
-  local suite prefix index=0 assigned
-  local selected=() patterns=()
-  IFS=, read -r -a patterns <<< "${prefixes}"
-  : > "${output}/group-suites.txt"
-  while IFS= read -r suite; do
-    if [[ "${CI_TEST_STAGE}" == extended ]]; then
-      # Most discovered suites have no Extended SQL tests. Keep the long query
-      # suite separate, and distribute the remaining suites across other jobs.
-      if [[ "${suite}" == org.apache.spark.sql.GlutenSQLQueryTestSuite ]]; then
-        assigned=1
-      else
-        assigned=$((index % (shards - 1) + 2))
-        index=$((index + 1))
-      fi
-    else
-      assigned=0
-      for prefix in "${patterns[@]}"; do
-        [[ "${suite}" == "${prefix}"* ]] || continue
-        assigned=$((index % shards + 1))
-        index=$((index + 1))
-        break
-      done
-      [[ "${assigned}" != 0 ]] || continue
-    fi
-    printf '%s\n' "${suite}" >> "${output}/group-suites.txt"
-    [[ "${assigned}" != "${shard}" ]] || selected+=("${suite}")
-  done < "${output}/discovered-suites.txt"
-  ((${#selected[@]} > 0))
-  printf '%s\n' "${selected[@]}" > "${output}/selected-suites.txt"
-  CI_SUITES="$(
-    IFS=,
-    printf '%s' "${selected[*]}"
-  )"
-  CI_GROUP="shard-${shard}"
-}
-
 ci_maven_test() (
   local stage="$1" module="$2"
   shift 2
@@ -280,15 +230,6 @@ ci_maven_test() (
     common_command+=("${argument}")
   done
   common_command+=(test)
-  if [[ "${module}" == reactor && "${CI_TEST_SHARDS:-1}" != 1 ]]; then
-    # Explicit suites and wildcard discovery are additive in ScalaTest. Only the
-    # common invocation keeps the original wildcard; SQL uses its shard list.
-    local filtered=()
-    for argument in "${command[@]}"; do
-      [[ "${argument}" == -DwildcardSuites=* ]] || filtered+=("${argument}")
-    done
-    command=("${filtered[@]}")
-  fi
   [[ -z "${CI_SUITES:-}" ]] || command+=("-Dsuites=${CI_SUITES}")
   # Reports must come from this invocation, including when Maven fails.
   shopt -s globstar nullglob
@@ -303,10 +244,8 @@ ci_maven_test() (
     # Keep the backend in the reactor so its active storage-profile dependencies
     # reach the tests. Its own tests run in JVM/Delta jobs. Run SQL separately so
     # a common-module failure cannot make Maven skip its dependent SQL tests.
-    if [[ "${CI_TEST_SHARD:-1}" == 1 ]]; then
-      ci_run "${log}" ci_runtime "${common_command[@]}" -Dbolt.skipTests=true \
-        -pl "!gluten-ut/${SPARK_MODULE}" || status=$?
-    fi
+    ci_run "${log}" ci_runtime "${common_command[@]}" -Dbolt.skipTests=true \
+      -pl "!gluten-ut/${SPARK_MODULE}" || status=$?
     ci_run "${log}" ci_runtime "${command[@]}" -Dbolt.skipTests=true \
       -pl "backends-bolt,gluten-ut/${SPARK_MODULE}" || status=$?
   elif [[ "${module}" == gluten-ut/* ]]; then
