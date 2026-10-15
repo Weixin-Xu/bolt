@@ -1,11 +1,25 @@
 diff --git a/gluten-ut/spark40/pom.xml b/gluten-ut/spark40/pom.xml
-index 179d479172..758cbe26e1 100644
+index 179d47917..5a1ad4f77 100644
 --- a/gluten-ut/spark40/pom.xml
 +++ b/gluten-ut/spark40/pom.xml
-@@ -365,6 +365,73 @@
+@@ -35,6 +35,13 @@
+   </properties>
+
+   <dependencies>
++    <!-- Spark's DataSource V2 test fixtures call JUnit Jupiter assertions. -->
++    <dependency>
++      <groupId>org.junit.jupiter</groupId>
++      <artifactId>junit-jupiter-api</artifactId>
++      <version>5.9.3</version>
++      <scope>test</scope>
++    </dependency>
+     <dependency>
+       <groupId>org.apache.gluten</groupId>
+       <artifactId>gluten-ut-common</artifactId>
+@@ -365,6 +372,73 @@
        </build>
      </profile>
- 
+
 +    <profile>
 +      <id>backends-bolt</id>
 +      <activation>
@@ -445,13 +459,27 @@ index 142cd5700c..090de69855 100644
              expectedCount = 0)
            checkAnswer(twoJoins, Row(0))
 diff --git a/gluten-ut/spark41/pom.xml b/gluten-ut/spark41/pom.xml
-index dbb761d93f..3062c675df 100644
+index dbb761d93..52046725c 100644
 --- a/gluten-ut/spark41/pom.xml
 +++ b/gluten-ut/spark41/pom.xml
-@@ -366,6 +366,62 @@
+@@ -35,6 +35,13 @@
+   </properties>
+
+   <dependencies>
++    <!-- Spark's DataSource V2 test fixtures call JUnit Jupiter assertions. -->
++    <dependency>
++      <groupId>org.junit.jupiter</groupId>
++      <artifactId>junit-jupiter-api</artifactId>
++      <version>5.9.3</version>
++      <scope>test</scope>
++    </dependency>
+     <dependency>
+       <groupId>org.apache.gluten</groupId>
+       <artifactId>gluten-ut-common</artifactId>
+@@ -366,6 +373,62 @@
        </build>
      </profile>
- 
+
 +    <profile>
 +      <id>backends-bolt</id>
 +      <activation>
