@@ -8,7 +8,6 @@ Welcome to the Bolt community! Bolt is a C++ acceleration library focused on hig
 - [Fork and PR Workflow](#fork-and-pr-workflow)
 - [Building and Testing](#building-and-testing)
   - [Common Targets](#common-targets)
-  - [Gluten Bolt backend CI](#gluten-bolt-backend-ci)
   - [Working with IDE](#working-with-ide)
 - [Code Style and Static Analysis](#code-style-and-static-analysis)
   - [Formatting (clang-format)](#formatting-clang-format)
@@ -47,9 +46,9 @@ Bolt uses **Conan 2** for dependency management and a Makefile to drive its buil
 
 - **OS**: Linux (Ubuntu 20.04+, CentOS 7+) or macOS (Experimental).
 
-- **Compiler**: GCC 10+ or Clang 16+ (Must support C++17).
+- **Compiler**: **Clang 22 is required**. CI validates this Clang toolchain; newer GCC versions are not covered by CI. macOS support remains experimental.
 - **Build Tools**: CMake 3.25+, Ninja.
-- **Dependency Manager**: Conan 2.0+.
+- **Dependency Manager**: Conan 2.33.0+.
 
 ### Setup Options
 
@@ -62,20 +61,41 @@ scripts/setup-dev-env.sh
 ```
 **⚠️ Important: What this script does** This script is "opinionated" and performs the following actions. Please review them to ensure they fit your workflow:
 
-1. **Python Environment (Miniconda)**:
+1. **LLVM Toolchain**:
+   - First checks Clang executables on PATH and in standard LLVM installation directories. Reuses Clang 22 when available, skipping LLVM installation.
+   - On Debian/Ubuntu supported by [apt.llvm.org](https://apt.llvm.org/), installs LLVM 22 using the official installer's `all` option, including Clang, LLD, LLDB, clangd, LLVM development tools, libc++, libc++abi, OpenMP, compiler-rt, libunwind, and Polly. Also installs the matching LLVM BOLT package and its runtime development files, which the official installer's `all` option omits. Requires root or `sudo`.
+   - On Linux, builds patched LLD 22.1.8 under `/opt/clang-22.1.8` with the repository's `llvm-pr220492.patch` and selects that linker for the Conan profile.
+   - On macOS, installs or upgrades Homebrew `llvm` and `lld`. Homebrew must already be installed.
+   - Sets `clang`, `clang++`, `lld`, and `ld.lld` to the installed LLVM version using `update-alternatives` on Debian/Ubuntu. On macOS, adds the Homebrew LLVM and LLD directories to the shell configuration. Use `ld.lld --version` on Linux or `ld64.lld --version` on macOS; `lld` itself is the generic driver.
+   - Configures the default Conan profile with `--compiler=clang --libcxx=libc++`, using the selected LLVM toolchain first on PATH. If Clang 22 is not found, installs LLVM 22.
+   - Other Linux distributions require manual compiler installation.
+2. **Python Environment (Miniconda)**:
    - Checks for `~/miniconda3`.
    - **If missing**: Automatically downloads and installs Miniconda locally.
    - **Shell Modification**: Appends the Miniconda path to your shell configuration file (`~/.bashrc` or `~/.zshrc`).
    - Installs Python dependencies (including `conan`) into this environment.
-2. **Conan Configuration**:
-   - Sets the C++ standard to `gnu17` in the default Conan profile.
+3. **Conan Configuration**:
+   - Sets the C++ standard to `gnu20` in the default Conan profile.
    - **Clones & Patches Recipes**: Calls `install-bolt-deps.sh` to download a specific version of `conan-center-index` to `~/.conan2/conan-center-index` and applies Bolt-specific patches (required for `folly`, `arrow`, etc.).
    - Configures local Conan remotes to prioritize these patched recipes.
-3. **Git Hooks**: Installs `pre-commit` hooks for automatic code formatting.
+4. **Git Hooks**: Installs `pre-commit` hooks for automatic code formatting.
 
 #### Option 2: Manual Setup (For Advanced Users)
 
 If you prefer to manage your own Python environment (e.g., via system packages, pyenv, or poetry) or use a specific compiler, you can skip the setup script. However, you **must** still configure the Conan dependencies manually.
+
+Install Clang 22 and libc++ using your platform's package manager. On Linux,
+build LLD 22.1.8 with `.github/runners/assets/patches/llvm-pr220492.patch` and
+install it under `/opt/clang-22.1.8`. After installing the Python dependencies
+below, select the compiler and patched linker explicitly, for example:
+
+```bash
+python scripts/configure-conan-profile.py \
+  --compiler clang-22 --linker /opt/clang-22.1.8/bin/ld.lld
+```
+
+The compiler and linker options also accept absolute paths. Newer compiler
+versions and GCC are not covered by CI; validate such configurations yourself.
 
 1. **Install Python Dependencies**:
 
@@ -154,135 +174,8 @@ make release_spark BUILD_VERSION=main
 ```
 
 
-### Gluten Bolt backend CI
-
-The [Gluten Bolt Backend workflow](.github/workflows/gluten-bolt.yml) is called
-by Build and Test on pull requests and merge groups, and also supports manual
-dispatch. It tests the candidate Bolt code against `apache/gluten:main`.
-Gluten builds the candidate Bolt engine and test utility library with
-`release_spark` and `enable_testutil=True`; Bolt's own UT executables are not
-built on this path. The existing `release_spark_with_test` job still builds and
-runs Bolt's UTs independently, so Gluten does not wait for it. Both paths enable
-HDFS and use Bolt's existing compiler cache. Gluten shares its native build and
-newly built dependencies with all downstream test jobs through short-lived
-Actions artifacts, without publishing to a Conan remote. The `gluten-bolt-check`
-job in Build and Test requires every Gluten job to succeed.
-Native CTest runs with the shared build. JVM compilation runs once per
-Spark/Scala/storage configuration. Each job verifies the native library hashes,
-then tests its own JVM build without transferring it between jobs.
-Native Iceberg connector tests are skipped because Bolt does not implement that
-connector. The inherited Java fixtures are still compiled; Iceberg helper and
-ordinary backend Java UTs run separately from Scala tests because their ORC
-dependencies conflict. Scala tests use the regular Spark 3.4 profile for
-Extended SQL/Slow Hive and retain the Iceberg fallback test that checks ordinary
-Parquet scans remain offloaded when native Iceberg reads are disabled.
-Reports and logs are retained separately for each test group and uploaded per profile.
-The regular x86 test scope follows Gluten's `velox_backend_x86.yml`:
-
-| Spark / Scala | Storage profiles | Spark SQL groups |
-| --- | --- | --- |
-| 3.4 / 2.12 | Iceberg (helper Java UTs), Delta, Hudi, Paimon | Three regular groups, Extended SQL, Slow Hive |
-| 3.5 / 2.12 | Iceberg, Delta, Hudi, Paimon | Three regular groups, Extended SQL, Slow Hive |
-| 3.5 / 2.13 | Iceberg, Delta | Three regular groups |
-| 4.0 / 2.13 | Delta, Paimon (Paimon excluded from Slow Hive) | Three regular groups, Extended SQL, Slow Hive |
-| 4.1 / 2.13 | Delta (regular groups only) | Three regular groups, Extended SQL, Slow Hive |
-
-These 23 SQL groups use Velox's suite/case selection and SQL-query golden resources via
-`GLUTEN_BOLT_USE_VELOX_TEST_SETTINGS=true`. The workflow has ten jobs: one resolves
-Apache main, one builds the shared native backend, and eight compile and test the
-Spark/Scala/storage profiles above. Each profile reuses its JVM build in the same
-job and runs its SQL groups sequentially. There are no JVM artifact transfers or
-SQL suite shards; fewer jobs trade some parallelism for less setup and network
-traffic. Backend JVM tests run for all five Spark/Scala combinations. Isolated
-Delta suites run for Spark 3.5, 4.0 and 4.1;
-Spark 3.4's Delta 2.4 coverage is in the backend JVM suites. TPC-H/TPC-DS
-comparison runs on Spark 3.5. Backend tests are excluded from the SQL reactor runs
-to avoid duplication. Additional OS/JDK/ARM, ANSI and fault-injection matrices
-are outside this workflow's scope. Test selection parity does not imply that
-Bolt passes every selected test; temporary exact exclusions remain explicit.
-Temporary source compatibility fixes live in
-`.github/gluten-ci-patches/` and are applied explicitly to the resolved Apache
-main. Already-applied patches are accepted; incompatible patches fail the job.
-
-The default image and runner match Bolt's existing CI. Missing or empty
-repository Actions variables use these defaults:
-
-| Optional variable | Default |
-| --- | --- |
-| `BOLT_GLUTEN_CI_IMAGE` | `bolt-registry:5000/bolt-ci:20260921` |
-| `BOLT_GLUTEN_CI_CONAN_IMAGE` | `bolt-registry:5000/conan-server:latest` |
-| `BOLT_GLUTEN_CI_RUNNER` | `["self-hosted", "medium"]` |
-
-Image overrides must be available to every selected runner. The runner must
-reach the Bolt registry and Conan service. The workflow
-reuses `bolt-build-base` for Conan setup and `install-bolt-deps.sh`, installs a
-full JDK 17 with `setup-java`, and provisions the pinned Python test runtime.
-Maven builds and tests use the same local repository, defaulting to
-`$HOME/.m2/repository`. Set `GLUTEN_MAVEN_REPO` to reuse a different local cache.
-Only the native build is transferred between jobs using GitHub Actions artifacts;
-Bolt and Gluten Conan packages are not uploaded to a Conan remote. Downloads are
-retried and checked against GitHub's SHA256 digest before extraction.
-Spark binaries and SQL test resources come from Gluten's existing
-`.github/workflows/util/install-spark-resources.sh`; its SHA512 verification
-requires `shasum` in the CI image.
-
-Local execution requires Linux x86_64, a full JDK 17 with AWT, Python 3.10+,
-Conan 2.32.0, Maven 3.9+, CMake 3.31, Ninja, mold, curl, jq,
-xmllint (libxml2-utils), unzip, and a C++ compiler. Provide a Spark 3.5.5 binary
-distribution with Python ZIPs and the matching source `sql/`
-test resources, plus PySpark 3.5.5, pandas 2.2.3 and PyArrow 20.0.0. Set
-`BOLT_GLUTEN_SPARK_HOME` to the binary directory; its `sql/` can be a symlink
-to the source tree. The container default is `/opt/shims/spark35/spark_home`.
-
-Use an isolated checkout and Conan home, with the same linker settings as the
-workflow. From the Bolt repository root:
-
-```bash
-git clone --branch main https://github.com/apache/gluten.git gluten
-export JAVA_HOME=/path/to/jdk17
-export PATH="$JAVA_HOME/bin:$PATH"
-export BOLT_GLUTEN_SPARK_HOME=/path/to/spark-3.5.5
-export CONAN_HOME="$PWD/.ci/conan"
-./scripts/install-bolt-deps.sh
-python3 scripts/configure-conan-profile.py \
-  --compiler clang --libcxx libstdc++11 --linker mold --lto none
-export CI_BUILD=spark35
-export GLUTEN_BOLT_USE_VELOX_TEST_SETTINGS=true
-source .github/scripts/gluten_ci.sh
-ci_apply_patches
-ci_init
-ci_spark_environment
-# Run one backend suite against the native backend built from this checkout.
-CI_SUITES=org.apache.gluten.execution.BoltLiteralSuite \
-  ci_maven_test jvm backends-bolt "${MVN[@]}" test \
-    "-DargLine=-Xmx4g -Dspark.test.home=${SPARK_HOME}"
-```
-
-Build and test commands are in the `build` and `test` jobs' `run` blocks in
-`.github/workflows/gluten-bolt.yml`; execute them in order for a complete local
-run. The build block configures Release and exports the
-candidate Bolt package into the selected Conan home. The example above runs
-one suite after that build. Set `CI_NUM_THREADS` for local build parallelism.
-Reports and failure logs go to `.ci/gluten-bolt/`. Test JVMs use a 4 GiB heap so
-heap-dependent Spark tests behave consistently across local and CI hosts.
-The shell helper handles runtime activation, logging and fresh report capture.
-Maven test stages also require valid fresh XML reports with executed tests;
-missing, malformed, empty or entirely skipped reports cannot pass a stage.
-Tests use CTest, Maven and Gluten's `gluten-it.sh` entry points directly; their
-exit status determines whether a stage succeeds. The workflow checks that
-Gluten consumes the exported candidate Bolt package and native libraries.
-
-`.github/gluten-ci-blacklist.txt` lists temporary exact testcase exclusions.
-`ci_init` exports its path as `GLUTEN_TEST_BLACKLIST`; a Gluten test-layer patch
-registers matching cases as ignored before executing their bodies. Unlisted
-failures, compilation errors, suite aborts and crashes remain fatal to Maven.
-Entries use `[Spark/Scala]suite#exact testcase`, for example the version prefix
-`[3.5/2.12]`; exclusions apply only to that Spark minor and Scala binary version.
-The blacklist covers exact observed failures in supported tests. Unsupported
-native Iceberg connector tests are excluded in `backends-bolt` rather than
-enumerated in this file. Unset
-`GLUTEN_TEST_BLACKLIST` after `ci_init` to retest excluded cases. Remove entries
-only after verifying the corresponding fixes.
+The optional [Gluten integration workflow](doc/gluten-ci.md) documents its
+compilation checks, scheduled Spark tests and runner cache preparation.
 
 ### Working with IDE
 
@@ -292,7 +185,7 @@ Vscode guide in [English](./doc/vscode-config-en.md) or [Chinese](./doc/vscode-c
 
 To maintain consistent code quality and style, please run the following checks before submitting your changes.
 
-- **C++ Standard**: We use **C++17**.
+- **C++ Standard**: We use **C++23** for all building Bolt code.
 
 - **Formatting**: We use `clang-format-14`.
 

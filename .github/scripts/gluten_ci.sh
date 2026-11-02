@@ -21,18 +21,49 @@ BOLT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GLUTEN_DIR="${GLUTEN_DIR:-${BOLT_ROOT}/gluten}"
 GLUTEN_REPORTS_DIR="${GLUTEN_REPORTS_DIR:-${BOLT_ROOT}/.ci/gluten-bolt}"
 
-ci_apply_patches() {
-  local patch
-  for patch in "${BOLT_ROOT}"/.github/gluten-ci-patches/*.patch; do
-    if git -C "${GLUTEN_DIR}" apply --check "${patch}"; then
-      git -C "${GLUTEN_DIR}" apply --index "${patch}"
-    elif git -C "${GLUTEN_DIR}" apply --reverse --check "${patch}"; then
-      echo "Already applied: ${patch##*/}"
-    else
-      echo "Cannot apply patch: ${patch}" >&2
-      return 1
-    fi
-  done
+# A single deadline is shared by native and JVM jobs, including their setup
+# and artifact transfer. Scheduled tests run outside this compilation budget.
+ci_compile() {
+  local remaining=$((GLUTEN_COMPILE_DEADLINE - $(date +%s)))
+  if ((remaining <= 0)); then
+    echo "Gluten compilation exceeded its 20-minute budget" >&2
+    return 124
+  fi
+  timeout --signal=TERM --kill-after=30s "${remaining}s" "$@"
+}
+
+ci_cache_environment() {
+  local cache="${GLUTEN_CACHE_ROOT:-/data/gluten-ci-cache}"
+  local slot
+  slot="$(printf '%s' "${RUNNER_NAME:-local}" | sha256sum | cut -c1-16)"
+  export CONAN_HOME="${RUNNER_TEMP:-/tmp}/gluten-conan-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-${CI_BUILD:-native}"
+  export GLUTEN_MAVEN_REPO="${cache}/maven/${slot}/${CI_BUILD:-native}"
+  export PIP_CACHE_DIR="${cache}/pip/${slot}"
+  mkdir -p "${CONAN_HOME}" "${GLUTEN_MAVEN_REPO}" "${PIP_CACHE_DIR}"
+  mkdir -p "${cache}/maven-tools/${slot}"
+  if [[ ! -e "${GLUTEN_DIR}/build/.mvn" ]]; then
+    ln -s "${cache}/maven-tools/${slot}" "${GLUTEN_DIR}/build/.mvn"
+  fi
+  if [[ -n "${GITHUB_ENV:-}" ]]; then
+    printf 'CONAN_HOME=%s\nGLUTEN_MAVEN_REPO=%s\nPIP_CACHE_DIR=%s\n' \
+      "${CONAN_HOME}" "${GLUTEN_MAVEN_REPO}" "${PIP_CACHE_DIR}" >> "${GITHUB_ENV}"
+  fi
+}
+
+ci_seed_conan() {
+  local archive="${GLUTEN_CONAN_SEED:-/opt/gluten-ci-seed/conan.tgz}"
+  if [[ -f "${archive}" ]]; then
+    conan cache restore "${archive}"
+  else
+    echo "::warning::No Conan seed: dependency builds may exceed the compilation budget"
+  fi
+  # Optional image helper for read-only download/source caches, as in Gluten PR #2.
+  if command -v configure-bolt-conan-cache > /dev/null; then
+    configure-bolt-conan-cache
+  fi
+  local downloads="${GLUTEN_MAVEN_REPO%/maven/*}/conan-downloads"
+  mkdir -p "${downloads}"
+  printf 'core.download:download_cache=%s\n' "${downloads}" >> "${CONAN_HOME}/global.conf"
 }
 
 ci_set_maven() {
@@ -92,7 +123,6 @@ ci_init() {
   JDK_VERSION=17
   ci_set_maven
   export SPARK_TESTING=true SPARK_SCALA_VERSION="${SCALA_VERSION}" SPARK_ANSI_SQL_MODE=false
-  export GLUTEN_TEST_BLACKLIST="${GLUTEN_TEST_BLACKLIST:-${BOLT_ROOT}/.github/gluten-ci-blacklist.txt}"
 }
 
 ci_conan_options() {
@@ -122,7 +152,7 @@ ci_verify_bolt_package() {
 # Verify the complete archive before extraction. A stopped artifact stream can
 # otherwise leave missing or truncated files while its action reports success.
 ci_download_artifact() (
-  local metadata url digest archive attempt
+  local metadata url digest archive attempt max_time remaining
   local api="${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts"
   local auth=(-H "Authorization: Bearer ${GITHUB_TOKEN:?}")
   metadata="$(curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --max-time 60 \
@@ -134,7 +164,13 @@ ci_download_artifact() (
   archive="$(mktemp "${RUNNER_TEMP:-/tmp}/gluten-artifact-XXXXXX.zip")" || return
   trap 'rm -f "${archive}"' EXIT
   for attempt in 1 2 3; do
-    if curl -fsSL --connect-timeout 30 --max-time 1800 \
+    max_time=1800
+    if [[ -n "${GLUTEN_COMPILE_DEADLINE:-}" ]]; then
+      remaining=$((GLUTEN_COMPILE_DEADLINE - $(date +%s)))
+      ((remaining > 0)) || return 124
+      ((remaining >= max_time)) || max_time=${remaining}
+    fi
+    if curl -fsSL --connect-timeout 30 --max-time "${max_time}" \
       "${auth[@]}" --output "${archive}" "${url}" \
       && printf '%s  %s\n' "${digest#sha256:}" "${archive}" | sha256sum -c - \
       && unzip -tqq "${archive}"; then
@@ -146,28 +182,54 @@ ci_download_artifact() (
   return 1
 )
 
+ci_package_native() (
+  source "${GLUTEN_DIR}/cpp/build/Release/generators/conanrun.sh"
+  local runtime="${BOLT_ROOT}/.ci/gluten-runtime" library dependency
+  local libraries=("${GLUTEN_DIR}"/cpp/build/package/bolt/linux/amd64/*.so)
+  if [[ -f "${GLUTEN_REPORTS_DIR}/native-tests.json" ]]; then
+    local executables=()
+    mapfile -t executables < <(jq -r '.tests[].command[0]' "${GLUTEN_REPORTS_DIR}/native-tests.json" | sort -u)
+    libraries+=("${executables[@]}")
+  fi
+  mkdir -p "${runtime}"
+  for library in "${libraries[@]}"; do
+    ldd "${library}" > "${GLUTEN_REPORTS_DIR}/$(basename "${library}").ldd"
+    if grep -q 'not found' "${GLUTEN_REPORTS_DIR}/$(basename "${library}").ldd"; then return 1; fi
+    while IFS= read -r dependency; do
+      # System libraries and the compiler runtime are provided by the same image.
+      [[ "${dependency}" == "${CONAN_HOME}/"* ]] || continue
+      cp -L "${dependency}" "${runtime}/"
+    done < <(ldd "${library}" | awk '$2 == "=>" && $3 ~ /^\// {print $3}')
+  done
+  (cd "${GLUTEN_DIR}/cpp/build/package/bolt/linux/amd64" && sha256sum *.so) \
+    > "${GLUTEN_REPORTS_DIR}/native.sha256"
+  (
+    cd "${runtime}"
+    shopt -s nullglob
+    libraries=(./*)
+    if ((${#libraries[@]})); then sha256sum "${libraries[@]}"; fi
+  ) \
+    > "${GLUTEN_REPORTS_DIR}/runtime.sha256"
+  tar -C "${BOLT_ROOT}" -I 'gzip -1' -cf "${GLUTEN_REPORTS_DIR}/native.tgz" \
+    gluten/cpp/build/package .ci/gluten-runtime
+)
+
 ci_restore_native() {
-  export BOLT_BUILD_VERSION="ci-$(git -C "${BOLT_ROOT}" rev-parse HEAD)"
-  local gluten_build_version="ci-$(git -C "${GLUTEN_DIR}" rev-parse HEAD)"
-  ci_conan_options
-  conan cache restore "${GLUTEN_REPORTS_DIR}/bolt.tgz"
-  mkdir -p "${GLUTEN_MAVEN_REPO}"
-  tar -C "${GLUTEN_MAVEN_REPO}" -xzf "${GLUTEN_REPORTS_DIR}/arrow.tgz"
-  tar -C "${GLUTEN_DIR}" -xzf "${GLUTEN_REPORTS_DIR}/native.tgz"
-  # Regenerate runtime paths for this job and verify the exact candidate package.
-  (cd "${GLUTEN_DIR}/cpp" && conan install . --name=gluten "--version=${gluten_build_version}" \
-    "${profile[@]}" -s build_type=Release "${options[@]}" "${gluten_options[@]}" \
-    --lockfile= --build=missing "--build=~bolt/*" --format=json) \
-    > "${GLUTEN_REPORTS_DIR}/gluten-install.json"
-  ci_verify_bolt_package
+  tar -C "${BOLT_ROOT}" -xzf "${GLUTEN_REPORTS_DIR}/native.tgz"
   (cd "${GLUTEN_DIR}/cpp/build/package/bolt/linux/amd64" \
     && sha256sum -c "${GLUTEN_REPORTS_DIR}/native.sha256")
+  if [[ -s "${GLUTEN_REPORTS_DIR}/runtime.sha256" ]]; then
+    (cd "${BOLT_ROOT}/.ci/gluten-runtime" \
+      && sha256sum -c "${GLUTEN_REPORTS_DIR}/runtime.sha256")
+  fi
   for library in "${GLUTEN_DIR}"/cpp/build/package/bolt/linux/amd64/*.so; do
     ci_runtime ldd "${library}"
   done | tee "${GLUTEN_REPORTS_DIR}/native-linkage.log"
   if grep -q 'not found' "${GLUTEN_REPORTS_DIR}/native-linkage.log"; then return 1; fi
-  rm "${GLUTEN_REPORTS_DIR}/bolt.tgz" "${GLUTEN_REPORTS_DIR}/arrow.tgz" \
-    "${GLUTEN_REPORTS_DIR}/native.tgz"
+  # Gluten embeds the Bolt source identity in the packaged JAR.
+  mkdir -p "${GLUTEN_DIR}/ep/build-bolt/build"
+  ln -s "${BOLT_ROOT}" "${GLUTEN_DIR}/ep/build-bolt/build/bolt_ep"
+  rm "${GLUTEN_REPORTS_DIR}/native.tgz"
 }
 
 ci_run() {
@@ -180,7 +242,10 @@ ci_run() {
 }
 
 ci_runtime() (
-  source "${GLUTEN_DIR}/cpp/build/Release/generators/conanrun.sh" || return
+  export LD_LIBRARY_PATH="${GLUTEN_DIR}/cpp/build/package/bolt/linux/amd64:${BOLT_ROOT}/.ci/gluten-runtime${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  if [[ -f "${GLUTEN_DIR}/cpp/build/Release/generators/conanrun.sh" ]]; then
+    source "${GLUTEN_DIR}/cpp/build/Release/generators/conanrun.sh" || return
+  fi
   "$@"
 )
 
@@ -206,6 +271,30 @@ ci_spark_environment() {
   )"
   export PYTHONPATH="${zipped}${PYTHONPATH:+:${PYTHONPATH}}"
 }
+
+# Spark archives are large. Cache verified resources per installer revision and
+# Spark/Scala version, then copy them so test suites cannot mutate the seed.
+ci_spark_resources() (
+  local installer="${GLUTEN_DIR}/.github/workflows/util/install-spark-resources.sh"
+  local key cache temporary
+  key="$({
+    sha256sum "${installer}"
+    printf '%s\n' "${SPARK_VERSION}/${SCALA_VERSION}/${SPARK_RESOURCE_PROFILE}"
+  } | sha256sum | cut -d ' ' -f1)"
+  cache="${GLUTEN_CACHE_ROOT:-/data/gluten-ci-cache}/spark/${key}"
+  mkdir -p "${cache%/*}"
+  exec 7> "${cache}.lock"
+  flock --exclusive 7
+  if [[ ! -f "${cache}/complete" ]]; then
+    temporary="$(mktemp -d "${cache}.XXXXXX")"
+    trap 'rm -rf "${temporary}"' EXIT
+    bash "${installer}" "${SPARK_RESOURCE_PROFILE}" "${temporary}"
+    touch "${temporary}/complete"
+    mv "${temporary}" "${cache}"
+  fi
+  mkdir -p "${BOLT_ROOT}/.ci/spark-resources"
+  cp -a --reflink=auto "${cache}/." "${BOLT_ROOT}/.ci/spark-resources/"
+)
 
 ci_maven_test() (
   local stage="$1" module="$2"
@@ -241,16 +330,14 @@ ci_maven_test() (
   rm -f "${reports[@]}" || return
   cd "${GLUTEN_DIR}" || return
   if [[ "${module}" == reactor ]]; then
-    # Keep the backend in the reactor so its active storage-profile dependencies
-    # reach the tests. Its own tests run in JVM/Delta jobs. Run SQL separately so
-    # a common-module failure cannot make Maven skip its dependent SQL tests.
-    ci_run "${log}" ci_runtime "${common_command[@]}" -Dbolt.skipTests=true \
-      -pl "!gluten-ut/${SPARK_MODULE}" || status=$?
-    ci_run "${log}" ci_runtime "${command[@]}" -Dbolt.skipTests=true \
-      -pl "backends-bolt,gluten-ut/${SPARK_MODULE}" || status=$?
+    # The preceding install supplies the backend and its active profile
+    # dependencies. Select SQL independently so backend suites run only once.
+    ci_run "${log}" ci_runtime "${common_command[@]}" \
+      -pl "!backends-bolt,!gluten-ut/${SPARK_MODULE}" || status=$?
+    ci_run "${log}" ci_runtime "${command[@]}" \
+      -pl "gluten-ut/${SPARK_MODULE}" || status=$?
   elif [[ "${module}" == gluten-ut/* ]]; then
-    ci_run "${log}" ci_runtime "${command[@]}" -Dbolt.skipTests=true \
-      -pl "backends-bolt,${module}" || status=$?
+    ci_run "${log}" ci_runtime "${command[@]}" -pl "${module}" || status=$?
   else
     ci_run "${log}" ci_runtime "${command[@]}" -pl "${module}" || status=$?
   fi
