@@ -36,17 +36,26 @@ ci_cache_environment() {
   local cache="${GLUTEN_CACHE_ROOT:-/data/gluten-ci-cache}"
   local slot
   slot="$(printf '%s' "${RUNNER_NAME:-local}" | sha256sum | cut -c1-16)"
-  export CONAN_HOME="${RUNNER_TEMP:-/tmp}/gluten-conan-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-${CI_BUILD:-native}"
+  local profile="${CI_BUILD:-native}"
+  [[ "${profile}" =~ ^[a-z0-9-]+$ ]] || return 1
+  # Each runner handles one job at a time. Keep dependency paths stable for
+  # ccache, but restore into a fresh job-local database every time.
+  export CONAN_HOME="${RUNNER_TEMP:-/tmp}/gluten-ci-conan-${profile}"
+  rm -rf -- "${CONAN_HOME}"
+  export CCACHE_BASEDIR="${BOLT_ROOT}"
   export GLUTEN_MAVEN_REPO="${cache}/maven/${slot}/${CI_BUILD:-native}"
   export PIP_CACHE_DIR="${cache}/pip/${slot}"
   mkdir -p "${CONAN_HOME}" "${GLUTEN_MAVEN_REPO}" "${PIP_CACHE_DIR}"
+  mkdir -p "${GLUTEN_REPORTS_DIR}"
+  printf 'Bolt %s\nGluten %s\n' "$(git -C "${BOLT_ROOT}" rev-parse HEAD)" \
+    "$(git -C "${GLUTEN_DIR}" rev-parse HEAD)" > "${GLUTEN_REPORTS_DIR}/sources.txt"
   mkdir -p "${cache}/maven-tools/${slot}"
   if [[ ! -e "${GLUTEN_DIR}/build/.mvn" ]]; then
     ln -s "${cache}/maven-tools/${slot}" "${GLUTEN_DIR}/build/.mvn"
   fi
   if [[ -n "${GITHUB_ENV:-}" ]]; then
-    printf 'CONAN_HOME=%s\nGLUTEN_MAVEN_REPO=%s\nPIP_CACHE_DIR=%s\n' \
-      "${CONAN_HOME}" "${GLUTEN_MAVEN_REPO}" "${PIP_CACHE_DIR}" >> "${GITHUB_ENV}"
+    printf 'CONAN_HOME=%s\nGLUTEN_MAVEN_REPO=%s\nPIP_CACHE_DIR=%s\nCCACHE_BASEDIR=%s\n' \
+      "${CONAN_HOME}" "${GLUTEN_MAVEN_REPO}" "${PIP_CACHE_DIR}" "${CCACHE_BASEDIR}" >> "${GITHUB_ENV}"
   fi
 }
 

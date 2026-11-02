@@ -135,6 +135,58 @@ class GlutenCiTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_conan_path_is_stable_and_fresh_for_each_runner_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gluten = root / "gluten"
+            (gluten / "build").mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(gluten)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(gluten),
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "fixture",
+                ],
+                check=True,
+            )
+            env = {
+                "GLUTEN_DIR": str(gluten),
+                "GLUTEN_REPORTS_DIR": str(root / "reports"),
+                "GLUTEN_CACHE_ROOT": str(root / "cache"),
+                "RUNNER_TEMP": str(root / "runner"),
+                "RUNNER_NAME": "fixture",
+                "CI_BUILD": "spark35",
+            }
+            first = self.shell(
+                'ci_cache_environment; printf "%s" "$CONAN_HOME"',
+                GITHUB_RUN_ID="1",
+                **env,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            home = Path(first.stdout)
+            (home / "stale").touch()
+            second = self.shell(
+                'ci_cache_environment; printf "%s" "$CONAN_HOME"',
+                GITHUB_RUN_ID="2",
+                **env,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(
+                first.stdout, second.stdout, "Changing paths prevents ccache reuse"
+            )
+            self.assertFalse(
+                (home / "stale").exists(), "Runner jobs must not share a Conan database"
+            )
+
     def test_rebuilt_or_wrong_candidate_package_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -77,7 +77,9 @@ seed. Preserve the existing `/data/conan-server-data` volume as well.
 | `/data/conan-server-data` | Existing Conan service binaries | Retain current Bolt CI prewarming |
 
 Do not mount one writable Conan package database into concurrent jobs. The
-workflow restores package archives into isolated homes. It never uploads the
+workflow restores package archives into fresh homes inside each runner's exclusive
+temporary directory. The container path is stable across runs so dependency
+include paths can reuse ccache; the database is cleared before each job. It never uploads the
 candidate Bolt package to a remote or reuses an earlier candidate as the tested
 binary. Only native shared libraries and their runtime dependencies are sent to
 JVM jobs; large LLVM/static-engine archives are not copied to every test job.
@@ -167,3 +169,9 @@ This local compilation path is slightly over 20 minutes when its stages are
 added together. It establishes source compatibility, not a successful 20-minute
 CI run. Warm ccache on each runner and validate the actual five-profile critical
 path in Actions. Full scheduled Spark suites have not been run locally.
+
+The first Actions validation exposed a shared setup-action path assumption:
+`bolt-build-base` wrote `global.conf` under `~/.conan2` even when `CONAN_HOME`
+selected a different home. The action now honors that override, with a regression
+test using an empty default home. Source identities are recorded before setup so
+initialization failures also have a report artifact.

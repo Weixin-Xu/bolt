@@ -171,6 +171,7 @@ jobs:
         if: ${{ github.event_name == 'schedule' || inputs.run_tests }}
         uses: actions/upload-artifact@v4
         with:
+          include-hidden-files: true
           name: gluten-bolt-native-tests-${{ github.sha }}
           path: |
             .ci/gluten-bolt/native-tests.json
@@ -188,6 +189,7 @@ jobs:
       - name: Upload the shared native build
         uses: actions/upload-artifact@v4
         with:
+          include-hidden-files: true
           name: gluten-bolt-native-${{ github.sha }}
           path: |
             .ci/gluten-bolt/native.tgz
@@ -203,6 +205,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          include-hidden-files: true
           name: gluten-bolt-reports-build-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             .ci/gluten-bolt/
@@ -273,6 +276,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          include-hidden-files: true
           name: gluten-bolt-reports-native-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             .ci/gluten-bolt/
@@ -343,6 +347,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          include-hidden-files: true
           name: gluten-bolt-compile-${{ matrix.build }}-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             .ci/gluten-bolt/
@@ -564,6 +569,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          include-hidden-files: true
           name: gluten-bolt-reports-${{ matrix.build }}-${{ matrix.stage }}-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             .ci/gluten-bolt/
