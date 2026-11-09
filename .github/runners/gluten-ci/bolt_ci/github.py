@@ -154,7 +154,7 @@ class GitHub:
             number, author = value["number"], value["user"]["login"]
             state = value["state"]
             head_repo = head["repo"]["full_name"] if head["repo"] else ""
-            base_repo = base["repo"]["full_name"]
+            base_repo, base_ref = base["repo"]["full_name"], base["ref"]
             changed = value.get("changed_files")
             if (
                 not positive(number)
@@ -163,6 +163,8 @@ class GitHub:
                 or (head_repo and not repository(head_repo))
                 or not repository(base_repo)
                 or base_repo.lower() != self.repo.lower()
+                or not isinstance(base_ref, str)
+                or not base_ref
                 or state not in {"open", "closed"}
                 or not LOGIN.fullmatch(author)
                 or (changed is not None and (type(changed) is not int or changed < 0))
@@ -174,6 +176,7 @@ class GitHub:
                 head_repo,
                 base["sha"],
                 base_repo,
+                base_ref,
                 author,
                 changed,
                 timestamp(value["updated_at"]),

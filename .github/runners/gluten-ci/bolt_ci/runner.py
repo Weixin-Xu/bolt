@@ -352,9 +352,7 @@ class Runner:
         if not self.state.current_task(task):
             return False
         pr = self.api.pull(task["pr"])
-        current = pr.open and pr.identity == tuple(
-            task[key] for key in ("head_sha", "head_repo", "base_sha", "base_repo")
-        )
+        current = pr.open and pr.matches_execution(task)
         if not current:
             self.state.invalidate(task)
         return current and self.state.current_task(task)

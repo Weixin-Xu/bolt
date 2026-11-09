@@ -14,6 +14,7 @@
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from bolt_ci.commenter import summary
@@ -26,13 +27,14 @@ B = "b" * 40
 C = "c" * 40
 
 
-def pull(sha=A, *, number=1, updated=1100, changed=1, open=True):
+def pull(sha=A, *, number=1, updated=1100, changed=1, open=True, base_ref="main"):
     return Pull(
         number,
         sha,
         "owner/contribution",
         C,
         "apache/gluten",
+        base_ref,
         "contributor",
         changed,
         updated,
@@ -219,6 +221,56 @@ class ListenerTests(unittest.TestCase):
         self.api.changed[1] = [{"filename": "docs/only.md"}]
         self.listener.tick()
         self.assertEqual(self.db.latest(1)["state"], "not_applicable")
+
+    def test_diff_read_retries_after_base_tip_race(self):
+        original = pull(sha=B)
+        self.api.current[1] = original
+        self.api.race = (
+            replace(original, base_sha=A),
+            [{"filename": "cpp/bolt/file.cpp"}],
+        )
+        self.listener.tick()
+        self.assertEqual(self.api.file_calls, 2)
+        self.assertEqual(self.db.latest(1)["base_sha"], A)
+        self.assertEqual(self.db.latest(1)["state"], "queued")
+
+    def test_base_tip_movement_keeps_the_original_queue_window(self):
+        original = pull(sha=B)
+        self.api.current[1] = original
+        self.api.changed[1] = [{"filename": "cpp/bolt/file.cpp"}]
+        self.listener.tick()
+        first = self.db.latest(1)
+        self.time += 1200
+        self.api.current[1] = replace(original, base_sha=A)
+        self.api.changed[1] = [{"filename": "docs/only.md"}]
+        self.listener.tick()
+        self.assertEqual(self.db.latest(1), first)
+        self.assertEqual(self.db.snapshots()[1]["base_sha"], A)
+        self.assertEqual(self.api.file_calls, 1)
+        self.db.expire(first["eligible"] + 1800, 1800)
+        self.assertEqual(self.db.latest(1)["state"], "queue_timeout")
+
+    def test_same_sha_retarget_retries_diff_and_supersedes_active_attempt(self):
+        original = pull(sha=B)
+        self.api.current[1] = original
+        self.api.changed[1] = [{"filename": "cpp/bolt/file.cpp"}]
+        self.listener.tick()
+        first = self.db.claim(self.time, 1800, 4, 2)
+        self.api.current[1] = replace(original, base_ref="branch/3.5")
+        self.api.race = (
+            replace(original, base_ref="branch/3.4"),
+            [{"filename": "cpp/bolt/file.cpp"}],
+        )
+        self.listener.tick()
+        self.assertEqual(self.api.file_calls, 3)
+        self.assertEqual(self.db.active()[0]["request_id"], first["request_id"])
+        self.assertEqual(self.db.active()[0]["request_state"], "superseded")
+        latest = self.db.latest(1)
+        self.assertEqual(latest["head_sha"], B)
+        self.assertEqual(latest["base_sha"], C)
+        self.assertEqual(latest["base_ref"], "branch/3.4")
+        self.assertEqual(latest["attempt"], 2)
+        self.assertEqual(latest["state"], "queued")
 
     def test_same_sha_reopens_once_and_old_events_are_ignored(self):
         self.api.current[1] = pull(updated=1100)

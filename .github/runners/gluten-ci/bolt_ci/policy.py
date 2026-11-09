@@ -147,11 +147,29 @@ class Pull:
     head_repo: str
     base_sha: str
     base_repo: str
+    base_ref: str
     author: str
     changed: int | None
     updated: int
     open: bool
 
     @property
-    def identity(self):
-        return self.head_sha, self.head_repo, self.base_sha, self.base_repo
+    def diff_identity(self):
+        return (
+            self.head_sha,
+            self.head_repo,
+            self.base_sha,
+            self.base_repo,
+            self.base_ref,
+        )
+
+    def matches_execution(self, row):
+        # Workers build the PR head. Advancing the target tip only changes
+        # the identity of a diff being classified.
+        return bool(
+            row
+            and self.head_sha == row["head_sha"]
+            and self.head_repo == row["head_repo"]
+            and self.base_repo == row["base_repo"]
+            and self.base_ref == row["base_ref"]
+        )

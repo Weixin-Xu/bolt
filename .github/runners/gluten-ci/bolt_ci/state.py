@@ -29,8 +29,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pulls(
     pr INTEGER PRIMARY KEY, head_sha TEXT NOT NULL, head_repo TEXT NOT NULL,
-    base_sha TEXT NOT NULL, base_repo TEXT NOT NULL, updated INTEGER NOT NULL,
-    open INTEGER NOT NULL
+    base_sha TEXT NOT NULL, base_repo TEXT NOT NULL, base_ref TEXT,
+    updated INTEGER NOT NULL, open INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events(
     kind TEXT NOT NULL, event INTEGER NOT NULL, PRIMARY KEY(kind,event)
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS events(
 CREATE TABLE IF NOT EXISTS requests(
     id INTEGER PRIMARY KEY, pr INTEGER NOT NULL, head_sha TEXT NOT NULL,
     head_repo TEXT NOT NULL, base_sha TEXT NOT NULL, base_repo TEXT NOT NULL,
-    attempt INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL,
+    base_ref TEXT, attempt INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL,
     rules INTEGER NOT NULL, bundle TEXT NOT NULL, eligible INTEGER NOT NULL,
     UNIQUE(pr,head_sha,attempt)
 );
@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS comments(
     pr INTEGER PRIMARY KEY, remote_id INTEGER, attempted INTEGER NOT NULL DEFAULT 0
 );
 """
-TASK_JOIN = """SELECT t.*,r.pr,r.head_sha,r.head_repo,r.base_sha,r.base_repo,
+TASK_JOIN = """SELECT t.*,r.pr,r.head_sha,r.head_repo,r.base_repo,r.base_ref,
     r.bundle,r.state AS request_state FROM tasks t JOIN requests r
     ON t.request_id=r.id"""
 
@@ -84,6 +84,22 @@ class State:
             if self._meta(db, "repository") != repository:
                 raise ValueError("State directory belongs to another repository")
             self.instance = self._meta(db, "instance")
+            self._migrate_target_refs(db)
+
+    def _migrate_target_refs(self, db):
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(requests)")}
+        if "base_ref" in columns:
+            return
+        db.execute("ALTER TABLE pulls ADD COLUMN base_ref TEXT")
+        db.execute("ALTER TABLE requests ADD COLUMN base_ref TEXT")
+        # Legacy target branches cannot be recovered from a commit SHA. Keep
+        # history, but retire unbound work and publications before using the DB.
+        affected = db.execute(
+            "SELECT pr FROM requests WHERE state IN ('queued','running') "
+            "UNION SELECT pr FROM outbox WHERE delivered=0"
+        ).fetchall()
+        for (pr,) in affected:
+            self._supersede(db, pr)
 
     def connect(self):
         db = sqlite3.connect(self.path, isolation_level=None, timeout=20)
@@ -133,8 +149,10 @@ class State:
     @staticmethod
     def _save_pull(db, pr):
         db.execute(
-            "INSERT OR REPLACE INTO pulls VALUES(?,?,?,?,?,?,?)",
-            (pr.number, *pr.identity, pr.updated, pr.open),
+            "INSERT OR REPLACE INTO pulls"
+            "(pr,head_sha,head_repo,base_sha,base_repo,base_ref,updated,open) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (pr.number, *pr.diff_identity, pr.updated, pr.open),
         )
 
     def baseline(self, pulls, now):
@@ -191,16 +209,6 @@ class State:
             db.execute("UPDATE pulls SET open=0 WHERE pr=?", (pr,))
             self._supersede(db, pr)
 
-    @staticmethod
-    def _same_identity(row, pr):
-        return (
-            row
-            and tuple(
-                row[k] for k in ("head_sha", "head_repo", "base_sha", "base_repo")
-            )
-            == pr.identity
-        )
-
     def observe(
         self, pr, now, *, related=None, reason="auto", reopened=(), comment=None
     ):
@@ -221,13 +229,13 @@ class State:
                 ),
                 default=None,
             )
-            changed = not self._same_identity(previous, pr) or not previous["open"]
+            changed = not pr.matches_execution(previous) or not previous["open"]
             self._save_pull(db, pr)
             if not pr.open:
                 self._supersede(db, pr.number)
                 return None
             latest = self._latest(db, pr.number)
-            same = self._same_identity(latest, pr)
+            same = pr.matches_execution(latest)
             if latest and not same:
                 self._supersede(db, pr.number)
             if related is None or not (
@@ -253,11 +261,11 @@ class State:
             ).fetchone()[0]
             status = "queued" if related else "not_applicable"
             req = db.execute(
-                "INSERT INTO requests(pr,head_sha,head_repo,base_sha,base_repo,attempt,state,"
-                "reason,rules,bundle,eligible) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO requests(pr,head_sha,head_repo,base_sha,base_repo,base_ref,"
+                "attempt,state,reason,rules,bundle,eligible) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     pr.number,
-                    *pr.identity,
+                    *pr.diff_identity,
                     attempt,
                     status,
                     reason,

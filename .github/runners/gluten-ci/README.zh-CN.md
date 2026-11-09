@@ -27,7 +27,7 @@ ECS 上的 listener 轮询公开 Gluten PR，runner 通过本机 Docker 执行�
 ```bash
 install -d -m 0755 /data/gluten-external-ci/deploy/release
 cd /data/gluten-external-ci/deploy/release
-sha256sum -c /path/to/bolt-gluten-ci.tar.gz.sha256
+(cd /path/to && sha256sum -c bolt-gluten-ci.tar.gz.sha256) || exit 1
 tar --no-same-owner -xzf /path/to/bolt-gluten-ci.tar.gz
 cd bolt-gluten-ci/deploy
 python3 -B bundle.py verify ..
@@ -98,6 +98,7 @@ PR 作者或配置的维护者可在 PR 留一条完整的 `Run Gluten Bolt CI` 
 - `./ci.sh status` 显示项目容器和队列统计，`./ci.sh logs` 显示控制日志。原始 worker 日志、报告和产物位于 `${HOST_DATA_DIR}/gluten-external-ci/jobs`，仅供宿主机私下查看。
 - `./ci.sh stop` 先停止 listener 和 runner 以冻结调度，再停止本实例的活跃 worker 并记录任务中断，最后停止 commenter。持久数据、缓存、worker bridge、防火墙和续期 timer 保留。恢复服务运行 `./ci.sh up`。更换镜像、PAT 文件、缓存地址或部署版本时，先 stop，再修改并重新 prepare、up。用持久旧 bundle 回滚时也执行相同步骤。
 - `${HOST_DATA_DIR}/gluten-external-ci/control/state` 存放 SQLite WAL 数据。`assets` 存放版本化 JDK、工具和引擎。`cache/maven` 只接收经控制器独立校验的外部发行版 JAR/POM。原 Maven 缓存保留在原处，逐个核验需要迁移的公开发行版文件。排除 `settings.xml`、凭据和本地 SNAPSHOT。用可信快照选填 `cache/seeds/{conan,spark,pip}`，Spark 资源按 driver 期望的版本键和完成标记组织。runner 将 seed 复制到作业私有缓存。大体量的既有 ccache 建议使用小型可信快照并测量复制开销。
+- 从旧版控制器升级时，停止服务后先备份 SQLite。旧记录没有目标分支名，升级会保留历史，停用这些记录中仍在排队或运行的请求及待发评论。Listener 重新核实受影响的开放 PR 的目标分支和完整 diff 后再按规则入队，未入队的旧基线 PR 不会仅因升级而触发。回滚到不识别目标分支字段的旧版时，需使用升级前的数据库备份。
 - systemd 的 `bolt-gluten-ci-network.timer` 每约 20 秒复核实际防火墙、网桥身份和已配置的 Conan 目标。规则丢失、桥重建、缓存身份变化或证明过期均阻止 worker 继续执行。检查 `systemctl status bolt-gluten-ci-network.timer` 和 `journalctl -u bolt-gluten-ci-network.service`，排除原因后 stop、prepare、up。Docker 原生 nftables 后端缺少所需的 iptables hook，预检会失败。
 - 重启 ECS 后先确认 guard 恢复续期，核对 listener/runner/commenter 的持久状态。断电期间没有评论或新任务；恢复后由同一数据库继续观察。Docker worker 的有效性由控制器重查当前 PR 和记录的容器身份。
 - 遇到故障优先保留私有报告和数据库，禁止使用 `docker compose down -v` 清理这两套项目。检查旧服务时使用显式项目和 Compose 文件，或使用上面的标签查询，避免继承旧环境的 `COMPOSE_FILE`。

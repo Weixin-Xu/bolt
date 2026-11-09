@@ -24,14 +24,6 @@ from .policy import affected, command_sha
 COMMENT_OVERLAP = 300
 
 
-def matches(row, pr):
-    return (
-        row
-        and tuple(row[k] for k in ("head_sha", "head_repo", "base_sha", "base_repo"))
-        == pr.identity
-    )
-
-
 class Listener:
     def __init__(self, state, api, maintainers=(), only_pr=None, clock=time.time):
         self.state = state
@@ -53,7 +45,7 @@ class Listener:
             except ApiError:
                 files = None
             after = self.api.pull(number)
-            if before.identity == after.identity and before.open == after.open:
+            if before.diff_identity == after.diff_identity and after.open:
                 return after, affected(files, after.changed)
         raise ApiError()
 
@@ -88,9 +80,22 @@ class Listener:
         if not listed.head_repo:
             self.state.close(listed.number)
             return
-        identity_changed = not matches(old, listed) or not old["open"]
+        identity_changed = not listed.matches_execution(old) or not old["open"]
         updated = old is None or old["updated"] != listed.updated
-        if not identity_changed and not updated:
+        if not identity_changed and not updated and old["base_sha"] == listed.base_sha:
+            return
+        if (
+            old
+            and old["open"]
+            and old["base_ref"] is None
+            and not updated
+            and listed.head_sha == old["head_sha"]
+            and listed.head_repo == old["head_repo"]
+            and listed.base_repo == old["base_repo"]
+            and self.state.latest(listed.number) is None
+        ):
+            # Learn the target for a legacy baseline entry without backfilling it.
+            self.state.observe(listed, now)
             return
         if not self._allowed(listed.number):
             self.state.observe(listed, now)

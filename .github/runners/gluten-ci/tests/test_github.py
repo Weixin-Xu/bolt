@@ -17,6 +17,7 @@ import threading
 import unittest
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 from bolt_ci.github import ApiError, GitHub
 
@@ -46,6 +47,30 @@ def server(respond):
 
 
 class ApiTests(unittest.TestCase):
+    def test_pull_retains_and_requires_target_ref(self):
+        api = GitHub("apache/gluten")
+        payload = {
+            "number": 1,
+            "user": {"login": "contributor"},
+            "head": {"repo": {"full_name": "owner/contribution"}, "sha": "a" * 40},
+            "base": {
+                "repo": {"full_name": "apache/gluten"},
+                "ref": "branch/3.5",
+                "sha": "b" * 40,
+            },
+            "updated_at": "2026-11-09T12:00:00Z",
+            "state": "open",
+        }
+        with patch.object(api, "_get", return_value=payload):
+            self.assertEqual(getattr(api.pull(1), "base_ref", None), "branch/3.5")
+            for invalid in (None, "", 42):
+                with self.subTest(invalid=invalid), self.assertRaises(ApiError):
+                    payload["base"]["ref"] = invalid
+                    api.pull(1)
+            del payload["base"]["ref"]
+            with self.assertRaises(ApiError):
+                api.pull(1)
+
     def test_follows_canonical_next_page_after_transient_error(self):
         calls = []
 

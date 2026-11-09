@@ -130,9 +130,7 @@ class Commenter:
 
     @staticmethod
     def _same(event, pr):
-        return pr.open and pr.identity == tuple(
-            event[key] for key in ("head_sha", "head_repo", "base_sha", "base_repo")
-        )
+        return pr.open and pr.matches_execution(event)
 
     def _neutralize(self, comment_id, pr):
         if comment_id is not None and pr.open and valid_sha(pr.head_sha):
@@ -165,8 +163,8 @@ class Commenter:
         else:
             self.writer.update_comment(owned, body)
         self.state.record_comment(number, owned)
-        latest = self.state.latest(number)
         after = self.reader.pull(number)
+        latest = self.state.latest(number)
         if not self._same(event, after) or (latest and latest["id"] != event["id"]):
             self._neutralize(owned, after)
         self.state.delivered(event)

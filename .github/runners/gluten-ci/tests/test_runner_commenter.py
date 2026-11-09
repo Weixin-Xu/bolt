@@ -26,6 +26,7 @@ from bolt_ci.commenter import Commenter, MARKER
 from bolt_ci.config import Config
 from bolt_ci.docker import Docker, Container, Workspaces, checkout
 from bolt_ci.github import ApiError
+from bolt_ci.listener import Listener
 from bolt_ci.runner import Runner, collect_result
 from bolt_ci.state import State
 from test_policy_listener import A, B, C, Api, pull
@@ -329,6 +330,155 @@ class ServicesTests(unittest.TestCase):
         self.assertNotIn("/work/secret", body)
         self.assertEqual(self.comment_api.posts, 1)
 
+    def test_base_tip_movement_preserves_running_native_and_downstream(self):
+        self.db.set_meta("baseline", self.now)
+        self.api.changed[1] = [{"filename": "cpp/bolt/file.cpp"}]
+        listener = Listener(self.db, self.api, clock=lambda: self.now)
+        original = self.api.current[1]
+        self.runner().tick()
+        native = self.db.active()[0]
+
+        self.api.current[1] = replace(original, base_sha=B)
+        listener.tick()
+        self.runner().tick()
+        self.assertEqual(self.docker.stopped, [])
+        self.assertEqual(len(self.docker.launches), 1)
+
+        self.complete(native)
+        # Advance again without letting the listener record the new tip.
+        self.api.current[1] = replace(original, base_sha=A)
+        self.runner().tick()
+        self.assertEqual(self.db.task_rows(native["request_id"])[0]["state"], "success")
+        self.assertEqual(len(self.db.active()), self.config.max_parallel)
+
+        self.api.current[1] = replace(original, updated=original.updated + 1)
+        listener.tick()
+        for _ in range(42):
+            active = self.db.active()
+            if not active:
+                break
+            for task in active:
+                self.complete(task)
+            self.runner().tick()
+        request = self.db.latest(1)
+        self.assertEqual(request["id"], native["request_id"])
+        self.assertEqual(request["attempt"], 1)
+        self.assertEqual(request["state"], "success")
+        self.assertEqual(len(self.docker.launches), 42)
+        self.assertEqual(self.docker.stopped, [])
+
+        self.api.current[1] = replace(
+            original, base_sha=B, updated=original.updated + 2
+        )
+        listener.tick()
+        self.assertEqual(self.db.latest(1), request)
+        self.commenter().tick()
+        self.assertIn("Passed", self.comment_api.messages[90]["body"])
+
+    def test_completed_native_is_accepted_after_base_tip_movement_without_listener(
+        self,
+    ):
+        self.runner().tick()
+        native = self.db.active()[0]
+        self.complete(native)
+        self.api.current[1] = replace(self.api.current[1], base_sha=B)
+        self.runner().tick()
+        self.assertEqual(self.db.task_rows(native["request_id"])[0]["state"], "success")
+        self.assertEqual(len(self.db.active()), self.config.max_parallel)
+
+    def test_runner_rejects_completed_native_after_same_sha_retarget(self):
+        self.runner().tick()
+        native = self.db.active()[0]
+        self.complete(native)
+        self.api.current[1] = replace(self.api.current[1], base_ref="branch/3.5")
+        self.runner().tick()
+        self.assertEqual(self.db.latest(1)["state"], "superseded")
+        self.assertEqual(self.db.task_rows(native["request_id"])[0]["state"], "not_run")
+        self.assertEqual(len(self.docker.launches), 1)
+
+    def test_runner_rejects_completed_native_from_replaced_head_repository(self):
+        self.runner().tick()
+        native = self.db.active()[0]
+        self.complete(native)
+        self.api.current[1] = replace(
+            self.api.current[1], head_repo="other/contribution"
+        )
+        self.runner().tick()
+        self.assertEqual(self.db.latest(1)["state"], "superseded")
+        self.assertEqual(self.db.task_rows(native["request_id"])[0]["state"], "not_run")
+        self.assertEqual(len(self.docker.launches), 1)
+
+    def test_legacy_unbound_targets_are_replaced_without_losing_history(self):
+        existing = self.api.current[1]
+        finished = pull(number=2)
+        queued = pull(number=3)
+        baseline = pull(number=4)
+        self.db.baseline((baseline,), 900)
+        self.runner().tick()
+        running_task = self.db.active()[0]
+        self.db.observe(finished, self.now, related=True)
+        completed_task = self.db.claim(self.now, 1800, 4, 2)
+        self.db.finish(completed_task, "failure", "test", None, self.now)
+        self.db.observe(queued, self.now, related=True)
+        self.db.ignore_comment(42)
+        self.db.record_comment(2, 90)
+        self.api.current = {
+            pr.number: pr for pr in (existing, finished, queued, baseline)
+        }
+        self.api.changed = {
+            pr: [{"filename": "cpp/bolt/file.cpp"}] for pr in self.api.current
+        }
+        with self.db.transaction() as db:
+            # Reproduce the previous schema while retaining real in-flight rows.
+            for table in ("pulls", "requests"):
+                columns = {
+                    row["name"] for row in db.execute(f"PRAGMA table_info({table})")
+                }
+                if "base_ref" in columns:
+                    db.execute(f"ALTER TABLE {table} DROP COLUMN base_ref")
+
+        def reopen_db():
+            return State(
+                self.config.state_dir,
+                self.config.repository,
+                self.config.matrix,
+                self.config.fingerprint,
+            )
+
+        instance = self.db.instance
+        self.db = reopen_db()
+        self.assertEqual(self.db.instance, instance)
+        self.assertEqual(self.db.latest(1)["state"], "superseded")
+        self.assertEqual(self.db.latest(2)["state"], "failure")
+        self.assertEqual(self.db.latest(3)["state"], "superseded")
+        self.assertIsNone(self.db.latest(2)["base_ref"])
+        self.assertEqual(self.db.status()["pending_comments"], 0)
+        self.assertEqual(self.db.comment_id(2), 90)
+        self.assertTrue(self.db.event_seen("comment", 42))
+        self.runner().tick()
+        self.assertEqual(self.docker.stopped, [running_task["container"]])
+        self.assertEqual(len(self.docker.launches), 1)
+
+        Listener(self.db, self.api, clock=lambda: self.now).tick()
+        self.assertEqual(self.api.file_calls, 3)
+        self.assertIsNone(self.db.latest(4))
+        self.assertEqual(self.db.snapshots()[4]["base_ref"], "main")
+        refreshed = [self.db.latest(pr) for pr in (1, 2, 3)]
+        for request in refreshed:
+            self.assertEqual(request["base_ref"], "main")
+            self.assertEqual(request["state"], "queued")
+            self.assertEqual(request["attempt"], 2)
+        self.assertEqual(self.db.status()["pending_comments"], 3)
+        self.db = reopen_db()
+        self.assertEqual([self.db.latest(pr) for pr in (1, 2, 3)], refreshed)
+        self.assertEqual(self.db.status()["pending_comments"], 3)
+        self.assertEqual(
+            self.db.task_rows(running_task["request_id"])[0]["state"], "not_run"
+        )
+        self.assertEqual(
+            self.db.task_rows(completed_task["request_id"])[0]["state"], "failure"
+        )
+
     def test_package_requires_nonempty_jar_matching_verification_digest(self):
         self.runner().tick()
         self.complete(self.db.active()[0])
@@ -400,6 +550,24 @@ class ServicesTests(unittest.TestCase):
         self.assertEqual(self.db.status()["pending_comments"], 0)
         self.assertEqual(self.docker.launches, [])
 
+    def test_completed_result_published_when_base_tip_changes_before_write(self):
+        self.commenter().tick()
+        self.runner().tick()
+        self.complete(self.db.active()[0], fail=True)
+        self.runner().tick()
+        self.api.current[1] = replace(self.api.current[1], base_sha=B)
+        self.commenter().tick()
+        self.assertIn("Failed", self.comment_api.messages[90]["body"])
+        self.assertEqual(self.db.status()["pending_comments"], 0)
+
+    def test_comment_stays_current_when_base_tip_changes_during_write(self):
+        def advance_base():
+            self.api.current[1] = replace(self.api.current[1], base_sha=B)
+
+        self.comment_api.after_write = advance_base
+        self.commenter().tick()
+        self.assertIn("Queued", self.comment_api.messages[90]["body"])
+
     def test_comment_neutralized_when_head_changes_during_write(self):
         def advance_head():
             self.api.current[1] = pull(sha=B)
@@ -410,6 +578,22 @@ class ServicesTests(unittest.TestCase):
             "Awaiting results for current commit", self.comment_api.messages[90]["body"]
         )
         self.assertIn(B, self.comment_api.messages[90]["body"])
+
+    def test_completed_result_neutralized_when_target_changes_during_write(self):
+        self.commenter().tick()
+        self.runner().tick()
+        self.complete(self.db.active()[0], fail=True)
+        self.runner().tick()
+        self.assertEqual(self.db.latest(1)["state"], "failure")
+
+        def retarget():
+            self.api.current[1] = replace(self.api.current[1], base_ref="branch/3.5")
+
+        self.comment_api.after_write = retarget
+        self.commenter().tick()
+        self.assertIn(
+            "Awaiting results for current commit", self.comment_api.messages[90]["body"]
+        )
 
     def test_only_own_marker_is_updated(self):
         self.comment_api.messages[12] = {"id": 12, "user": {"id": 3}, "body": MARKER}
