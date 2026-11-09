@@ -18,6 +18,10 @@ limitations under the License.
 
 ECS 上的 listener 轮询公开 Gluten PR，runner 通过本机 Docker 执行构建与测试，commenter 更新 PR 评论。Gluten 仓库维护可移植测试入口和矩阵。首次上线只发布评论，合入权限由目标仓库管理。[Gluten 测试入口](https://github.com/apache/gluten/tree/main/dev/bolt-ci)
 
+部署代码和 bundle 打包入口位于 **Bolt 仓库的 `.github/runners/gluten-ci/`**；`WATCH_REPOSITORY=apache/gluten` 决定这套服务监听 Gluten。Bolt 仓库自身继续通过 GitHub Actions 和既有 self-hosted runner 执行 CI。代码存放在 Bolt 不会把 Bolt 自身的 CI 切换到这套外部监听器。
+
+两套服务可同时部署：原有 runner Compose 服务继续负责 Bolt，独立的 `bolt-gluten-ci` Compose project 负责 Gluten。保持 Bolt runner 的注册、标签和 workflow 配置。若共用一台 ECS，须为 Gluten 配置实际剩余的并发、CPU 和内存预算，不能把两套默认并发分别当作整机可用容量。
+
 ## 准备 ECS
 
 使用 Debian 12 x86_64、已更新的 Python 3.11、Git、Docker Engine、Docker Compose v2 插件、`iproute2`、`iptables` 和 systemd。使用本机的 rootful Docker 及其 iptables 防火墙后端。IPv4 转发和 Linux bridge netfilter 必须启用。宿主机和 worker 需要公网 DNS 及 GitHub、Adoptium、Debian、Maven Central、PyPI、Spark 下载站的访问能力。状态和作业目录需要持久的本地文件系统。按可用资源调整并发、CPU、内存和磁盘预检下限。
@@ -64,23 +68,11 @@ source /etc/bolt-gluten-ci.env
 
 预览读取 PR 和变更，不入队、不执行 PR 代码、不发评论。首启时 listener 将已有打开的 PR 建立基线，所以此处需显式入队。查看同一 PR 的当前 SHA、排队、开始和结果评论。核对 native 测试成功后能派发 14 个打包项和 27 个 UT 项，真实失败会写入结果。查看私有日志与报告确认 JDK、下载、缓存路径和失败分类。测试可以失败，失败本身也是应验证的回写路径。
 
-正式切换时先等待旧 Actions 作业退出，并在 fork 的 Actions 页面停用仍部署在默认分支上的 `Bolt CI Listener`、`Bolt CI Commenter`、`Bolt CI Control Tests` 和 `Bolt Backend Build (x86)`。确认无重复入队后，使用标签只停止旧的 self-hosted runner 容器。请先检查下列两条查询的输出。
+正式切换仅涉及此前用于 Gluten 的 Actions 流程：在 **`Weixin-Xu/gluten` fork** 中停用默认分支上的 `Bolt CI Listener`、`Bolt CI Commenter`、`Bolt CI Control Tests` 和 `Bolt Backend Build (x86)`。这些名称中的 Bolt 指 Gluten 的 Bolt 后端，不是 `bytedance/bolt` 仓库自身的工作流。
 
-```bash
-for service in runner-medium runner-small; do
-  docker ps --filter label=com.docker.compose.project=runners \
-    --filter "label=com.docker.compose.service=$service" \
-    --format '{{.ID}} {{.Names}} {{.Status}}'
-done
+**保留为 `bytedance/bolt` 服务的全部 runner。** `runner-medium`、`runner-small` 或 Compose project `runners` 等名称不能证明容器属于 Gluten，因此不要按这些标签批量停止容器。只有确认某个容器专门注册给旧 Gluten 仓库、并且其任务已经结束时，才可按该容器的具体 ID 手动退役；共用的组织级 runner 也应保留。registry、Conan 和 Arrow 源缓存服务继续运行。
 
-for service in runner-medium runner-small; do
-  docker ps --quiet --filter label=com.docker.compose.project=runners \
-    --filter "label=com.docker.compose.service=$service" |
-    xargs -r docker stop
-done
-```
-
-验证期间如果两套执行器仍在使用同一 ECS，先排空旧任务并预留资源，再执行真实入队。上述命令保留 registry、Conan 和源缓存。停止外部服务，清空环境文件中的 `ONLY_PR` 后重新 source、prepare、up，即可开启自动监听。
+验证期间先为外部 Gluten 作业预留资源，再执行真实入队。单 PR 验收通过后，停止外部服务，清空环境文件中的 `ONLY_PR`，重新 source、prepare、up，即可开启自动监听；这里的 `./ci.sh stop` 只管理外部 Gluten 服务及其作业。
 
 ```bash
 ./ci.sh stop
@@ -101,7 +93,7 @@ PR 作者或配置的维护者可在 PR 留一条完整的 `Run Gluten Bolt CI` 
 - 从旧版控制器升级时，停止服务后先备份 SQLite。旧记录没有目标分支名，升级会保留历史，停用这些记录中仍在排队或运行的请求及待发评论。Listener 重新核实受影响的开放 PR 的目标分支和完整 diff 后再按规则入队，未入队的旧基线 PR 不会仅因升级而触发。回滚到不识别目标分支字段的旧版时，需使用升级前的数据库备份。
 - systemd 的 `bolt-gluten-ci-network.timer` 每约 20 秒复核实际防火墙、网桥身份和已配置的 Conan 目标。规则丢失、桥重建、缓存身份变化或证明过期均阻止 worker 继续执行。检查 `systemctl status bolt-gluten-ci-network.timer` 和 `journalctl -u bolt-gluten-ci-network.service`，排除原因后 stop、prepare、up。Docker 原生 nftables 后端缺少所需的 iptables hook，预检会失败。
 - 重启 ECS 后先确认 guard 恢复续期，核对 listener/runner/commenter 的持久状态。断电期间没有评论或新任务；恢复后由同一数据库继续观察。Docker worker 的有效性由控制器重查当前 PR 和记录的容器身份。
-- 遇到故障优先保留私有报告和数据库，禁止使用 `docker compose down -v` 清理这两套项目。检查旧服务时使用显式项目和 Compose 文件，或使用上面的标签查询，避免继承旧环境的 `COMPOSE_FILE`。
+- 遇到故障优先保留私有报告和数据库，禁止使用 `docker compose down -v` 清理这两套项目。检查旧服务时使用显式项目和 Compose 文件，并核实其注册仓库，避免继承旧环境的 `COMPOSE_FILE` 或误停 Bolt runner。
 
 防火墙路径和 JDK/辅助工具由 ECS 上的 `prepare` 验证。验证日志、两种元数据地址与控制探针的隔离、一个真实 PR 的全矩阵运行及实际评论是现场验收项。[Docker 防火墙文档](https://docs.docker.com/engine/network/packet-filtering-firewalls/) [Adoptium CI 下载说明](https://adoptium.net/installation/ci-scripts)
 
