@@ -438,6 +438,7 @@ class ServicesTests(unittest.TestCase):
         for required in (
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
+            "--sysctl=net.ipv6.conf.all.disable_ipv6=1",
             "--network=gluten-worker",
             "--user=1000:1000",
             "--cpus=16",

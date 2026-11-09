@@ -367,6 +367,7 @@ class Docker:
             "--user=1000:1000",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
+            "--sysctl=net.ipv6.conf.all.disable_ipv6=1",
             f"--cpus={c.cpus}",
             f"--memory={c.memory_gib}g",
             f"--memory-swap={c.memory_gib}g",
