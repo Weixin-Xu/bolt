@@ -84,19 +84,6 @@ class Listener:
         updated = old is None or old["updated"] != listed.updated
         if not identity_changed and not updated and old["base_sha"] == listed.base_sha:
             return
-        if (
-            old
-            and old["open"]
-            and old["base_ref"] is None
-            and not updated
-            and listed.head_sha == old["head_sha"]
-            and listed.head_repo == old["head_repo"]
-            and listed.base_repo == old["base_repo"]
-            and self.state.latest(listed.number) is None
-        ):
-            # Learn the target for a legacy baseline entry without backfilling it.
-            self.state.observe(listed, now)
-            return
         if not self._allowed(listed.number):
             self.state.observe(listed, now)
             return
@@ -108,6 +95,18 @@ class Listener:
             and event["created"] > baseline
             and not self.state.event_seen("reopen", event["id"])
         ]
+        if (
+            not reopened
+            and old
+            and old["open"]
+            and old["base_ref"] is None
+            and listed.head_sha == old["head_sha"]
+            and listed.head_repo == old["head_repo"]
+            and listed.base_repo == old["base_repo"]
+            and self.state.latest(listed.number) is None
+        ):
+            # Learn the target for a legacy baseline entry without backfilling it.
+            identity_changed = False
         if identity_changed or reopened:
             verified, related = self._classify(listed.number)
             if not verified.head_repo:

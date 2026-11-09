@@ -272,6 +272,48 @@ class ListenerTests(unittest.TestCase):
         self.assertEqual(latest["attempt"], 2)
         self.assertEqual(latest["state"], "queued")
 
+    def test_legacy_baseline_learns_targets_without_backfilling_discussion(self):
+        for number in range(2, 6):
+            self.db.observe(pull(number=number, updated=950), self.time)
+        with self.db.transaction() as db:
+            db.execute("ALTER TABLE pulls DROP COLUMN base_ref")
+            db.execute("ALTER TABLE requests DROP COLUMN base_ref")
+        self.db = State(self.db.directory, "apache/gluten")
+        self.listener = Listener(self.db, self.api, clock=lambda: self.time)
+        self.assertTrue(
+            all(row["base_ref"] is None for row in self.db.snapshots().values())
+        )
+
+        self.api.current = {
+            number: pull(number=number, updated=1120) for number in range(1, 6)
+        }
+        self.api.current[3] = replace(self.api.current[3], base_sha=B)
+        self.api.current[5] = replace(self.api.current[5], head_sha=B)
+        for number in range(2, 6):
+            self.api.changed[number] = [{"filename": "cpp/bolt/file.cpp"}]
+        self.api.history[2] = [{"id": 20, "event": "reopened", "created": 950}]
+        self.api.history[4] = [{"id": 40, "event": "reopened", "created": 1110}]
+        self.comment(10, "Run Gluten Bolt CI", "contributor")
+        self.listener.tick()
+
+        for number, base_sha in ((2, C), (3, B)):
+            with self.subTest(number=number, base_sha=base_sha):
+                self.assertIsNone(self.db.latest(number))
+                snapshot = self.db.snapshots()[number]
+                self.assertEqual(snapshot["base_ref"], "main")
+                self.assertEqual(snapshot["base_sha"], base_sha)
+                self.assertEqual(snapshot["updated"], 1120)
+        for number, reason in ((1, "manual_override"), (4, "reopened"), (5, "auto")):
+            with self.subTest(number=number, reason=reason):
+                request = self.db.latest(number)
+                self.assertEqual(request["reason"], reason)
+                self.assertEqual(request["head_sha"], self.api.current[number].head_sha)
+                self.assertEqual(request["state"], "queued")
+                self.assertEqual(request["attempt"], 1)
+        self.assertTrue(self.db.event_seen("reopen", 40))
+        self.assertEqual(self.api.event_calls, 5)
+        self.assertEqual(self.api.file_calls, 2)
+
     def test_same_sha_reopens_once_and_old_events_are_ignored(self):
         self.api.current[1] = pull(updated=1100)
         self.api.changed[1] = [{"filename": "cpp/bolt/example.cpp"}]
