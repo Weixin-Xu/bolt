@@ -138,9 +138,7 @@ def start(args):
         # A preview must not create or modify the live queue.
         with tempfile.TemporaryDirectory(prefix="bolt-ci-preview-") as temp:
             state = State(Path(temp), c.repository, c.matrix, c.fingerprint)
-            listener = Listener(
-                state, api, c.maintainer_logins, c.only_pr, bot_login=c.bot_login
-            )
+            listener = Listener(state, api, c.maintainer_logins, c.only_pr)
             result = listener.enqueue(args.pr, True)
             print(json.dumps(result, sort_keys=True))
         return 0
@@ -149,9 +147,7 @@ def start(args):
         print(json.dumps(state.status(), sort_keys=True))
         return 0
     if command in {"listener", "enqueue"}:
-        service = Listener(
-            state, api, c.maintainer_logins, c.only_pr, bot_login=c.bot_login
-        )
+        service = Listener(state, api, c.maintainer_logins, c.only_pr)
         if command == "enqueue":
             print(json.dumps(service.enqueue(args.pr, False), sort_keys=True))
             return 0

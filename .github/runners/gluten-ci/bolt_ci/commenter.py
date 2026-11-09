@@ -145,7 +145,6 @@ class Commenter:
             return
         if self.viewer_id is None:
             self.viewer_id = self.writer.viewer()
-            self.state.set_meta("commenter_user", self.viewer_id)
         # Discover the marker even if the database lacks a comment ID. A previous
         # POST may have succeeded before an HTTP timeout or controller restart.
         owned = self._own(number)

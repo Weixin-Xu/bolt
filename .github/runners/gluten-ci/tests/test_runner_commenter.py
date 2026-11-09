@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from zipfile import ZipFile
 
 from bolt_ci.commenter import Commenter, MARKER
 from bolt_ci.config import Config
@@ -253,7 +254,10 @@ class ServicesTests(unittest.TestCase):
                     f"{stage}/gluten-ut/spark{spark}/target/surefire-reports/TEST-Unit.xml"
                 ]
         else:
-            evidence = ["package-verification.txt", "gluten-bolt-bundle-1.jar"]
+            jar = reports / "gluten-bolt-bundle-1.jar"
+            with ZipFile(jar, "w") as bundle:
+                bundle.writestr("gluten-build-info.properties", f"bolt_revision={A}\n")
+            evidence = ["package-verification.txt", jar.name]
         for relative in evidence:
             path = reports / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,9 +266,8 @@ class ServicesTests(unittest.TestCase):
             elif relative.endswith("run.log"):
                 path.write_text("  Summary: 1 out of 1 queries passed.\n")
             elif relative == "package-verification.txt":
-                path.write_text(
-                    "a" * 64 + "  gluten-bolt-bundle-1.jar\nbolt_revision=" + A + "\n"
-                )
+                digest = hashlib.sha256(jar.read_bytes()).hexdigest()
+                path.write_text(f"{digest}  {jar.name}\nbolt_revision={A}\n")
             elif not path.exists():
                 path.write_text("verified")
         count = sum(path.endswith((".xml", "run.log")) for path in evidence)
@@ -325,6 +328,32 @@ class ServicesTests(unittest.TestCase):
         self.assertNotIn("192.0.2.8", body)
         self.assertNotIn("/work/secret", body)
         self.assertEqual(self.comment_api.posts, 1)
+
+    def test_package_requires_nonempty_jar_matching_verification_digest(self):
+        self.runner().tick()
+        self.complete(self.db.active()[0])
+        self.runner().tick()
+        task = next(task for task in self.db.active() if task["kind"] == "package")
+        self.complete(task)
+        reports = self.staging.job(task) / "reports"
+        jar = reports / "gluten-bolt-bundle-1.jar"
+        verification = reports / "package-verification.txt"
+        payload, record = jar.read_bytes(), verification.read_text()
+
+        self.assertEqual(collect_result(self.config, task, reports, 0)[0], "success")
+
+        for label, changed in (
+            ("replacement", payload[:-1] + bytes([payload[-1] ^ 1])),
+            ("truncation", payload[: len(payload) // 2]),
+            ("empty with matching digest", b""),
+        ):
+            with self.subTest(label=label):
+                jar.write_bytes(changed)
+                if not changed:
+                    empty_digest = hashlib.sha256(changed).hexdigest()
+                    verification.write_text(empty_digest + record[64:])
+                with self.assertRaises(ValueError):
+                    collect_result(self.config, task, reports, 0)
 
     def test_invalid_native_report_blocks_entire_downstream(self):
         self.runner().tick()

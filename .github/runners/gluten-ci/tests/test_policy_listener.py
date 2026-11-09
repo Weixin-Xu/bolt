@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from bolt_ci.commenter import summary
 from bolt_ci.listener import Listener
 from bolt_ci.policy import Pull, affected, command_sha
 from bolt_ci.state import State
@@ -144,7 +145,9 @@ class ListenerTests(unittest.TestCase):
         self.listener.tick()
         self.time = 1200
 
-    def comment(self, comment_id, body, login, *, created=1100, kind="User"):
+    def comment(
+        self, comment_id, body, login, *, created=1100, kind="User", user_id=None
+    ):
         self.api.feed.append(
             dict(
                 id=comment_id,
@@ -152,6 +155,7 @@ class ListenerTests(unittest.TestCase):
                 body=body,
                 login=login,
                 type=kind,
+                user_id=user_id,
                 created=created,
                 updated=created,
             )
@@ -183,6 +187,21 @@ class ListenerTests(unittest.TestCase):
         self.comment(7, "Run Gluten Bolt CI", "maintainer")
         self.listener.tick()
         self.assertEqual(self.db.latest(1)["attempt"], 2)
+
+    def test_author_can_rerun_from_status_publisher_account(self):
+        self.db.set_meta("commenter_user", 701)
+        status = summary(
+            {"head_sha": A, "id": 1, "attempt": 1, "publication": "queued"}, []
+        )
+        self.comment(10, status, "contributor", user_id=701)
+        self.listener.tick()
+        self.assertIsNone(self.db.latest(1))
+
+        self.comment(11, "Run Gluten Bolt CI", "contributor", user_id=701)
+        self.listener.tick()
+        request = self.db.latest(1)
+        self.assertIsNotNone(request)
+        self.assertEqual(request["reason"], "manual_override")
 
     def test_file_read_retries_after_head_race_then_supersedes(self):
         self.api.current[1] = pull(updated=1100, sha=B)

@@ -33,15 +33,12 @@ def matches(row, pr):
 
 
 class Listener:
-    def __init__(
-        self, state, api, maintainers=(), only_pr=None, clock=time.time, bot_login=""
-    ):
+    def __init__(self, state, api, maintainers=(), only_pr=None, clock=time.time):
         self.state = state
         self.api = api
         self.maintainers = {login.lower() for login in maintainers}
         self.only_pr = only_pr
         self.clock = clock
-        self.bot_login = bot_login.lower()
 
     def _allowed(self, number):
         return self.only_pr is None or self.only_pr == number
@@ -124,7 +121,6 @@ class Listener:
         comments = self.api.recent_comments(max(baseline, last - COMMENT_OVERLAP))
         # Process all ID events before advancing the durable cursor. An API failure
         # leaves the cursor unchanged and already processed IDs are harmless.
-        bot_id = self.state.meta("commenter_user")
         for comment in sorted(
             comments, key=lambda entry: (entry["created"], entry["id"])
         ):
@@ -132,13 +128,11 @@ class Listener:
                 continue
             if self.state.event_seen("comment", comment["id"]):
                 continue
+            # Generated status bodies cannot match the whole-comment command.
+            # An authorized person may use the same account as the publisher.
             sha = command_sha(comment["body"])
-            own = comment["login"].lower() == self.bot_login or (
-                bot_id is not None and str(comment.get("user_id")) == bot_id
-            )
             if (
                 sha is None
-                or own
                 or comment["type"] != "User"
                 or comment["updated"] != comment["created"]
             ):

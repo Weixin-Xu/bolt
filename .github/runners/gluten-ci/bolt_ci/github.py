@@ -263,7 +263,6 @@ class GitHub:
                         body=entry["body"],
                         login=user["login"] if user else "",
                         type=user["type"] if user else "",
-                        user_id=user["id"] if user else None,
                         created=timestamp(entry["created_at"]),
                         updated=timestamp(entry["updated_at"]),
                     )

@@ -115,7 +115,6 @@ class Config:
     matrix: list
     fingerprint: str
     maintainer_logins: tuple = ()
-    bot_login: str = ""
     only_pr: int | None = None
     poll_seconds: int = 60
     runner_poll_seconds: int = 5
@@ -197,9 +196,6 @@ class Config:
         ):
             raise ValueError("Invalid maintainer allowlist")
         options["maintainer_logins"] = tuple(login.lower() for login in maintainers)
-        bot = options.get("bot_login", "")
-        if bot and not LOGIN.fullmatch(bot):
-            raise ValueError("Invalid commenter account")
         only_pr = options.get("only_pr")
         if only_pr is not None and (
             type(only_pr) is not int or not 0 < only_pr < 2**63

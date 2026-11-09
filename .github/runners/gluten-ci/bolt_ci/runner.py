@@ -233,12 +233,21 @@ def collect_result(config, task, root, exit_code):
             raise ValueError("Unexpected packaging test counts")
         if not exit_code:
             verification = contents(root, "package-verification.txt", 4096).decode()
-            expected_record = rf"[0-9a-f]{{64}}  (gluten-bolt-bundle-[A-Za-z0-9._+-]+\.jar)\nbolt_revision={config.bolt_sha}\n"
+            expected_record = (
+                r"(?P<digest>[0-9a-f]{64})  (?P<jar>gluten-bolt-bundle-[A-Za-z0-9._+-]+\.jar)"
+                rf"\nbolt_revision={config.bolt_sha}\n"
+            )
             match = re.fullmatch(expected_record, verification)
-            if not match or match[1] not in paths:
+            if not match or match["jar"] not in paths:
                 raise ValueError("Missing package verification")
-            with regular(root, match[1], MAX_ARTIFACT):
-                pass
+            with regular(root, match["jar"], MAX_ARTIFACT) as artifact:
+                if not os.fstat(artifact.fileno()).st_size:
+                    raise ValueError("Package artifact is empty")
+                if (
+                    hashlib.file_digest(artifact, "sha256").hexdigest()
+                    != match["digest"]
+                ):
+                    raise ValueError("Package artifact checksum mismatch")
     elif not exit_code or counts["failed"]:
         if test_evidence(entry, root, paths) != counts:
             raise ValueError("Worker test evidence does not match its report")
