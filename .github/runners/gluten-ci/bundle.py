@@ -15,13 +15,12 @@
 """Create and verify an offline deployment from explicit Git revisions."""
 
 import argparse
-import io
 import json
 import os
 import subprocess
 import tarfile
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from bolt_ci.config import HELPERS, digest_file
 from bolt_ci.policy import valid_sha
@@ -103,10 +102,51 @@ def git(repo, *args, data=None):
 
 
 def export(repo, revision, target, paths):
-    with tarfile.open(
-        fileobj=io.BytesIO(git(repo, "archive", revision, "--", *paths))
-    ) as archive:
-        archive.extractall(target, filter="data")
+    # The repositories can mark CI files export-ignore in .gitattributes.
+    # Copy only committed allowlisted blobs, preserving their executable bits.
+    if (
+        git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip().decode()
+        != revision
+    ):
+        raise ValueError("Bundle revision is not a commit")
+    entries = git(repo, "ls-tree", "-r", "-z", revision, "--", *paths).split(b"\0")
+    found = set()
+    total_bytes = 0
+    for entry in filter(None, entries):
+        description, raw_name = entry.split(b"\t", 1)
+        mode, kind, digest = description.split()
+        name = raw_name.decode()
+        selection = next(
+            (path for path in paths if name == path or name.startswith(path + "/")),
+            None,
+        )
+        if selection is None or kind != b"blob" or mode not in {b"100644", b"100755"}:
+            raise ValueError("Bundle path must refer to a regular committed file")
+        relative = PurePosixPath(name)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.as_posix() != name
+        ):
+            raise ValueError("Invalid path in deployment Git tree")
+        if "/bolt_ci/" in name and relative.suffix != ".py":
+            raise ValueError(
+                "The deployment package may only export Python controller files"
+            )
+        size = int(git(repo, "cat-file", "-s", digest.decode()))
+        total_bytes += size
+        if size > 4 * 1024**2 or total_bytes > 32 * 1024**2:
+            raise ValueError("Deployment Git files exceed the bundle size limits")
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("xb") as stream:
+            stream.write(git(repo, "cat-file", "blob", digest.decode()))
+        destination.chmod(0o755 if mode == b"100755" else 0o644)
+        found.add(selection)
+    if found != set(paths):
+        raise ValueError(
+            "A required deployment path is missing from the pinned revision"
+        )
 
 
 def export_driver(repo, target):

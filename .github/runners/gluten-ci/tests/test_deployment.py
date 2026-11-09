@@ -270,3 +270,41 @@ class DeploymentTest(unittest.TestCase):
                 ("docker", "owned-orphan"),
             ],
         )
+
+    def test_bundle_exports_allowlisted_files_even_if_git_archive_ignores_them(self):
+        bundle = self.module("bundle")
+        source, out = self.root / "git-source", self.root / "out"
+        source.mkdir()
+        out.mkdir()
+        subprocess.run(["git", "init", "-q", str(source)], check=True)
+        (source / ".github").mkdir()
+        (source / ".gitattributes").write_text(".github export-ignore\n")
+        file = source / ".github/ci.sh"
+        file.write_text("#!/bin/sh\nexit 0\n")
+        file.chmod(0o755)
+        subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "-c",
+                "user.name=CI Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-qm",
+                "test fixture",
+            ],
+            check=True,
+        )
+        commit = subprocess.check_output(
+            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+        ).strip()
+        bundle.export(source, commit, out, (".github/ci.sh",))
+        exported = out / ".github/ci.sh"
+        self.assertEqual(exported.read_text(), file.read_text())
+        self.assertTrue(exported.stat().st_mode & 0o100)
+        self.assertFalse((out / ".gitattributes").exists())
